@@ -77,7 +77,7 @@ pub fn apply_model(kind: AppKind, model_id: Option<String>) -> AppResult<ApplyRe
         model: model.clone(),
         gateway_base_url: status.base_url.clone(),
         gateway_token: status.token.clone(),
-        model_alias: platform::model_alias(&model),
+        model_alias: gateway::MODEL_ALIAS.to_string(),
     };
 
     let report = configurator.apply(&context)?;

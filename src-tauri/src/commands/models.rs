@@ -2,8 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::domain::canonical::CanonicalRequest;
-use crate::domain::catalog;
-use crate::domain::model::{ModelConfig, ModelFormat, ModelInput, ModelPreset};
+use crate::domain::model::{ModelConfig, ModelFormat, ModelInput};
 use crate::error::{AppError, AppResult};
 use crate::gateway;
 use crate::providers::{http_client, provider_for};
@@ -14,7 +13,6 @@ use crate::settings;
 pub struct FormatInfo {
     pub format: ModelFormat,
     pub display_name: String,
-    pub description: String,
     pub default_base_url: String,
 }
 
@@ -36,7 +34,6 @@ pub fn list_model_formats() -> Vec<FormatInfo> {
         .map(|format| FormatInfo {
             format: *format,
             display_name: format.display_name().to_string(),
-            description: format.description().to_string(),
             default_base_url: format.default_base_url().to_string(),
         })
         .collect()
@@ -45,11 +42,6 @@ pub fn list_model_formats() -> Vec<FormatInfo> {
 #[tauri::command]
 pub fn list_models() -> AppResult<Vec<ModelConfig>> {
     Ok(settings::snapshot().models)
-}
-
-#[tauri::command]
-pub fn list_model_presets() -> Vec<ModelPreset> {
-    catalog::builtin_model_presets()
 }
 
 #[tauri::command]

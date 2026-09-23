@@ -7,13 +7,11 @@ import type {
   ModelConfig,
   ModelFormat,
   ModelInput,
-  ModelPreset,
   TestResult,
 } from "@/lib/types";
 
 const models = ref<ModelConfig[]>([]);
 const formats = ref<FormatInfo[]>([]);
-const presets = ref<ModelPreset[]>([]);
 const activeModelId = ref<string | null>(null);
 const loading = ref(false);
 const testingId = ref<string | null>(null);
@@ -38,12 +36,7 @@ async function refresh(): Promise<void> {
 }
 
 async function loadMeta(): Promise<void> {
-  const [formatList, presetList] = await Promise.all([
-    modelApi.formats(),
-    modelApi.presets(),
-  ]);
-  formats.value = formatList;
-  presets.value = presetList;
+  formats.value = await modelApi.formats();
 }
 
 async function save(input: ModelInput): Promise<boolean> {
@@ -104,7 +97,6 @@ export function useModels() {
   return {
     models,
     formats,
-    presets,
     activeModel,
     activeModelId,
     loading,

@@ -60,31 +60,6 @@ pub fn configurator_for(kind: AppKind) -> Box<dyn AppConfigurator> {
     Box::new(fallback::UnsupportedConfigurator::new(kind))
 }
 
-fn slugify(input: &str) -> String {
-    let mut out = String::new();
-    let mut last_dash = false;
-    for ch in input.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-            last_dash = false;
-        } else if !last_dash && !out.is_empty() {
-            out.push('-');
-            last_dash = true;
-        }
-    }
-    out.trim_matches('-').to_string()
-}
-
-pub fn model_alias(model: &ModelConfig) -> String {
-    let slug = slugify(&model.name);
-    if slug.is_empty() {
-        let short = &model.id[..model.id.len().min(8)];
-        format!("ai-start-{short}")
-    } else {
-        format!("ai-start-{slug}")
-    }
-}
-
 pub fn expand_env(raw: &str) -> String {
     let mut result = raw.to_string();
     let mut rest = result.clone();

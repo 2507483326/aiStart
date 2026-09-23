@@ -1,9 +1,22 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
+import { ChevronDown, Search } from "@lucide/vue";
 import { LoaderCircle, RefreshCw } from "lucide";
+import { ComboboxInput } from "reka-ui";
 
 import MorphIconBox from "@/components/common/MorphIconBox.vue";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Combobox,
+  ComboboxAnchor,
+  ComboboxEmpty,
+  ComboboxItem,
+  ComboboxItemIndicator,
+  ComboboxList,
+  ComboboxTrigger,
+  ComboboxViewport,
+} from "@/components/ui/combobox";
 import {
   Dialog,
   DialogContent,
@@ -22,7 +35,6 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
-import { Switch } from "@/components/ui/switch";
 import { useModels } from "@/composables/useModels";
 import { notifyError, notifySuccess } from "@/lib/notify";
 import type { ModelConfig, ModelFormat, ModelInput } from "@/lib/types";
@@ -32,7 +44,7 @@ const open = defineModel<boolean>("open", { required: true });
 const props = defineProps<{ model: ModelConfig | null }>();
 const emit = defineEmits<{ saved: [] }>();
 
-const { formats, presets, save, fetchUpstream } = useModels();
+const { formats, save, fetchUpstream } = useModels();
 
 const name = ref("");
 const format = ref<ModelFormat>("openai-completions");
@@ -40,8 +52,9 @@ const baseUrl = ref("");
 const apiKey = ref("");
 const model = ref("");
 const supports1m = ref(false);
-const presetLabel = ref("");
 const upstreamModels = ref<string[]>([]);
+const searchTerm = ref("");
+const comboOpen = ref(false);
 const saving = ref(false);
 const fetching = ref(false);
 
@@ -58,8 +71,9 @@ function reset() {
   apiKey.value = source?.apiKey ?? "";
   model.value = source?.model ?? "";
   supports1m.value = source?.supports1m ?? false;
-  presetLabel.value = "";
+  searchTerm.value = source?.model ?? "";
   upstreamModels.value = [];
+  comboOpen.value = false;
 }
 
 watch(open, (value) => {
@@ -75,15 +89,16 @@ function changeFormat(value: unknown) {
   format.value = next;
 }
 
-function applyPreset(presetName: string) {
-  const preset = presets.value.find((item) => item.name === presetName);
-  if (!preset) return;
-  presetLabel.value = preset.name;
-  upstreamModels.value = [];
-  name.value = preset.name;
-  format.value = preset.format;
-  baseUrl.value = preset.baseUrl;
-  model.value = preset.model;
+function onSearch(value: unknown) {
+  searchTerm.value = String(value ?? "");
+}
+
+function commitTypedModel() {
+  const typed = searchTerm.value.trim();
+  if (!typed) return;
+  if (!upstreamModels.value.includes(typed)) {
+    model.value = typed;
+  }
 }
 
 async function loadUpstreamModels() {
@@ -96,14 +111,19 @@ async function loadUpstreamModels() {
     const list = await fetchUpstream(baseUrl.value.trim(), apiKey.value, format.value);
     if (!list) return;
     upstreamModels.value = list;
-    if (!model.value && list.length) model.value = list[0];
+    if (!model.value && list.length) {
+      model.value = list[0];
+      searchTerm.value = list[0];
+    }
     notifySuccess(`获取到 ${list.length} 个模型`);
+    comboOpen.value = true;
   } finally {
     fetching.value = false;
   }
 }
 
 async function submit() {
+  commitTypedModel();
   const input: ModelInput = {
     id: props.model?.id,
     name: name.value.trim(),
@@ -138,27 +158,6 @@ async function submit() {
       </DialogHeader>
 
       <div class="space-y-4 py-2">
-        <div v-if="!isEdit && presets.length" class="space-y-2">
-          <Label>快速填充</Label>
-          <Select
-            :model-value="presetLabel"
-            @update:model-value="(value) => applyPreset(String(value ?? ''))"
-          >
-            <SelectTrigger class="w-full">
-              <SelectValue>
-                {{ presetLabel || "从常用预设开始…" }}
-              </SelectValue>
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem v-for="preset in presets" :key="preset.name" :value="preset.name">
-                {{ preset.name }} — {{ preset.note }}
-              </SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
-
-        <Separator />
-
         <div class="grid grid-cols-2 gap-4">
           <div class="space-y-2">
             <Label for="model-name">显示名称</Label>
@@ -181,12 +180,7 @@ async function submit() {
           </div>
         </div>
 
-        <p
-          v-if="activeFormat"
-          class="rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
-        >
-          {{ activeFormat.description }}
-        </p>
+        <Separator />
 
         <div class="space-y-2">
           <Label for="model-base-url">Base URL</Label>
@@ -227,38 +221,51 @@ async function submit() {
               获取模型列表
             </Button>
           </div>
-          <Input
-            id="model-upstream"
-            v-model="model"
-            class="font-mono text-xs"
-            placeholder="deepseek-chat"
-          />
-          <Select
-            v-if="upstreamModels.length"
-            :model-value="model"
-            @update:model-value="(value) => (model = String(value ?? ''))"
-          >
-            <SelectTrigger class="w-full">
-              <SelectValue>
-                {{ model || `从获取到的 ${upstreamModels.length} 个模型中选择…` }}
-              </SelectValue>
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem v-for="id in upstreamModels" :key="id" :value="id">
-                {{ id }}
-              </SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
 
-        <div class="flex items-center justify-between gap-4 rounded-md border px-3 py-2.5">
-          <div class="space-y-0.5">
-            <Label for="model-1m" class="cursor-pointer">支持 1M 上下文</Label>
-            <p class="text-xs text-muted-foreground">
-              标记后会写入 Claude Desktop 的模型列表，选择器会额外提供 1M 变体。
-            </p>
-          </div>
-          <Switch id="model-1m" v-model="supports1m" />
+          <Combobox
+            v-model="model"
+            :open="comboOpen"
+            :reset-search-term-on-blur="false"
+            @update:open="comboOpen = $event"
+          >
+            <ComboboxAnchor as-child>
+              <div class="relative">
+                <Search
+                  class="pointer-events-none absolute top-1/2 left-3 size-3.5 -translate-y-1/2 opacity-50"
+                />
+                <ComboboxInput
+                  id="model-upstream"
+                  :display-value="(value: unknown) => String(value ?? '')"
+                  placeholder="deepseek-chat，或点右侧箭头从列表选择"
+                  class="h-9 w-full rounded-md border bg-transparent pr-9 pl-8 font-mono text-xs shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                  @update:model-value="onSearch"
+                  @focus="comboOpen = true"
+                  @blur="commitTypedModel"
+                />
+                <ComboboxTrigger
+                  class="absolute top-1/2 right-2 -translate-y-1/2 rounded-sm p-1 text-muted-foreground hover:text-foreground"
+                  aria-label="展开模型列表"
+                >
+                  <ChevronDown class="size-4 opacity-60" />
+                </ComboboxTrigger>
+              </div>
+            </ComboboxAnchor>
+
+            <ComboboxList class="w-(--reka-combobox-trigger-width)">
+              <ComboboxEmpty>没有匹配的模型，先点「获取模型列表」</ComboboxEmpty>
+              <ComboboxViewport class="max-h-72 overflow-y-auto p-1">
+                <ComboboxItem v-for="id in upstreamModels" :key="id" :value="id">
+                  {{ id }}
+                  <ComboboxItemIndicator />
+                </ComboboxItem>
+              </ComboboxViewport>
+            </ComboboxList>
+          </Combobox>
+
+          <label class="flex cursor-pointer items-center gap-2 pt-1 text-xs text-muted-foreground">
+            <Checkbox v-model="supports1m" />
+            该模型支持 1M 上下文
+          </label>
         </div>
       </div>
 

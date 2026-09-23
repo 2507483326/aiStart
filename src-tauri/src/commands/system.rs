@@ -43,7 +43,7 @@ fn view() -> SettingsView {
     let snapshot = settings::snapshot();
     SettingsView {
         gateway_port: snapshot.gateway_port,
-        gateway_token: snapshot.gateway_token,
+        gateway_token: gateway::GATEWAY_TOKEN.to_string(),
         deepseek_config_path: settings::deepseek_config_path(),
         auto_failover: snapshot.auto_failover,
         active_model_id: snapshot.active_model_id,

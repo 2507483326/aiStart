@@ -9,6 +9,9 @@ use tokio::sync::oneshot;
 
 use crate::error::{AppError, AppResult};
 
+pub const GATEWAY_TOKEN: &str = "aiStart";
+pub const MODEL_ALIAS: &str = "aiStart";
+
 #[derive(Debug, Default)]
 pub struct GatewayStats {
     pub requests: AtomicU64,
@@ -110,7 +113,7 @@ pub fn status() -> GatewayStatus {
         running: running_port.is_some(),
         port: running_port.unwrap_or(settings.gateway_port),
         base_url: base_url(running_port.unwrap_or(settings.gateway_port)),
-        token: settings.gateway_token.clone(),
+        token: GATEWAY_TOKEN.to_string(),
         requests,
         errors,
         failovers,

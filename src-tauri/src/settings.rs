@@ -18,8 +18,6 @@ pub struct Settings {
     #[serde(default = "default_port")]
     pub gateway_port: u16,
     #[serde(default)]
-    pub gateway_token: String,
-    #[serde(default)]
     pub deepseek_config_path: Option<String>,
     #[serde(default)]
     pub auto_failover: bool,
@@ -37,7 +35,6 @@ impl Default for Settings {
             models: Vec::new(),
             active_model_id: None,
             gateway_port: default_port(),
-            gateway_token: generate_token(),
             deepseek_config_path: None,
             auto_failover: false,
             applied: BTreeMap::new(),
@@ -124,10 +121,6 @@ impl Settings {
     }
 }
 
-pub fn generate_token() -> String {
-    format!("ask_{}", uuid::Uuid::new_v4().simple())
-}
-
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 static STORE: OnceLock<RwLock<Settings>> = OnceLock::new();
 
@@ -137,6 +130,10 @@ fn store() -> &'static RwLock<Settings> {
 
 fn settings_file() -> Option<PathBuf> {
     DIR.get().map(|dir| dir.join("settings.json"))
+}
+
+pub fn data_dir() -> Option<PathBuf> {
+    DIR.get().cloned()
 }
 
 pub fn init(dir: PathBuf) -> AppResult<()> {
@@ -152,9 +149,6 @@ pub fn init(dir: PathBuf) -> AppResult<()> {
     };
 
     let mut settings = loaded;
-    if settings.gateway_token.is_empty() {
-        settings.gateway_token = generate_token();
-    }
     seed_default_models(&mut settings);
 
     *store().write().expect("settings lock poisoned") = settings;

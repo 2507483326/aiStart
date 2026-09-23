@@ -16,26 +16,6 @@ async function refresh(): Promise<void> {
   }
 }
 
-async function start(): Promise<boolean> {
-  const result = await attempt(() => gatewayApi.start(), {
-    success: "本地网关已启动",
-    error: "启动网关失败",
-  });
-  if (!result) return false;
-  status.value = result;
-  return true;
-}
-
-async function stop(): Promise<boolean> {
-  const result = await attempt(() => gatewayApi.stop(), {
-    success: "本地网关已停止",
-    error: "停止网关失败",
-  });
-  if (!result) return false;
-  status.value = result;
-  return true;
-}
-
 async function restart(): Promise<boolean> {
   const result = await attempt(() => gatewayApi.restart(), {
     success: "本地网关已重启",
@@ -52,8 +32,6 @@ export function useGateway() {
     loading,
     running: computed(() => status.value?.running ?? false),
     refresh,
-    start,
-    stop,
     restart,
   };
 }

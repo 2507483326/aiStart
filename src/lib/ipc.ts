@@ -10,11 +10,12 @@ import type {
   ModelConfig,
   ModelFormat,
   ModelInput,
-  ModelPreset,
   SettingsInput,
   SettingsView,
   TestResult,
   ToolApp,
+  UsageRecord,
+  UsageSummary,
 } from "@/lib/types";
 
 export const appApi = {
@@ -29,7 +30,6 @@ export const appApi = {
 export const modelApi = {
   list: () => invoke<ModelConfig[]>("list_models"),
   formats: () => invoke<FormatInfo[]>("list_model_formats"),
-  presets: () => invoke<ModelPreset[]>("list_model_presets"),
   save: (input: ModelInput) => invoke<ModelConfig>("save_model", { input }),
   remove: (id: string) => invoke<ModelConfig[]>("delete_model", { id }),
   activate: (id: string) => invoke<GatewayStatus>("activate_model", { id }),
@@ -40,9 +40,12 @@ export const modelApi = {
 
 export const gatewayApi = {
   status: () => invoke<GatewayStatus>("gateway_status"),
-  start: () => invoke<GatewayStatus>("start_gateway"),
-  stop: () => invoke<GatewayStatus>("stop_gateway"),
   restart: () => invoke<GatewayStatus>("restart_gateway"),
+};
+
+export const usageApi = {
+  summary: (days: number) => invoke<UsageSummary>("usage_summary", { days }),
+  records: (limit: number) => invoke<UsageRecord[]>("usage_records", { limit }),
 };
 
 export const systemApi = {

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY};
+use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY};
 use winreg::RegKey;
 
 use crate::domain::app::{AppDescriptor, AppKind, ApplyMode, ApplyReport};
@@ -15,6 +15,8 @@ const UNINSTALL_PATHS: &[&str] = &[
     r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
     r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
 ];
+
+const MSIX_PACKAGES_PATH: &str = r"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages";
 
 struct InstalledApp {
     name: String,
@@ -32,7 +34,7 @@ fn installed_apps() -> Vec<InstalledApp> {
                 continue;
             };
             for sub_name in key.enum_keys().flatten() {
-                let Ok(sub) = key.open_subkey_with_flags(&sub_name, flags | KEY_WOW64_32KEY) else {
+                let Ok(sub) = key.open_subkey_with_flags(&sub_name, flags) else {
                     continue;
                 };
                 let display: String = sub.get_value("DisplayName").unwrap_or_default();
@@ -66,6 +68,74 @@ fn find_app(needles: &[&str]) -> Option<InstalledApp> {
                 name: app.name.clone(),
                 version: app.version.clone(),
                 location: app.location.clone(),
+            });
+        }
+    }
+    None
+}
+
+struct MsixPackage {
+    name: String,
+    version: Option<String>,
+    location: Option<String>,
+}
+
+fn parse_package_id(package_id: &str) -> Option<(String, Option<String>)> {
+    let mut parts = package_id.split('_');
+    let name = parts.next()?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let version = parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    Some((name.to_string(), version))
+}
+
+fn installed_msix_packages() -> Vec<MsixPackage> {
+    let mut packages = Vec::new();
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let Ok(key) = hkcu.open_subkey_with_flags(MSIX_PACKAGES_PATH, KEY_READ) else {
+        return packages;
+    };
+    for full_name in key.enum_keys().flatten() {
+        let Ok(sub) = key.open_subkey_with_flags(&full_name, KEY_READ) else {
+            continue;
+        };
+        let display: String = sub.get_value("DisplayName").unwrap_or_default();
+        if display.trim().is_empty() {
+            continue;
+        }
+        let package_id: String = sub
+            .get_value("PackageID")
+            .unwrap_or_else(|_| full_name.clone());
+        let Some((_, version)) = parse_package_id(&package_id) else {
+            continue;
+        };
+        let location: String = sub.get_value("PackageRootFolder").unwrap_or_default();
+        packages.push(MsixPackage {
+            name: display,
+            version,
+            location: (!location.trim().is_empty()).then_some(location),
+        });
+    }
+    packages
+}
+
+fn find_msix(needles: &[&str]) -> Option<MsixPackage> {
+    let packages = installed_msix_packages();
+    for needle in needles {
+        let needle = needle.to_lowercase();
+        if let Some(package) = packages
+            .iter()
+            .find(|package| package.name.to_lowercase().contains(&needle))
+        {
+            return Some(MsixPackage {
+                name: package.name.clone(),
+                version: package.version.clone(),
+                location: package.location.clone(),
             });
         }
     }
@@ -130,6 +200,12 @@ impl AppConfigurator for ClaudeDesktopConfigurator {
     }
 
     fn detect(&self) -> AppResult<DetectResult> {
+        if let Some(package) = find_msix(&["claude"]) {
+            return Ok(DetectResult::found(
+                package.location.unwrap_or(package.name),
+                package.version,
+            ));
+        }
         if let Some(path) = claude_binary() {
             let version = find_app(&["claude desktop", "claude for windows"])
                 .and_then(|app| app.version)
@@ -233,6 +309,12 @@ impl AppConfigurator for DeepseekDesktopConfigurator {
     }
 
     fn detect(&self) -> AppResult<DetectResult> {
+        if let Some(package) = find_msix(&["deepseek"]) {
+            return Ok(DetectResult::found(
+                package.location.unwrap_or(package.name),
+                package.version,
+            ));
+        }
         match find_app(&["deepseek"]) {
             Some(app) => Ok(DetectResult::found(
                 app.location.unwrap_or_else(|| app.name.clone()),
@@ -296,5 +378,24 @@ impl AppConfigurator for DeepseekDesktopConfigurator {
             std::fs::remove_file(path)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_package_id;
+
+    #[test]
+    fn parses_version_out_of_msix_package_id() {
+        let (name, version) = parse_package_id("Claude_2.2553.1.0_x64__pzs8sxrjxfjjc").unwrap();
+        assert_eq!(name, "Claude");
+        assert_eq!(version.as_deref(), Some("2.2553.1.0"));
+
+        let (name, version) =
+            parse_package_id("Microsoft.WindowsTerminal_1.24.11911.0_x64__8wekyb3d8bbwe").unwrap();
+        assert_eq!(name, "Microsoft.WindowsTerminal");
+        assert_eq!(version.as_deref(), Some("1.24.11911.0"));
+
+        assert!(parse_package_id("").is_none());
     }
 }

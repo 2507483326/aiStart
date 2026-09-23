@@ -5,6 +5,7 @@ mod gateway;
 mod platform;
 mod providers;
 mod settings;
+mod usage;
 
 #[cfg(test)]
 mod tests;
@@ -34,19 +35,18 @@ pub fn run() {
             commands::apps::app_apply_mode_label,
             commands::models::list_model_formats,
             commands::models::list_models,
-            commands::models::list_model_presets,
             commands::models::save_model,
             commands::models::delete_model,
             commands::models::activate_model,
             commands::models::test_model,
             commands::models::fetch_upstream_models,
             commands::gateway::gateway_status,
-            commands::gateway::start_gateway,
-            commands::gateway::stop_gateway,
             commands::gateway::restart_gateway,
             commands::system::get_settings,
             commands::system::update_settings,
             commands::system::app_info,
+            commands::usage::usage_summary,
+            commands::usage::usage_records,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

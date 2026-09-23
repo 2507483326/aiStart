@@ -3,10 +3,10 @@ import { computed } from "vue";
 import { useRoute } from "vue-router";
 import {
   Activity,
-  BrainCircuit,
+  BarChart3,
   Boxes,
+  BrainCircuit,
   LayoutDashboard,
-  Power,
   Settings2,
   Sparkles,
 } from "lucide";
@@ -30,21 +30,12 @@ const sectionIcons = {
   dashboard: LayoutDashboard,
   apps: Boxes,
   models: BrainCircuit,
+  stats: BarChart3,
 };
 
 const activeIcon = computed(
   () => sectionIcons[route.name as keyof typeof sectionIcons] ?? Sparkles,
 );
-
-const gatewayIcon = computed(() => (gateway.running.value ? Activity : Power));
-
-async function toggleGateway() {
-  if (gateway.running.value) {
-    await gateway.stop();
-  } else {
-    await gateway.start();
-  }
-}
 </script>
 
 <template>
@@ -71,29 +62,22 @@ async function toggleGateway() {
           <div class="flex items-center justify-between">
             <span class="flex items-center gap-1.5 text-xs font-medium">
               <MorphIconBox
-                :icon="gatewayIcon"
+                :icon="Activity"
                 :size="13"
                 :class="gateway.running.value ? 'text-emerald-500' : 'text-muted-foreground'"
               />
               本地网关
             </span>
-            <Badge :variant="gateway.running.value ? 'default' : 'outline'" class="text-[10px]">
+            <Badge
+              :variant="gateway.running.value ? 'default' : 'outline'"
+              class="text-[10px]"
+            >
               {{ gateway.running.value ? "运行中" : "已停止" }}
             </Badge>
           </div>
           <p class="mt-1.5 truncate font-mono text-[11px] text-muted-foreground">
             {{ gateway.status.value?.baseUrl ?? "—" }}
           </p>
-          <Button
-            variant="outline"
-            size="sm"
-            class="mt-2 w-full gap-2"
-            :disabled="gateway.loading.value"
-            @click="toggleGateway"
-          >
-            <MorphIconBox :icon="gatewayIcon" :size="14" />
-            {{ gateway.running.value ? "停止" : "启动" }}
-          </Button>
         </div>
 
         <SettingsDialog>

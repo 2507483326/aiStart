@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -14,16 +15,18 @@ use tower_http::cors::CorsLayer;
 use crate::domain::canonical::CanonicalRequest;
 use crate::domain::model::{ModelConfig, ModelFormat};
 use crate::error::{AppError, AppResult};
-use crate::providers::{http_client, provider_for, SseEvent, StreamState};
+use crate::providers::{http_client, provider_for, SseEvent, StreamState, WireState};
 
 use super::sse::{encode_channel_event, parse_sse_stream};
-use super::GatewayStats;
+use super::{GatewayStats, GATEWAY_TOKEN, MODEL_ALIAS};
 
 pub fn router() -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
         .route("/v1/messages", post(messages))
+        .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/responses", post(responses))
         .layer(CorsLayer::permissive())
         .with_state(super::stats())
 }
@@ -40,11 +43,14 @@ fn json_response(status: StatusCode, body: Value) -> Response {
     (status, axum::Json(body)).into_response()
 }
 
-fn api_error(status: StatusCode, kind: &str, message: &str) -> Response {
-    json_response(
-        status,
-        json!({ "type": "error", "error": { "type": kind, "message": message } }),
-    )
+fn api_error(inbound: ModelFormat, status: StatusCode, kind: &str, message: &str) -> Response {
+    let body = match inbound {
+        ModelFormat::AnthropicMessages => {
+            json!({ "type": "error", "error": { "type": kind, "message": message } })
+        }
+        _ => json!({ "error": { "message": message, "type": kind, "code": kind } }),
+    };
+    json_response(status, body)
 }
 
 fn extract_token(headers: &HeaderMap) -> Option<String> {
@@ -58,18 +64,29 @@ fn extract_token(headers: &HeaderMap) -> Option<String> {
 }
 
 fn encode_event(event: &SseEvent) -> String {
-    let data = serde_json::to_string(&event.data).unwrap_or_else(|_| "{}".into());
+    let data = match &event.raw {
+        Some(raw) => raw.clone(),
+        None => serde_json::to_string(&event.data).unwrap_or_else(|_| "{}".into()),
+    };
     encode_channel_event(&event.event, &data)
 }
 
-fn encode_error(message: &str) -> String {
-    encode_event(&SseEvent::new(
-        "error",
-        json!({ "type": "error", "error": { "type": "api_error", "message": message } }),
-    ))
+fn error_events(inbound: ModelFormat, message: &str) -> Vec<SseEvent> {
+    match inbound {
+        ModelFormat::AnthropicMessages => vec![SseEvent::new(
+            "error",
+            json!({ "type": "error", "error": { "type": "api_error", "message": message } }),
+        )],
+        _ => vec![SseEvent::new(
+            "error",
+            json!({ "error": { "message": message, "type": "api_error" } }),
+        )],
+    }
 }
 
-fn sse_response(stream: impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static) -> Response {
+fn sse_response(
+    stream: impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+) -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
@@ -77,7 +94,43 @@ fn sse_response(stream: impl futures_util::Stream<Item = Result<Bytes, std::io::
         .header(header::CONNECTION, "keep-alive")
         .header("x-accel-buffering", "no")
         .body(Body::from_stream(stream))
-        .unwrap_or_else(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "api_error", "构建流式响应失败"))
+        .unwrap_or_else(|_| {
+            api_error(
+                ModelFormat::AnthropicMessages,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "构建流式响应失败",
+            )
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_usage(
+    active_model_name: &str,
+    config: &ModelConfig,
+    inbound: ModelFormat,
+    input_tokens: u64,
+    output_tokens: u64,
+    duration_ms: u64,
+    ok: bool,
+    failover: bool,
+    error: Option<String>,
+) {
+    let (timestamp, date) = crate::usage::current_timestamp();
+    crate::usage::record(&crate::usage::UsageRecord {
+        timestamp,
+        date,
+        model_name: active_model_name.to_string(),
+        served_by: config.name.clone(),
+        inbound_protocol: inbound.as_str().to_string(),
+        upstream_protocol: config.format.as_str().to_string(),
+        input_tokens,
+        output_tokens,
+        duration_ms,
+        ok,
+        failover,
+        error,
+    });
 }
 
 async fn health(State(stats): State<Arc<GatewayStats>>) -> Response {
@@ -88,6 +141,7 @@ async fn health(State(stats): State<Arc<GatewayStats>>) -> Response {
         json!({
             "status": "ok",
             "service": "ai-start-gateway",
+            "protocols": ["anthropic-messages", "openai-completions", "openai-responses"],
             "activeModel": settings.active_model().map(|model| model.name.clone()),
             "autoFailover": settings.auto_failover,
             "requests": requests,
@@ -98,47 +152,79 @@ async fn health(State(stats): State<Arc<GatewayStats>>) -> Response {
 }
 
 async fn models() -> Response {
-    let settings = crate::settings::snapshot();
-    let entries: Vec<Value> = settings
-        .models
-        .iter()
-        .map(|model| {
-            json!({
-                "type": "model",
-                "id": alias_for(model),
-                "display_name": model.name,
-                "created_at": model.created_at
-            })
-        })
-        .collect();
-
     json_response(
         StatusCode::OK,
         json!({
-            "data": entries,
+            "object": "list",
+            "data": [{ "id": MODEL_ALIAS, "type": "model", "object": "model", "created": 0, "display_name": MODEL_ALIAS, "owned_by": "ai-start" }],
             "has_more": false,
-            "first_id": entries.first().and_then(|entry| entry.get("id")).cloned(),
-            "last_id": entries.last().and_then(|entry| entry.get("id")).cloned()
+            "first_id": MODEL_ALIAS,
+            "last_id": MODEL_ALIAS
         }),
     )
 }
 
-fn alias_for(model: &ModelConfig) -> String {
-    crate::platform::model_alias(model)
+async fn messages(State(stats): State<Arc<GatewayStats>>, headers: HeaderMap, body: Bytes) -> Response {
+    route(ModelFormat::AnthropicMessages, stats, headers, body).await
 }
 
-async fn messages(State(stats): State<Arc<GatewayStats>>, headers: HeaderMap, body: Bytes) -> Response {
-    stats.requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    match handle_messages(stats.clone(), headers, body).await {
+async fn chat_completions(
+    State(stats): State<Arc<GatewayStats>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    route(ModelFormat::OpenaiCompletions, stats, headers, body).await
+}
+
+async fn responses(
+    State(stats): State<Arc<GatewayStats>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    route(ModelFormat::OpenaiResponses, stats, headers, body).await
+}
+
+async fn route(
+    inbound: ModelFormat,
+    stats: Arc<GatewayStats>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    stats.requests.fetch_add(1, Ordering::Relaxed);
+    let started = std::time::Instant::now();
+
+    match handle(inbound, stats.clone(), headers, body, started).await {
         Ok(response) => response,
         Err(error) => {
             stats.record_error(&error.to_string());
+            let message = error.to_string();
+            let settings = crate::settings::snapshot();
+            let active_name = settings
+                .active_model()
+                .map(|model| model.name.clone())
+                .unwrap_or_default();
+            let (timestamp, date) = crate::usage::current_timestamp();
+            crate::usage::record(&crate::usage::UsageRecord {
+                timestamp,
+                date,
+                model_name: active_name,
+                served_by: String::new(),
+                inbound_protocol: inbound.as_str().to_string(),
+                upstream_protocol: String::new(),
+                input_tokens: 0,
+                output_tokens: 0,
+                duration_ms: started.elapsed().as_millis() as u64,
+                ok: false,
+                failover: false,
+                error: Some(message.clone()),
+            });
+
             let status = match error {
                 AppError::NotFound(_) => StatusCode::NOT_FOUND,
                 AppError::InvalidConfig(_) => StatusCode::BAD_REQUEST,
                 _ => StatusCode::BAD_GATEWAY,
             };
-            api_error(status, "api_error", &error.to_string())
+            api_error(inbound, status, "api_error", &message)
         }
     }
 }
@@ -198,25 +284,28 @@ async fn dispatch(
     Ok(response)
 }
 
-async fn handle_messages(
+async fn handle(
+    inbound: ModelFormat,
     stats: Arc<GatewayStats>,
     headers: HeaderMap,
     body: Bytes,
+    started: std::time::Instant,
 ) -> AppResult<Response> {
     let settings = crate::settings::snapshot();
 
-    let provided = extract_token(&headers);
-    if provided.as_deref() != Some(settings.gateway_token.as_str()) {
+    if extract_token(&headers).as_deref() != Some(GATEWAY_TOKEN) {
         return Ok(api_error(
+            inbound,
             StatusCode::UNAUTHORIZED,
             "authentication_error",
-            "网关 API Key 不匹配，请在应用详情中重新执行「一键应用模型」",
+            &format!("网关 API Key 不匹配，应为 {GATEWAY_TOKEN}"),
         ));
     }
 
     let raw: Value = serde_json::from_slice(&body)
         .map_err(|error| AppError::InvalidConfig(format!("请求体不是合法 JSON: {error}")))?;
-    let request = CanonicalRequest::parse(raw)?;
+    let inbound_provider = provider_for(inbound);
+    let request = inbound_provider.decode_request(raw)?;
 
     let candidates = settings.candidate_models();
     if candidates.is_empty() {
@@ -224,7 +313,12 @@ async fn handle_messages(
     }
 
     let primary = candidates[0].name.clone();
+    let active_name = settings
+        .active_model()
+        .map(|model| model.name.clone())
+        .unwrap_or_default();
     let mut chosen: Option<(ModelConfig, reqwest::Response)> = None;
+    let mut failover_used = false;
     let mut last_error: Option<AppError> = None;
 
     for (index, candidate) in candidates.iter().enumerate() {
@@ -232,6 +326,7 @@ async fn handle_messages(
             Ok(response) => {
                 if index > 0 {
                     stats.record_failover(&primary, &candidate.name);
+                    failover_used = true;
                 }
                 chosen = Some((candidate.clone(), response));
                 break;
@@ -249,30 +344,50 @@ async fn handle_messages(
         return Err(last_error.unwrap_or_else(|| AppError::Message("没有可用的上游模型".into())));
     };
 
-    let provider = provider_for(config.format);
+    let upstream_provider = provider_for(config.format);
 
     if !request.stream() {
-        let raw = upstream.json::<Value>().await?;
-        let response = provider.decode_response(&config, &raw)?;
-        if let Some(usage) = response.get("usage") {
-            stats.record_tokens(
-                usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
-                usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
-            );
-        }
-        return Ok(json_response(StatusCode::OK, response));
+        let raw_response = upstream.json::<Value>().await?;
+        let canonical = upstream_provider.decode_response(&config, &raw_response)?;
+        let input_tokens = canonical
+            .pointer("/usage/input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let output_tokens = canonical
+            .pointer("/usage/output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        stats.record_tokens(input_tokens, output_tokens);
+        record_usage(
+            &active_name,
+            &config,
+            inbound,
+            input_tokens,
+            output_tokens,
+            started.elapsed().as_millis() as u64,
+            true,
+            failover_used,
+            None,
+        );
+
+        let wire = inbound_provider.encode_response(&config, &canonical)?;
+        return Ok(json_response(StatusCode::OK, wire));
     }
 
-    let mut state = StreamState::new(config.name.clone());
-    let passthrough = provider.is_passthrough();
+    let mut upstream_state = StreamState::new(config.name.clone());
+    let mut wire_state = WireState::default();
+    let emit_initial = !upstream_provider.is_passthrough();
     let events = parse_sse_stream(upstream.bytes_stream());
 
     let stream = async_stream::stream! {
         futures_util::pin_mut!(events);
+        let mut stream_error: Option<String> = None;
 
-        if !passthrough {
-            for event in state.begin() {
-                yield Ok::<Bytes, std::io::Error>(Bytes::from(encode_event(&event)));
+        if emit_initial {
+            for canonical in upstream_state.begin() {
+                for event in inbound_provider.encode_stream_event(&config, &canonical, &mut wire_state) {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(encode_event(&event)));
+                }
             }
         }
 
@@ -280,37 +395,65 @@ async fn handle_messages(
             match item {
                 Ok((event_name, data)) => {
                     if data.trim() == "[DONE]" {
-                        for event in provider.decode_stream_done(&config, &mut state).unwrap_or_default() {
-                            yield Ok(Bytes::from(encode_event(&event)));
+                        for canonical in upstream_provider.decode_stream_done(&config, &mut upstream_state).unwrap_or_default() {
+                            for event in inbound_provider.encode_stream_event(&config, &canonical, &mut wire_state) {
+                                yield Ok(Bytes::from(encode_event(&event)));
+                            }
                         }
                         continue;
                     }
                     let Ok(value) = serde_json::from_str::<Value>(&data) else {
                         continue;
                     };
-                    match provider.decode_stream_event(&config, &event_name, &value, &mut state) {
-                        Ok(list) => {
-                            for event in list {
-                                yield Ok(Bytes::from(encode_event(&event)));
+                    match upstream_provider.decode_stream_event(&config, &event_name, &value, &mut upstream_state) {
+                        Ok(canonical_events) => {
+                            for canonical in canonical_events {
+                                for event in inbound_provider.encode_stream_event(&config, &canonical, &mut wire_state) {
+                                    yield Ok(Bytes::from(encode_event(&event)));
+                                }
                             }
                         }
                         Err(error) => {
-                            yield Ok(Bytes::from(encode_error(&error.to_string())));
+                            let message = error.to_string();
+                            stream_error = Some(message.clone());
+                            for event in error_events(inbound, &message) {
+                                yield Ok(Bytes::from(encode_event(&event)));
+                            }
                         }
                     }
                 }
                 Err(error) => {
-                    yield Ok(Bytes::from(encode_error(&error.to_string())));
+                    let message = error.to_string();
+                    stream_error = Some(message.clone());
+                    for event in error_events(inbound, &message) {
+                        yield Ok(Bytes::from(encode_event(&event)));
+                    }
                     break;
                 }
             }
         }
 
-        for event in provider.decode_stream_done(&config, &mut state).unwrap_or_default() {
+        for canonical in upstream_provider.decode_stream_done(&config, &mut upstream_state).unwrap_or_default() {
+            for event in inbound_provider.encode_stream_event(&config, &canonical, &mut wire_state) {
+                yield Ok(Bytes::from(encode_event(&event)));
+            }
+        }
+        for event in inbound_provider.encode_stream_done(&config, &mut wire_state) {
             yield Ok(Bytes::from(encode_event(&event)));
         }
 
-        stats.record_tokens(state.input_tokens, state.output_tokens);
+        stats.record_tokens(upstream_state.input_tokens, upstream_state.output_tokens);
+        record_usage(
+            &active_name,
+            &config,
+            inbound,
+            upstream_state.input_tokens,
+            upstream_state.output_tokens,
+            started.elapsed().as_millis() as u64,
+            stream_error.is_none(),
+            failover_used,
+            stream_error,
+        );
     };
 
     Ok(sse_response(stream))

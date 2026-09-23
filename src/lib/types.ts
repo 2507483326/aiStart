@@ -29,19 +29,53 @@ export interface ModelInput {
   supports1m: boolean;
 }
 
-export interface ModelPreset {
-  name: string;
-  format: ModelFormat;
-  baseUrl: string;
-  model: string;
-  note: string;
-}
-
 export interface FormatInfo {
   format: ModelFormat;
   displayName: string;
-  description: string;
   defaultBaseUrl: string;
+}
+
+export interface UsageRecord {
+  timestamp: string;
+  date: string;
+  modelName: string;
+  servedBy: string;
+  inboundProtocol: string;
+  upstreamProtocol: string;
+  inputTokens: number;
+  outputTokens: number;
+  durationMs: number;
+  ok: boolean;
+  failover: boolean;
+  error: string | null;
+}
+
+export interface DailyUsage {
+  date: string;
+  requests: number;
+  failed: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+}
+
+export interface ModelUsage {
+  modelName: string;
+  requests: number;
+  inputTokens: number;
+  outputTokens: number;
+}
+
+export interface UsageSummary {
+  totalRequests: number;
+  failedRequests: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  todayTokens: number;
+  streakDays: number;
+  daily: DailyUsage[];
+  byModel: ModelUsage[];
 }
 
 export interface ToolApp {

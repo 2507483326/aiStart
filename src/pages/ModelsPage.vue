@@ -88,8 +88,8 @@ onMounted(async () => {
       </div>
     </div>
 
-    <div v-if="loading && !models.length" class="grid gap-4 lg:grid-cols-2">
-      <Skeleton v-for="index in 2" :key="index" class="h-52 w-full" />
+    <div v-if="loading && !models.length" class="space-y-2">
+      <Skeleton v-for="index in 3" :key="index" class="h-16 w-full" />
     </div>
 
     <EmptyState
@@ -104,7 +104,7 @@ onMounted(async () => {
       </Button>
     </EmptyState>
 
-    <div v-else class="grid gap-4 lg:grid-cols-2">
+    <div v-else class="space-y-2">
       <ModelCard
         v-for="model in models"
         :key="model.id"

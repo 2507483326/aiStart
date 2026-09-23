@@ -3,7 +3,7 @@ use serde_json::json;
 use crate::commands::models::parse_model_ids;
 use crate::domain::canonical::CanonicalRequest;
 use crate::domain::model::{ModelConfig, ModelFormat};
-use crate::providers::provider_for;
+use crate::providers::{provider_for, SseEvent, WireState};
 use crate::settings::Settings;
 
 fn model(format: ModelFormat, base_url: &str) -> ModelConfig {
@@ -222,4 +222,200 @@ fn model_id_parsing_covers_common_endpoint_shapes() {
     assert_eq!(parse_model_ids(&deduped), vec!["x"]);
 
     assert!(parse_model_ids(&json!({ "unexpected": true })).is_empty());
+}
+
+fn canonical_events() -> Vec<SseEvent> {
+    vec![
+        SseEvent::new(
+            "message_start",
+            json!({ "type": "message_start", "message": { "id": "msg_1", "model": "gpt-5", "usage": { "input_tokens": 3, "output_tokens": 0 } } }),
+        ),
+        SseEvent::new(
+            "content_block_start",
+            json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
+        ),
+        SseEvent::new(
+            "content_block_delta",
+            json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "Hello" } }),
+        ),
+        SseEvent::new(
+            "content_block_stop",
+            json!({ "type": "content_block_stop", "index": 0 }),
+        ),
+        SseEvent::new(
+            "content_block_start",
+            json!({ "type": "content_block_start", "index": 1, "content_block": { "type": "tool_use", "id": "call_1", "name": "get_weather", "input": {} } }),
+        ),
+        SseEvent::new(
+            "content_block_delta",
+            json!({ "type": "content_block_delta", "index": 1, "delta": { "type": "input_json_delta", "partial_json": "{\"city\":\"Beijing\"}" } }),
+        ),
+        SseEvent::new(
+            "content_block_stop",
+            json!({ "type": "content_block_stop", "index": 1 }),
+        ),
+        SseEvent::new(
+            "message_delta",
+            json!({ "type": "message_delta", "delta": { "stop_reason": "tool_use" }, "usage": { "output_tokens": 4 } }),
+        ),
+    ]
+}
+
+fn encode_all(format: ModelFormat) -> Vec<serde_json::Value> {
+    let cfg = model(format, "https://api.openai.com/v1");
+    let provider = provider_for(format);
+    let mut state = WireState::default();
+    let mut out: Vec<SseEvent> = Vec::new();
+    for event in canonical_events() {
+        out.extend(provider.encode_stream_event(&cfg, &event, &mut state));
+    }
+    out.extend(provider.encode_stream_done(&cfg, &mut state));
+    out.into_iter()
+        .map(|event| {
+            if let Some(raw) = event.raw {
+                json!({ "raw": raw })
+            } else {
+                event.data
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn openai_completions_reencodes_canonical_stream_into_chunks() {
+    let events = encode_all(ModelFormat::OpenaiCompletions);
+    let types: Vec<&str> = events
+        .iter()
+        .map(|event| event.get("object").and_then(|v| v.as_str()).unwrap_or("done"))
+        .collect();
+
+    assert!(types.iter().all(|kind| *kind == "chat.completion.chunk" || *kind == "done"));
+
+    assert_eq!(events[0]["choices"][0]["delta"]["role"], "assistant");
+    assert_eq!(events[1]["choices"][0]["delta"]["content"], "Hello");
+    assert_eq!(events[2]["choices"][0]["delta"]["tool_calls"][0]["id"], "call_1");
+    assert_eq!(events[2]["choices"][0]["delta"]["tool_calls"][0]["index"], 0);
+    assert_eq!(
+        events[3]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+        "{\"city\":\"Beijing\"}"
+    );
+    assert_eq!(events[4]["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(events[5]["raw"], "[DONE]");
+}
+
+#[test]
+fn openai_responses_reencodes_canonical_stream_into_events() {
+    let events = encode_all(ModelFormat::OpenaiResponses);
+    let kinds: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event.get("type").and_then(|v| v.as_str()))
+        .collect();
+
+    assert!(kinds.contains(&"response.created"));
+    assert!(kinds.contains(&"response.output_item.added"));
+    assert!(kinds.contains(&"response.content_part.added"));
+    assert!(kinds.contains(&"response.output_text.delta"));
+    assert!(kinds.contains(&"response.output_text.done"));
+    assert!(kinds.contains(&"response.function_call_arguments.delta"));
+    assert!(kinds.contains(&"response.completed"));
+
+    let created = events
+        .iter()
+        .find(|event| event["type"] == "response.created")
+        .unwrap();
+    assert_eq!(created["response"]["model"], "gpt-5");
+
+    let delta = events
+        .iter()
+        .find(|event| event["type"] == "response.output_text.delta")
+        .unwrap();
+    assert_eq!(delta["delta"], "Hello");
+
+    let completed = events
+        .iter()
+        .find(|event| event["type"] == "response.completed")
+        .unwrap();
+    assert_eq!(completed["response"]["usage"]["input_tokens"], 3);
+    assert_eq!(completed["response"]["usage"]["output_tokens"], 4);
+}
+
+#[test]
+fn openai_inbound_requests_are_lifted_to_canonical() {
+    let chat = provider_for(ModelFormat::OpenaiCompletions)
+        .decode_request(json!({
+            "model": "gpt-4o",
+            "max_tokens": 100,
+            "messages": [
+                { "role": "system", "content": "Be terse." },
+                { "role": "user", "content": "hi" },
+                { "role": "assistant", "tool_calls": [{ "id": "call_1", "type": "function", "function": { "name": "f", "arguments": "{\"a\":1}" } }] },
+                { "role": "tool", "tool_call_id": "call_1", "content": "ok" }
+            ],
+            "tools": [{ "type": "function", "function": { "name": "f", "parameters": { "type": "object" } } }]
+        }))
+        .unwrap();
+
+    let body = chat.body();
+    assert_eq!(body.max_tokens, Some(100));
+    assert_eq!(body.system.as_ref().unwrap().plain_text(), "Be terse.");
+    assert_eq!(body.messages.len(), 3);
+    assert_eq!(body.messages[0].role, "user");
+    assert_eq!(body.messages[1].role, "assistant");
+    assert_eq!(body.messages[2].role, "user");
+    assert_eq!(body.messages[2].content.blocks()[0].kind, "tool_result");
+    assert_eq!(body.tools.as_ref().unwrap()[0].name, "f");
+
+    let responses = provider_for(ModelFormat::OpenaiResponses)
+        .decode_request(json!({
+            "model": "gpt-5",
+            "instructions": "Be terse.",
+            "input": [
+                { "role": "user", "content": [{ "type": "input_text", "text": "hi" }] },
+                { "type": "function_call", "call_id": "call_9", "name": "f", "arguments": "{}" },
+                { "type": "function_call_output", "call_id": "call_9", "output": "done" }
+            ]
+        }))
+        .unwrap();
+
+    let body = responses.body();
+    assert_eq!(body.system.as_ref().unwrap().plain_text(), "Be terse.");
+    assert_eq!(body.messages.len(), 3);
+    assert_eq!(body.messages[1].content.blocks()[0].kind, "tool_use");
+    assert_eq!(body.messages[2].content.blocks()[0].kind, "tool_result");
+}
+
+#[test]
+fn canonical_responses_are_re_encoded_for_openai_clients() {
+    let canonical = json!({
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "gpt-4o",
+        "content": [
+            { "type": "text", "text": "hi" },
+            { "type": "tool_use", "id": "call_1", "name": "f", "input": { "a": 1 } }
+        ],
+        "stop_reason": "tool_use",
+        "usage": { "input_tokens": 7, "output_tokens": 2 }
+    });
+
+    let chat = provider_for(ModelFormat::OpenaiCompletions)
+        .encode_response(&model(ModelFormat::OpenaiCompletions, "https://api.openai.com/v1"), &canonical)
+        .unwrap();
+    assert_eq!(chat["choices"][0]["message"]["content"], "hi");
+    assert_eq!(chat["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"], "{\"a\":1}");
+    assert_eq!(chat["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(chat["usage"]["total_tokens"], 9);
+
+    let responses = provider_for(ModelFormat::OpenaiResponses)
+        .encode_response(&model(ModelFormat::OpenaiResponses, "https://api.openai.com/v1"), &canonical)
+        .unwrap();
+    let types: Vec<&str> = responses["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(types, vec!["message", "function_call"]);
+    assert_eq!(responses["status"], "completed");
 }

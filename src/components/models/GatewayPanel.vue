@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { Activity, ArrowLeftRight, Copy, LoaderCircle, Power, RefreshCw, Route } from "lucide";
+import { Activity, ArrowLeftRight, Copy, LoaderCircle, RefreshCw, Route } from "lucide";
 
 import MorphIconBox from "@/components/common/MorphIconBox.vue";
 import StatTile from "@/components/common/StatTile.vue";
@@ -18,16 +18,21 @@ import { useGateway } from "@/composables/useGateway";
 import { formatCompact, formatNumber } from "@/lib/format";
 import { notifySuccess } from "@/lib/notify";
 
-const { status, running, loading, start, stop, restart } = useGateway();
+const { status, running, loading, restart } = useGateway();
 
-const statusIcon = computed(() => (running.value ? Activity : Power));
+const baseUrl = computed(() => status.value?.baseUrl ?? "http://127.0.0.1:8931");
+
+const endpoints = computed(() => [
+  { path: "/v1/messages", label: "Anthropic Messages" },
+  { path: "/v1/chat/completions", label: "OpenAI Chat Completions" },
+  { path: "/v1/responses", label: "OpenAI Responses" },
+]);
 
 const sample = computed(
-  () =>
-    `curl ${status.value?.baseUrl ?? "http://127.0.0.1:8931"}/v1/messages \\
+  () => `curl ${baseUrl.value}/v1/messages \\
   -H "content-type: application/json" \\
-  -H "x-api-key: ${status.value?.token ?? "<token>"}" \\
-  -d '{"model":"any","max_tokens":64,"messages":[{"role":"user","content":"ping"}]}'`,
+  -H "x-api-key: aiStart" \\
+  -d '{"model":"aiStart","max_tokens":64,"messages":[{"role":"user","content":"ping"}]}'`,
 );
 
 async function copySample() {
@@ -43,11 +48,11 @@ async function copySample() {
         <div class="space-y-1">
           <CardTitle class="text-base">本地网关</CardTitle>
           <CardDescription class="text-xs">
-            对外暴露 Anthropic Messages 协议，内部按上游协议转发并流式翻译。
+            对外同时暴露三种协议，内部统一翻译后转发到当前启用的上游模型。
           </CardDescription>
         </div>
         <Badge :variant="running ? 'default' : 'outline'" class="gap-1.5">
-          <MorphIconBox :icon="statusIcon" :size="12" />
+          <MorphIconBox :icon="Activity" :size="12" />
           {{ running ? "运行中" : "已停止" }}
         </Badge>
       </div>
@@ -55,7 +60,7 @@ async function copySample() {
 
     <CardContent class="space-y-4">
       <div class="grid grid-cols-4 gap-3">
-        <StatTile label="监听地址" :value="status?.baseUrl ?? '—'" />
+        <StatTile label="监听地址" :value="baseUrl" />
         <StatTile label="累计请求" :value="formatNumber(status?.requests ?? 0)" />
         <StatTile
           label="错误次数"
@@ -80,6 +85,24 @@ async function copySample() {
         </span>
       </div>
 
+      <div class="space-y-1.5">
+        <p class="text-xs text-muted-foreground">对外协议</p>
+        <div class="flex flex-wrap gap-2">
+          <div
+            v-for="endpoint in endpoints"
+            :key="endpoint.path"
+            class="flex items-center gap-2 rounded-md border px-2.5 py-1.5"
+          >
+            <span class="font-mono text-[11px]">{{ endpoint.path }}</span>
+            <span class="text-[11px] text-muted-foreground">{{ endpoint.label }}</span>
+          </div>
+        </div>
+        <p class="text-[11px] text-muted-foreground">
+          三个端点都使用同一个 API Key：<span class="font-mono">aiStart</span>，模型名也固定为
+          <span class="font-mono">aiStart</span>。
+        </p>
+      </div>
+
       <div class="flex flex-wrap items-center gap-2 text-xs">
         <span class="flex items-center gap-1.5 text-muted-foreground">
           <MorphIconBox :icon="ArrowLeftRight" :size="13" />
@@ -89,9 +112,7 @@ async function copySample() {
           {{ status?.autoFailover ? "已开启" : "已关闭" }}
         </Badge>
         <template v-if="status?.autoFailover">
-          <span class="text-muted-foreground">
-            已触发 {{ status.failovers }} 次
-          </span>
+          <span class="text-muted-foreground">已触发 {{ status.failovers }} 次</span>
           <span v-if="status.lastFailover" class="font-mono text-muted-foreground">
             {{ status.lastFailover }}
           </span>
@@ -125,23 +146,13 @@ async function copySample() {
     </CardContent>
 
     <div class="flex flex-wrap gap-2 px-6 pb-6">
-      <Button
-        v-if="!running"
-        size="sm"
-        class="gap-2"
-        :disabled="loading"
-        @click="start"
-      >
-        <MorphIconBox :icon="loading ? LoaderCircle : Power" :size="15" :class="loading ? 'animate-spin' : ''" />
-        启动网关
-      </Button>
-      <Button v-else variant="outline" size="sm" class="gap-2" :disabled="loading" @click="stop">
-        <MorphIconBox :icon="Power" :size="15" />
-        停止网关
-      </Button>
-      <Button variant="ghost" size="sm" class="gap-2" :disabled="loading" @click="restart">
-        <MorphIconBox :icon="RefreshCw" :size="15" />
-        重启
+      <Button variant="outline" size="sm" class="gap-2" :disabled="loading" @click="restart">
+        <MorphIconBox
+          :icon="loading ? LoaderCircle : RefreshCw"
+          :size="15"
+          :class="loading ? 'animate-spin' : ''"
+        />
+        重启网关
       </Button>
     </div>
   </Card>

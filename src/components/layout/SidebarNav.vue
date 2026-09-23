@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { useRoute } from "vue-router";
-import { BrainCircuit, Boxes, LayoutDashboard } from "@lucide/vue";
+import { BarChart3, Boxes, BrainCircuit, LayoutDashboard } from "@lucide/vue";
 
 import { cn } from "@/lib/utils";
 
@@ -11,6 +11,7 @@ const items = [
   { name: "dashboard", label: "面板", to: "/dashboard", icon: LayoutDashboard },
   { name: "apps", label: "应用", to: "/apps", icon: Boxes },
   { name: "models", label: "模型", to: "/models", icon: BrainCircuit },
+  { name: "stats", label: "统计", to: "/stats", icon: BarChart3 },
 ];
 
 const activeName = computed(() => String(route.name ?? ""));

@@ -33,14 +33,6 @@ impl ModelFormat {
         }
     }
 
-    pub fn description(&self) -> &'static str {
-        match self {
-            ModelFormat::AnthropicMessages => "POST /v1/messages，Claude 原生协议，网关直通",
-            ModelFormat::OpenaiCompletions => "POST /chat/completions，最通用的 OpenAI 兼容协议",
-            ModelFormat::OpenaiResponses => "POST /responses，OpenAI 新一代有状态响应协议",
-        }
-    }
-
     pub fn default_base_url(&self) -> &'static str {
         match self {
             ModelFormat::AnthropicMessages => "https://api.anthropic.com",
@@ -106,14 +98,4 @@ pub struct ModelInput {
     pub model: String,
     #[serde(default)]
     pub supports_1m: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ModelPreset {
-    pub name: String,
-    pub format: ModelFormat,
-    pub base_url: String,
-    pub model: String,
-    pub note: String,
 }

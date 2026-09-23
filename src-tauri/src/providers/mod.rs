@@ -2,7 +2,7 @@ pub mod anthropic_messages;
 pub mod openai_completions;
 pub mod openai_responses;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
 use serde_json::{json, Value};
@@ -17,6 +17,7 @@ pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 pub struct SseEvent {
     pub event: String,
     pub data: Value,
+    pub raw: Option<String>,
 }
 
 impl SseEvent {
@@ -24,8 +25,38 @@ impl SseEvent {
         Self {
             event: event.into(),
             data,
+            raw: None,
         }
     }
+
+    /// An event whose payload is not JSON (for example OpenAI's `[DONE]` marker).
+    pub fn raw(payload: impl Into<String>) -> Self {
+        Self {
+            event: String::new(),
+            data: Value::Null,
+            raw: Some(payload.into()),
+        }
+    }
+}
+
+/// State used when re-encoding canonical (Anthropic) events into another wire format.
+#[derive(Debug, Default)]
+pub struct WireState {
+    pub started: bool,
+    pub done_sent: bool,
+    pub model: String,
+    pub response_id: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub next_output_index: i64,
+    pub text_block_index: Option<i64>,
+    pub text_output_index: i64,
+    pub text_item_open: bool,
+    pub text_item_id: String,
+    pub text_buffer: String,
+    pub tool_indices: BTreeMap<i64, i64>,
+    pub tool_meta: BTreeMap<i64, (String, String)>,
+    pub tool_args: BTreeMap<i64, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,6 +260,31 @@ pub trait ModelProvider: Send + Sync {
 
     fn decode_stream_done(&self, _cfg: &ModelConfig, state: &mut StreamState) -> AppResult<Vec<SseEvent>> {
         Ok(state.finish("end_turn"))
+    }
+
+    /// Client wire request -> canonical request. Default assumes the canonical (Anthropic) shape.
+    fn decode_request(&self, raw: Value) -> AppResult<CanonicalRequest> {
+        CanonicalRequest::parse(raw)
+    }
+
+    /// Canonical response -> client wire response. Default passes the canonical shape through.
+    fn encode_response(&self, _cfg: &ModelConfig, canonical: &Value) -> AppResult<Value> {
+        Ok(canonical.clone())
+    }
+
+    /// Canonical stream event -> client wire stream events.
+    fn encode_stream_event(
+        &self,
+        _cfg: &ModelConfig,
+        canonical: &SseEvent,
+        _state: &mut WireState,
+    ) -> Vec<SseEvent> {
+        vec![canonical.clone()]
+    }
+
+    /// Final client wire events once the upstream stream ends.
+    fn encode_stream_done(&self, _cfg: &ModelConfig, _state: &mut WireState) -> Vec<SseEvent> {
+        Vec::new()
     }
 }
 

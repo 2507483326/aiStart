@@ -2,13 +2,46 @@
 
 管理开发者工具的桌面工具箱：**一键安装、一键更新、一键把任意模型接入桌面客户端**。
 
-目前有左侧边栏的三个页面：
+目前有左侧边栏的四个页面：
 
 - **面板** — 本地网关的运行状态、调用统计、自动切换情况，以及应用/模型总览
 - **应用** — Claude Desktop、DeepSeek Desktop，负责安装 / 更新 / 模型接入
 - **模型** — 统一管理三种上游协议的模型，并支持自动切换
+- **统计** — Token 消耗贡献图与每一次请求的明细
 
 技术栈：Tauri 2 + Vue 3 + vue-router + Tailwind CSS v4 + shadcn-vue + morphicons。
+
+---
+
+## 网关对外协议
+
+网关在 `127.0.0.1` 上**同时暴露三种协议**，入站用哪种协议、上游用哪种协议互不影响：
+
+| 端点 | 入站协议 |
+| --- | --- |
+| `POST /v1/messages` | Anthropic Messages |
+| `POST /v1/chat/completions` | OpenAI Chat Completions |
+| `POST /v1/responses` | OpenAI Responses |
+| `GET /v1/models` | 兼容两种列表格式 |
+
+- **API Key 固定为 `aiStart`**，模型名也固定为 `aiStart`（可在 `gateway/mod.rs` 的常量中修改）。
+  `x-api-key` 与 `Authorization: Bearer` 两种携带方式都接受。
+- 错误响应会跟随入站协议：Anthropic 返回 `{"type":"error","error":{...}}`，
+  OpenAI 返回 `{"error":{...}}`。
+
+一次请求的完整链路是：
+
+```
+客户端(协议 A) → decode_request → 规范请求
+              → 上游 Provider.encode_request → 上游(协议 B)
+              → 上游 Provider.decode_response/decode_stream_event → 规范响应/事件
+              → Provider(A).encode_response/encode_stream_event → 客户端(协议 A)
+```
+
+`anthropic-messages` 的这四个方法全部使用默认实现（恒等变换），所以它天然是"直通"路径；
+另外两种协议各自实现双向翻译。流式情况下规范事件会经过 `encode_stream_event` 重新编码，
+OpenAI Completions 输出 `chat.completion.chunk` + `data: [DONE]`，
+Responses 输出 `response.created` / `response.output_text.delta` / `response.completed` 事件序列。
 
 ---
 
@@ -74,19 +107,30 @@ message_start → content_block_start → content_block_delta* → content_block
 ## 模型管理与自动切换
 
 模型表单只保留接入必需的字段：显示名称、上游协议、Base URL、API Key、上游模型 ID，
-以及一个「支持 1M 上下文」开关。
+以及一个「支持 1M 上下文」勾选框。
 
-- **获取模型列表**：按所选协议请求上游的模型列表接口（`{base}/v1/models`），
-  支持 OpenAI 的 `{data:[{id}]}`、Anthropic 的 `{data:[{id,display_name}]}`、
-  Ollama 的 `{models:[{name}]}` 以及裸数组等常见返回结构，结果去重排序后可直接选中。
+- **获取模型列表 + 可搜索下拉**：按所选协议请求上游模型列表（`{base}/v1/models`），
+  解析 OpenAI `{data:[{id}]}`、Anthropic `{data:[{id,display_name}]}`、
+  Ollama `{models:[{name}]}` 与裸数组等结构，去重排序后直接填入输入框内的下拉，
+  下拉自带搜索框（输入即过滤），也允许直接手填未在列表中的 ID。
 - **支持 1M 上下文**：勾选后会以 `supports1m` + `prefer1m` 写入 Claude Desktop 的
   `inferenceModels`，Claude 的模型选择器会额外提供一个 1M 变体。
+- **启用 / 使用中**：列表每行右侧的按钮用于切换当前接管的模型，启用后该行会变绿。
 - **自动切换**：模型列表右上角的开关。开启后，网关向上游发起请求失败时
   （网络错误、5xx、401/403/404/408/429），会按列表顺序自动尝试下一个模型，
   成功后继续本次请求。面板会显示已触发次数与最近一次 `X → Y` 的切换记录。
 
 请求本身的形状错误（400/422）不会触发切换 —— 那种错误换模型也一样会失败，
 只会掩盖真正的问题。
+
+## 用量统计
+
+每次经由网关的调用都会追加一条记录到 `<配置目录>/usage.jsonl`（超过 20000 条自动裁剪到 10000 条），
+记录包含时间、入站/上游协议、模型、输入/输出 Token、耗时、是否成功、是否发生了自动切换。
+
+「统计」页面顶部是 GitHub 风格的贡献图（最近 53 周的每日 Token 消耗，5 档颜色），
+下面是逐条请求的明细表。`usage_summary(days)` 返回按天与按模型的聚合，
+`usage_records(limit)` 返回最近的明细。
 
 ## 平台抽象
 
@@ -107,9 +151,9 @@ src-tauri/src/platform/
 HKEY_CURRENT_USER\SOFTWARE\Policies\Claude
   inferenceProvider            = gateway
   inferenceGatewayBaseUrl      = http://127.0.0.1:<port>
-  inferenceGatewayApiKey       = <本机生成的 token>
+  inferenceGatewayApiKey       = aiStart
   inferenceGatewayAuthScheme   = bearer
-  inferenceModels              = [{"name":"ai-start-...","labelOverride":"..."}]
+  inferenceModels              = [{"name":"aiStart","labelOverride":"..."}]
   modelDiscoveryEnabled        = false
   disableDeploymentModeChooser = true
 ```
@@ -141,22 +185,24 @@ DeepSeek Desktop 没有公开的程序化配置格式，因此这里是**按最�
 
 ```
 ├── src/                          # 前端
-│   ├── pages/                    # 页面：AppsPage / ModelsPage
+│   ├── pages/                    # 页面：Dashboard / Apps / Models / Stats
 │   ├── components/
 │   │   ├── apps/                 # 应用卡片等
-│   │   ├── models/               # 模型卡片 / 表单 / 网关面板
-│   │   ├── layout/               # AppShell / NavTabs / SettingsDialog
+│   │   ├── models/               # 模型行 / 表单 / 网关面板
+│   │   ├── stats/                # 贡献图
+│   │   ├── layout/               # AppShell / SidebarNav / SettingsDialog
 │   │   ├── common/               # 通用：MorphIconBox / EmptyState / ConfirmDialog ...
 │   │   └── ui/                   # shadcn-vue 组件
-│   ├── composables/              # useApps / useModels / useGateway / useSettings
+│   ├── composables/              # useApps / useModels / useGateway / useUsage / useSettings
 │   ├── lib/                      # ipc（invoke 封装）/ types / format / notify / open
 │   └── router/
 └── src-tauri/src/                # 后端
     ├── domain/                   # 领域模型 + 规范请求 + 内置目录
-    ├── providers/                # 三种协议的策略实现
+    ├── providers/                # 三种协议的双向翻译（decode/encode 请求、响应、事件流）
     ├── platform/                 # 客户端配置适配层
-    ├── gateway/                  # 本地网关（axum + SSE）
+    ├── gateway/                  # 本地网关（axum + SSE + 用量记录）
     ├── commands/                 # Tauri 命令
+    ├── usage.rs                  # 用量记录与聚合
     └── settings.rs               # 配置持久化
 ```
 
