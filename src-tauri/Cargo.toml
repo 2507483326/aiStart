@@ -1,0 +1,50 @@
+[package]
+name = "ai-start"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "ai_start_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2.0.20"
+anyhow = "1.0.104"
+dirs = "7.0.0"
+chrono = "0.4.45"
+uuid = { version = "1.26.1", features = ["serde", "v4"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "fs", "net", "time", "io-util", "process"] }
+axum = "0.8.9"
+tower = "0.5.3"
+tower-http = { version = "0.7.1", features = ["cors"] }
+futures-util = "0.3.34"
+bytes = "1.12.1"
+async-stream = "0.3.6"
+tokio-stream = "0.1.19"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream", "native-tls"] }
+
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
+
+[target."cfg(windows)".dependencies]
+winreg = "0.56.0"
