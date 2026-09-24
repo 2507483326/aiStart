@@ -41,7 +41,7 @@ onMounted(async () => {
         <CardHeader>
           <div class="flex items-center justify-between">
             <div class="space-y-1">
-              <CardTitle class="text-base">应用接入</CardTitle>
+              <CardTitle>应用接入</CardTitle>
               <CardDescription class="text-xs">
                 已安装的桌面客户端及其当前接入的模型
               </CardDescription>
@@ -57,7 +57,7 @@ onMounted(async () => {
             <div
               v-for="app in apps"
               :key="app.kind"
-              class="-mx-2 flex items-center justify-between gap-3 rounded-md px-2 py-1.5 transition-colors hover:bg-accent/40"
+              class="-mx-2 flex items-center justify-between gap-3 rounded-md px-2 py-1.5 transition-colors duration-150 hover:bg-accent/50"
             >
               <div class="flex min-w-0 items-center gap-2.5">
                 <MorphIconBox :icon="Boxes" :size="16" class="text-muted-foreground" />
@@ -70,10 +70,10 @@ onMounted(async () => {
                 </div>
               </div>
               <div class="flex shrink-0 items-center gap-2">
-                <Badge :variant="app.installed ? 'outline' : 'secondary'" class="text-[10px]">
+                <Badge :variant="app.installed ? 'outline' : 'secondary'">
                   {{ app.installed ? "已安装" : "未安装" }}
                 </Badge>
-                <Badge v-if="app.appliedModelName" class="gap-1 text-[10px]">
+                <Badge v-if="app.appliedModelName" class="gap-1">
                   <MorphIconBox :icon="CircleCheck" :size="10" />
                   {{ app.appliedModelName }}
                 </Badge>
@@ -88,7 +88,7 @@ onMounted(async () => {
         <CardHeader>
           <div class="flex items-center justify-between">
             <div class="space-y-1">
-              <CardTitle class="text-base">模型概览</CardTitle>
+              <CardTitle>模型概览</CardTitle>
               <CardDescription class="text-xs">
                 共 {{ models.length }} 个上游模型，网关当前接管
                 {{ activeModel?.name ?? "未设置" }}
@@ -104,7 +104,7 @@ onMounted(async () => {
           <div v-if="models.length" class="space-y-2.5">
             <template v-for="(model, index) in models" :key="model.id">
               <Separator v-if="index > 0" />
-              <div class="-mx-2 flex items-center justify-between gap-3 rounded-md px-2 py-1.5 transition-colors hover:bg-accent/40">
+              <div class="-mx-2 flex items-center justify-between gap-3 rounded-md px-2 py-1.5 transition-colors duration-150 hover:bg-accent/50">
                 <div class="flex min-w-0 items-center gap-2.5">
                   <MorphIconBox
                     :icon="BrainCircuit"
@@ -123,8 +123,8 @@ onMounted(async () => {
                   </div>
                 </div>
                 <div class="flex shrink-0 items-center gap-1.5">
-                  <Badge v-if="model.supports1m" variant="outline" class="text-[10px]">1M</Badge>
-                  <Badge v-if="model.id === activeModel?.id" variant="secondary" class="text-[10px]">
+                  <Badge v-if="model.supports1m" variant="outline">1M</Badge>
+                  <Badge v-if="model.id === activeModel?.id" variant="secondary">
                     启用中
                   </Badge>
                 </div>

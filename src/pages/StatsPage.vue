@@ -94,7 +94,7 @@ function openAll(): void {
       <CardHeader>
         <div class="flex items-start justify-between gap-3">
           <div class="space-y-1">
-            <CardTitle class="text-base">Token 贡献</CardTitle>
+            <CardTitle>Token 贡献</CardTitle>
             <CardDescription class="text-xs">
               {{ year }} 年每天的 Token 消耗量，颜色越深消耗越多。
             </CardDescription>
@@ -119,7 +119,7 @@ function openAll(): void {
     <Card>
       <CardHeader>
         <div class="space-y-1">
-          <CardTitle class="text-base">请求明细</CardTitle>
+          <CardTitle>请求明细</CardTitle>
           <CardDescription class="text-xs">
             每次经由网关的调用及其 Token 消耗，最新 {{ PREVIEW_LIMIT }} 条。
           </CardDescription>
@@ -137,7 +137,7 @@ function openAll(): void {
         </CardAction>
       </CardHeader>
       <CardContent>
-        <RequestTable :records="records" />
+        <RequestTable :records="records" scroll />
       </CardContent>
     </Card>
   </div>

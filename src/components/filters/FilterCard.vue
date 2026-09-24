@@ -8,49 +8,23 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { useFilters } from "@/composables/useFilters";
-import type { FilterRule, RequestFilter } from "@/lib/types";
+import type { PromptMode, RequestFilter } from "@/lib/types";
 
 const props = defineProps<{ filter: RequestFilter }>();
 const emit = defineEmits<{ edit: [filter: RequestFilter] }>();
 
 const { setEnabled, remove } = useFilters();
 
-const KIND_LABELS: Record<FilterRule["kind"], string> = {
-  "system-prompt": "系统提示词",
-  "request-params": "请求参数",
-  "text-replace": "文本替换",
-};
+const KIND_LABEL = "系统提示词";
 
-const MODE_LABELS: Record<string, string> = {
+const MODE_LABELS: Record<PromptMode, string> = {
   append: "追加到末尾",
   prepend: "插入到开头",
-  replace: "整体替换",
 };
-
-const TARGET_LABELS: Record<string, string> = {
-  system: "system",
-  messages: "messages",
-  all: "system + messages",
-};
-
-const kindLabel = computed(() => KIND_LABELS[props.filter.rule.kind]);
 
 const summary = computed(() => {
   const rule = props.filter.rule;
-  switch (rule.kind) {
-    case "system-prompt":
-      return `${MODE_LABELS[rule.mode]}：${truncate(rule.text)}`;
-    case "request-params": {
-      const parts: string[] = [];
-      if (rule.temperature !== null) parts.push(`temperature=${rule.temperature}`);
-      if (rule.maxTokens !== null) parts.push(`max_tokens=${rule.maxTokens}`);
-      if (rule.topP !== null) parts.push(`top_p=${rule.topP}`);
-      if (rule.stopSequences?.length) parts.push(`stop=${rule.stopSequences.join(",")}`);
-      return parts.length ? parts.join(" · ") : "未设置任何参数";
-    }
-    case "text-replace":
-      return `${TARGET_LABELS[rule.target]}：「${truncate(rule.find)}」→「${truncate(rule.replace)}」`;
-  }
+  return `${MODE_LABELS[rule.mode]}：${truncate(rule.text)}`;
 });
 
 function truncate(text: string): string {
@@ -60,7 +34,7 @@ function truncate(text: string): string {
 
 <template>
   <div
-    class="flex items-center gap-4 rounded-lg border bg-card px-4 py-3 transition-all"
+    class="flex items-center gap-4 rounded-lg border bg-card px-4 py-3 transition-[border-color,background-color] duration-200"
     :class="
       filter.enabled ? 'border-emerald-500/40' : 'hover:border-foreground/20 hover:bg-accent/30'
     "
@@ -68,7 +42,7 @@ function truncate(text: string): string {
     <div class="min-w-0 flex-1">
       <div class="flex flex-wrap items-center gap-2">
         <p class="truncate text-sm font-medium">{{ filter.name }}</p>
-        <Badge variant="outline" class="text-[10px]">{{ kindLabel }}</Badge>
+        <Badge variant="outline">{{ KIND_LABEL }}</Badge>
       </div>
       <p class="mt-0.5 truncate font-mono text-xs text-muted-foreground">{{ summary }}</p>
     </div>
@@ -93,7 +67,7 @@ function truncate(text: string): string {
         <MorphIconBox :icon="Pencil" :size="14" />
       </Button>
       <ConfirmDialog
-        title="删除过滤器"
+        title="删除提示词注入"
         :description="`确定删除「${filter.name}」吗？该操作不可撤销。`"
         confirm-text="删除"
         destructive

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { Activity, ArrowLeftRight, Copy, LoaderCircle, RefreshCw, Route } from "lucide";
 
 import MorphIconBox from "@/components/common/MorphIconBox.vue";
@@ -7,49 +7,82 @@ import StatTile from "@/components/common/StatTile.vue";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useGateway } from "@/composables/useGateway";
-import { formatCompact, formatNumber } from "@/lib/format";
+import { cacheHitRate, formatCompact, formatNumber, formatPercent } from "@/lib/format";
+import { usageApi } from "@/lib/ipc";
 import { notifySuccess } from "@/lib/notify";
+import type { UsageSummary } from "@/lib/types";
 
 const { status, running, loading, restart } = useGateway();
 
 const baseUrl = computed(() => status.value?.baseUrl ?? "http://127.0.0.1:8931");
 
-const endpoints = computed(() => [
-  { path: "/v1/messages", label: "Anthropic Messages" },
-  { path: "/v1/chat/completions", label: "OpenAI Chat Completions" },
-  { path: "/v1/responses", label: "OpenAI Responses" },
-]);
+const endpoints = [
+  { path: "/v1/messages", label: "Messages" },
+  { path: "/v1/chat/completions", label: "Completions" },
+  { path: "/v1/responses", label: "Responses" },
+];
+const selectedEndpoint = ref(endpoints[0]);
+const endpointUrl = computed(() => `${baseUrl.value}${selectedEndpoint.value.path}`);
+
+// 面板只展示当日用量，口径与「统计」页一致。
+const today = ref<UsageSummary | null>(null);
+
+const cacheRead = computed(() => today.value?.cacheReadTokens ?? 0);
+const cacheHit = computed(() =>
+  formatPercent(
+    cacheHitRate({
+      inputTokens: today.value?.inputTokens ?? 0,
+      cacheReadTokens: today.value?.cacheReadTokens,
+      cacheWriteTokens: today.value?.cacheWriteTokens,
+    }),
+  ),
+);
+
+async function loadToday() {
+  today.value = await usageApi.summary(1);
+}
+
+async function handleRestart() {
+  if (await restart()) await loadToday();
+}
 
 const sample = computed(
   () => `curl ${baseUrl.value}/v1/messages \\
   -H "content-type: application/json" \\
-  -H "x-api-key: claude-desktop" \\
-  -d '{"model":"claude-sonnet-5","max_tokens":64,"messages":[{"role":"user","content":"ping"}]}'`,
+  -H "x-api-key: aiStartClaude" \\
+  -d '{"model":"aiStart","max_tokens":64,"messages":[{"role":"user","content":"ping"}]}'`,
 );
 
-async function copySample() {
-  await navigator.clipboard.writeText(sample.value);
-  notifySuccess("调用示例已复制");
+async function copyText(text: string, message: string) {
+  await navigator.clipboard.writeText(text);
+  notifySuccess(message);
 }
+
+onMounted(loadToday);
 </script>
 
 <template>
   <Card>
     <CardHeader>
-      <div class="flex items-start justify-between gap-3">
-        <div class="space-y-1">
-          <CardTitle class="text-base">本地网关</CardTitle>
-          <CardDescription class="text-xs">
-            对外同时暴露三种协议，内部统一翻译后转发到当前启用的上游模型。
-          </CardDescription>
+      <div class="flex items-center justify-between gap-3">
+        <div class="flex items-center gap-2">
+          <CardTitle>本地网关</CardTitle>
+          <Button
+            variant="outline"
+            size="sm"
+            class="gap-1.5"
+            :disabled="loading"
+            @click="handleRestart"
+          >
+            <MorphIconBox
+              :icon="loading ? LoaderCircle : RefreshCw"
+              :size="14"
+              :class="loading ? 'animate-spin' : ''"
+            />
+            重启网关
+          </Button>
         </div>
         <Badge :variant="running ? 'default' : 'outline'" class="gap-1.5">
           <MorphIconBox :icon="Activity" :size="12" />
@@ -59,54 +92,25 @@ async function copySample() {
     </CardHeader>
 
     <CardContent class="space-y-4">
-      <div class="grid grid-cols-4 gap-3">
-        <StatTile label="监听地址" :value="baseUrl" />
-        <StatTile label="累计请求" :value="formatNumber(status?.requests ?? 0)" />
+      <div class="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-5">
+        <StatTile label="监听地址" :value="baseUrl" value-class="text-sm" />
+        <StatTile label="今日请求" :value="formatNumber(today?.totalRequests ?? 0)" />
         <StatTile
-          label="错误次数"
-          :value="formatNumber(status?.errors ?? 0)"
-          :tone="(status?.errors ?? 0) > 0 ? 'danger' : 'default'"
+          label="今日错误"
+          :value="formatNumber(today?.failedRequests ?? 0)"
+          :tone="(today?.failedRequests ?? 0) > 0 ? 'danger' : 'default'"
+        />
+        <StatTile
+          label="缓存命中"
+          :value="cacheHit"
+          :hint="`缓存读 ${formatCompact(cacheRead)}`"
+          :tone="cacheRead > 0 ? 'success' : 'default'"
         />
         <StatTile
           label="输出 Token"
-          :value="formatCompact(status?.outputTokens ?? 0)"
-          :hint="`输入 ${formatCompact(status?.inputTokens ?? 0)}`"
+          :value="formatCompact(today?.outputTokens ?? 0)"
+          :hint="`输入 ${formatCompact(today?.inputTokens ?? 0)}`"
         />
-      </div>
-
-      <div class="flex flex-wrap items-center gap-2 text-xs">
-        <span class="text-muted-foreground">接管模型</span>
-        <Badge v-if="status?.activeModelName" variant="secondary">
-          {{ status.activeModelName }}
-        </Badge>
-        <span v-else class="text-muted-foreground">尚未设置</span>
-        <span v-if="status?.activeModelFormat" class="font-mono text-muted-foreground">
-          {{ status.activeModelFormat }}
-        </span>
-      </div>
-
-      <div class="space-y-1.5">
-        <p class="text-xs text-muted-foreground">对外协议</p>
-        <div class="flex flex-wrap gap-2">
-          <div
-            v-for="endpoint in endpoints"
-            :key="endpoint.path"
-            class="flex items-center gap-2 rounded-md border px-2.5 py-1.5 transition-colors hover:bg-accent/40"
-          >
-            <span class="font-mono text-[11px]">{{ endpoint.path }}</span>
-            <span class="text-[11px] text-muted-foreground">{{ endpoint.label }}</span>
-          </div>
-        </div>
-        <p class="text-[11px] text-muted-foreground">
-          三个端点接受任意非空 API Key（网关只校验非空），并按 Key 匹配来源应用：应用接入时会自动写入各自的专属
-          Key（<span class="font-mono">claude-desktop</span> /
-          <span class="font-mono">deepseek-desktop</span>），未匹配的 Key 会原样记录在「请求」页的来源列。模型名必须是
-          Claude 能识别的 <span class="font-mono">claude-*</span> 路由（对外提供
-          <span class="font-mono">claude-sonnet-5</span> /
-          <span class="font-mono">claude-opus-5</span> /
-          <span class="font-mono">claude-haiku-4-5</span> /
-          <span class="font-mono">claude-fable-5</span>），实际转发到的是当前启用的上游模型。
-        </p>
       </div>
 
       <div class="flex flex-wrap items-center gap-2 text-xs">
@@ -136,30 +140,95 @@ async function copySample() {
         </AlertDescription>
       </Alert>
 
-      <div class="space-y-1.5">
+      <div class="space-y-2">
+        <p class="text-sm text-muted-foreground">对接说明</p>
+        <div class="divide-y rounded-md border bg-muted/40 text-sm">
+          <div class="space-y-2 px-3 py-2.5 transition-colors duration-150 hover:bg-accent/30">
+            <div class="flex flex-wrap items-center gap-2">
+              <span class="text-muted-foreground">接口地址</span>
+              <div class="flex gap-0.5 rounded-md border bg-background p-0.5">
+                <button
+                  v-for="endpoint in endpoints"
+                  :key="endpoint.path"
+                  type="button"
+                  class="rounded px-2 py-0.5 text-xs transition-colors"
+                  :class="
+                    endpoint.path === selectedEndpoint.path
+                      ? 'bg-primary text-primary-foreground'
+                      : 'text-muted-foreground hover:bg-accent'
+                  "
+                  @click="selectedEndpoint = endpoint"
+                >
+                  {{ endpoint.label }}
+                </button>
+              </div>
+            </div>
+            <div class="flex items-center gap-2">
+              <span class="min-w-0 flex-1 break-all font-mono text-foreground">
+                {{ endpointUrl }}
+              </span>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                class="shrink-0 text-muted-foreground"
+                aria-label="复制接口地址"
+                @click="copyText(endpointUrl, '接口地址已复制')"
+              >
+                <MorphIconBox :icon="Copy" :size="14" />
+              </Button>
+            </div>
+          </div>
+
+          <div class="flex items-center gap-2 px-3 py-2.5 transition-colors duration-150 hover:bg-accent/30">
+            <span class="shrink-0 text-muted-foreground">API Key</span>
+            <span class="min-w-0 flex-1 break-all font-mono text-foreground">
+              aiStart<span class="text-muted-foreground">[应用名称]</span>
+            </span>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              class="shrink-0 text-muted-foreground"
+              aria-label="复制 API Key"
+              @click="copyText('aiStart', 'API Key 已复制')"
+            >
+              <MorphIconBox :icon="Copy" :size="14" />
+            </Button>
+          </div>
+
+          <div class="flex items-center gap-2 px-3 py-2.5 transition-colors duration-150 hover:bg-accent/30">
+            <span class="shrink-0 text-muted-foreground">模型名称</span>
+            <span class="min-w-0 flex-1 font-mono text-foreground">aiStart</span>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              class="shrink-0 text-muted-foreground"
+              aria-label="复制模型名称"
+              @click="copyText('aiStart', '模型名称已复制')"
+            >
+              <MorphIconBox :icon="Copy" :size="14" />
+            </Button>
+          </div>
+        </div>
+      </div>
+
+      <div class="space-y-2">
         <div class="flex items-center justify-between">
-          <p class="text-xs text-muted-foreground">调用示例</p>
-          <Button variant="ghost" size="sm" class="gap-1.5" @click="copySample">
-            <MorphIconBox :icon="Copy" :size="13" />
+          <p class="text-sm text-muted-foreground">调用示例</p>
+          <Button
+            variant="ghost"
+            size="sm"
+            class="gap-1.5"
+            @click="copyText(sample, '调用示例已复制')"
+          >
+            <MorphIconBox :icon="Copy" :size="14" />
             复制
           </Button>
         </div>
         <pre
-          class="overflow-x-auto rounded-md border bg-muted/40 px-3 py-2 font-mono text-[11px] leading-relaxed"
+          class="overflow-x-auto rounded-md border bg-muted/40 px-3 py-2 font-mono text-sm leading-relaxed"
           >{{ sample }}</pre
         >
       </div>
     </CardContent>
-
-    <div class="flex flex-wrap gap-2 px-6 pb-6">
-      <Button variant="outline" size="sm" class="gap-2" :disabled="loading" @click="restart">
-        <MorphIconBox
-          :icon="loading ? LoaderCircle : RefreshCw"
-          :size="15"
-          :class="loading ? 'animate-spin' : ''"
-        />
-        重启网关
-      </Button>
-    </div>
   </Card>
 </template>

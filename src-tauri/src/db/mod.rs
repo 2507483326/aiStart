@@ -9,7 +9,7 @@ use crate::error::{AppError, AppResult};
 pub const SCHEMA_SQL: &str = include_str!("schema.sql");
 
 /// 当前 schema 版本号，写入 schema_meta.db_schema_version。
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 static DB: OnceLock<Mutex<Connection>> = OnceLock::new();
 
@@ -26,6 +26,13 @@ pub fn init(dir: &Path) -> AppResult<()> {
     // 所以必须在执行 DDL 之前对「已存在的表」补列（新库由 schema.sql 直接建出带列的表，这里跳过）。
     ensure_column(&connection, "usage_detail", "source_app", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(&connection, "app_model_bindings", "token", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(&connection, "usage_payload", "upstream_request", "TEXT")?;
+    ensure_column(
+        &connection,
+        "usage_payload",
+        "upstream_request_truncated",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
 
     connection.execute_batch(SCHEMA_SQL)?;
 

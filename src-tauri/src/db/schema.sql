@@ -1,11 +1,12 @@
 -- =====================================================================
--- AI Start SQLite schema v4（db_schema_version = 4）
+-- AI Start SQLite schema v5（db_schema_version = 5）
 -- v1 首次落库：app_settings / models / app_model_bindings（配置与模型，取代 settings.json）、
 -- usage_detail / usage_daily_total（token 消耗，取代 usage.jsonl）、events（审计事件）、
 -- app_version_records（应用版本检查与更新记录）。
 -- v2 新增：usage_payload（单次调用的请求/响应报文，供「请求明细抽屉」查看）。
 -- v3 新增：request_filters（请求转发前按规则改写请求的过滤器）。
 -- v4 新增：usage_detail.source_app（请求来源应用 / 原样 token）、app_model_bindings.token（应用专属网关 Key）。
+-- v5 新增：usage_payload.upstream_request / upstream_request_truncated（提示词注入后实际发往上游的请求体）。
 --
 -- 规范（对齐 eTeam：C:\eTeam\src\host\state\schema.sql）：
 --   主键 = 每张表自己的编号列，统一 INTEGER 自增（仅 schema_meta / app_settings 以 key 为主键，
@@ -171,15 +172,18 @@ CREATE INDEX IF NOT EXISTS idx_app_model_bindings_kind ON app_model_bindings (ap
 -- ---------------------------------------------------------------------
 -- 8. usage_payload —— 请求/响应报文（一行 = 一次网关调用的报文快照）
 --    与 usage_detail 一比一（usage_detail_id 松引用，不建外键）；
---    存「原生报文」：请求为客户端原始 body，响应为上游原生形状（流式按事件拼装后再转回上游协议原生形状），
+--    存「原生报文」：入站请求为客户端原始 body，上游请求为注入后实际发出的 body，
+--    响应为上游原生形状（流式按事件拼装后再转回上游协议原生形状），
 --    由前端按入站/上游协议解析展示；受写入时的保留策略约束（只留最近若干条，会被清理）
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS usage_payload (
   usage_payload_id   INTEGER PRIMARY KEY AUTOINCREMENT,  -- 报文行号，自增
   usage_detail_id    INTEGER NOT NULL,   -- 关联明细行 usage_detail.usage_detail_id（松引用）
   inbound_request    TEXT,               -- 客户端发来的原始请求体（原生协议 JSON）；未捕获为 NULL
+  upstream_request   TEXT,               -- 提示词注入后实际发往上游的请求体（上游协议原生形状）；未捕获为 NULL
   upstream_response  TEXT,               -- 上游原生响应：非流式=上游返回原文；流式=拼装后转回上游协议原生形状
   request_truncated  INTEGER NOT NULL DEFAULT 0,  -- 1=入站请求体因超上限被截断
+  upstream_request_truncated INTEGER NOT NULL DEFAULT 0,  -- 1=上游请求体因超上限被截断
   response_truncated INTEGER NOT NULL DEFAULT 0,  -- 1=上游响应因超上限被截断
   is_stream          INTEGER NOT NULL DEFAULT 0,  -- 1=流式（响应为拼装结果）/ 0=非流式（上游原文）
   created_time       INTEGER NOT NULL,   -- 入库时刻
@@ -191,10 +195,8 @@ CREATE INDEX IF NOT EXISTS idx_usage_payload_time   ON usage_payload (created_ti
 
 -- ---------------------------------------------------------------------
 -- 9. request_filters —— 请求过滤器（网关把请求转发给上游前，按 sort_order 依次套用的改写规则）
---    每条规则一个动作（策略），三种 rule_kind：
---      system-prompt  注入系统提示词（mode=append/prepend/replace）
---      request-params 覆盖请求参数（temperature / max_tokens / top_p / stop_sequences）
---      text-replace   文本字面量查找替换（find/replace/target=system/messages/all）
+--    每条规则一个动作（策略），当前只有一种 rule_kind：
+--      system-prompt  注入系统提示词（mode=append/prepend）
 --    规则体按 rule_kind 存放在 rule_config（JSON），rule_kind 仅作展示与索引的冗余列；
 --    只有 enabled=1 的规则参与执行，顺序即 sort_order（本期等于创建顺序，不提供上移/下移）
 -- ---------------------------------------------------------------------
@@ -203,7 +205,7 @@ CREATE TABLE IF NOT EXISTS request_filters (
   name              TEXT NOT NULL,             -- 显示名
   enabled           INTEGER NOT NULL DEFAULT 1,  -- 是否启用：1=启用 / 0=停用
   sort_order        INTEGER NOT NULL DEFAULT 0,  -- 执行顺序（由小到大；等于创建顺序）
-  rule_kind         TEXT NOT NULL,             -- 规则类型：system-prompt / request-params / text-replace
+  rule_kind         TEXT NOT NULL,             -- 规则类型：system-prompt
   rule_config       TEXT NOT NULL,             -- 规则体（JSON 字符串，含 kind 标签，按 rule_kind 解释）
   created_time      INTEGER NOT NULL,          -- 创建时间
   update_time       INTEGER NOT NULL           -- 更新时间

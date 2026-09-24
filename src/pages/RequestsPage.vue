@@ -82,7 +82,7 @@ function goBack(): void {
     <Card>
       <CardHeader>
         <div class="space-y-1">
-          <CardTitle class="text-base">请求明细</CardTitle>
+          <CardTitle>请求明细</CardTitle>
           <CardDescription class="text-xs">全部网关调用记录，最新在前。</CardDescription>
         </div>
       </CardHeader>

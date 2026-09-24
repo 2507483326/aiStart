@@ -34,7 +34,7 @@ const collapsed = ref(props.defaultCollapsed);
     <CardHeader>
       <div class="flex items-center justify-between gap-3">
         <div class="space-y-1">
-          <CardTitle class="text-base">{{ title }}</CardTitle>
+          <CardTitle>{{ title }}</CardTitle>
           <CardDescription v-if="description" class="text-xs">{{ description }}</CardDescription>
         </div>
         <div class="flex items-center gap-2">

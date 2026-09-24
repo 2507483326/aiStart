@@ -48,9 +48,17 @@ const sourceIcon = computed(() => (record.value ? sourceAppIcon(record.value.sou
 const requestView = computed(() =>
   parseRequest(payload.value?.inboundRequest ?? null, record.value?.inboundProtocol ?? ""),
 );
+const upstreamRequestView = computed(() =>
+  parseRequest(payload.value?.upstreamRequest ?? null, record.value?.upstreamProtocol ?? ""),
+);
 const responseView = computed(() =>
   parseResponse(payload.value?.upstreamResponse ?? null, record.value?.upstreamProtocol ?? ""),
 );
+
+const responseDescription = computed(() => {
+  if (record.value && !record.value.ok) return "上游错误响应 · 上游原生返回";
+  return `${payload.value?.stream ? "流式（已按事件拼装）" : "非流式"} · 上游原生返回`;
+});
 
 const systemLabelClass =
   "border-transparent bg-amber-500/15 text-amber-600 dark:text-amber-400";
@@ -100,8 +108,8 @@ function goBack(): void {
 </script>
 
 <template>
-  <TooltipProvider>
-    <div class="w-full space-y-4">
+  <div class="w-full space-y-4">
+    <TooltipProvider>
       <Button variant="ghost" size="sm" class="gap-1.5" @click="goBack">
         <MorphIconBox :icon="ArrowLeft" :size="15" />
         返回
@@ -127,7 +135,7 @@ function goBack(): void {
           <CardHeader>
             <div class="flex items-start justify-between gap-3">
               <div class="space-y-1">
-                <CardTitle class="text-base">
+                <CardTitle>
                   {{ record.servedBy || record.modelName || "请求详情" }}
                 </CardTitle>
                 <CardDescription class="text-xs">
@@ -232,9 +240,40 @@ function goBack(): void {
           </CollapsibleCard>
 
           <CollapsibleCard
-            title="上游响应"
-            :description="`${payload.stream ? '流式（已按事件拼装）' : '非流式'} · 上游原生返回`"
+            v-if="payload.upstreamRequest"
+            title="上游请求"
+            description="提示词注入后，实际发往上游的请求"
           >
+            <template #action>
+              <Badge v-if="payload.upstreamRequestTruncated" variant="outline">已截断</Badge>
+            </template>
+
+            <template v-if="upstreamRequestView">
+              <PayloadCard
+                v-if="upstreamRequestView.system"
+                label="system"
+                :label-class="systemLabelClass"
+                :text="upstreamRequestView.system"
+              >
+                <pre
+                  class="text-xs leading-relaxed break-words whitespace-pre-wrap"
+                  >{{ upstreamRequestView.system }}</pre
+                >
+              </PayloadCard>
+              <MessageList
+                v-if="upstreamRequestView.messages.length"
+                :messages="upstreamRequestView.messages"
+              />
+            </template>
+            <RawPayload
+              v-else
+              :raw="payload.upstreamRequest"
+              label="原始请求（无法解析）"
+              :truncated="payload.upstreamRequestTruncated"
+            />
+          </CollapsibleCard>
+
+          <CollapsibleCard title="上游响应" :description="responseDescription">
             <template #action>
               <Badge v-if="payload.responseTruncated" variant="outline">已截断</Badge>
             </template>
@@ -250,16 +289,19 @@ function goBack(): void {
               </div>
             </template>
             <RawPayload
-              v-else
+              v-else-if="payload.upstreamResponse"
               :raw="payload.upstreamResponse"
               label="原始响应（无法解析）"
               :truncated="payload.responseTruncated"
             />
+            <p v-else class="text-xs text-muted-foreground">
+              本次未获取到上游响应报文（网络错误或上游未返回内容）。
+            </p>
           </CollapsibleCard>
 
           <Card>
             <CardHeader>
-              <CardTitle class="text-base">原始报文</CardTitle>
+              <CardTitle>原始报文</CardTitle>
               <CardDescription class="text-xs">解析前的原文，便于排查。</CardDescription>
             </CardHeader>
             <CardContent class="space-y-2">
@@ -269,14 +311,24 @@ function goBack(): void {
                 :truncated="payload.requestTruncated"
               />
               <RawPayload
+                v-if="payload.upstreamRequest"
+                :raw="payload.upstreamRequest"
+                label="上游请求原文"
+                :truncated="payload.upstreamRequestTruncated"
+              />
+              <RawPayload
+                v-if="payload.upstreamResponse"
                 :raw="payload.upstreamResponse"
                 label="上游响应原文"
                 :truncated="payload.responseTruncated"
               />
+              <p v-else class="text-xs text-muted-foreground">
+                本次未获取到上游响应原文（网络错误或上游未返回内容）。
+              </p>
             </CardContent>
           </Card>
         </template>
       </template>
-    </div>
-  </TooltipProvider>
+    </TooltipProvider>
+  </div>
 </template>

@@ -12,6 +12,8 @@ pub enum AppError {
     Http(#[from] reqwest::Error),
     #[error("未找到: {0}")]
     NotFound(String),
+    #[error("{0}")]
+    Unauthorized(String),
     #[error("不支持的操作: {0}")]
     #[allow(dead_code)]
     Unsupported(String),

@@ -1,4 +1,9 @@
 #[cfg(windows)]
+pub mod dsh;
+
+pub mod manual;
+
+#[cfg(windows)]
 pub mod windows;
 
 #[cfg(not(windows))]
@@ -15,10 +20,22 @@ pub struct ModelChoice {
     pub label: String,
 }
 
+/// 网关不按请求里的 model 路由，所以只认单个模型入口的客户端统一用这个名字。
+pub const GATEWAY_ALIAS: &str = "aiStart";
+
+/// 大多数客户端只需要一个网关入口，不用逐个认识网关的路由。
+pub fn gateway_alias_choice() -> ModelChoice {
+    ModelChoice {
+        id: GATEWAY_ALIAS.to_string(),
+        label: GATEWAY_ALIAS.to_string(),
+    }
+}
+
 pub struct ApplyContext {
     pub model: ModelConfig,
     pub gateway_base_url: String,
     pub gateway_token: String,
+    /// 由 [`AppConfigurator::exposed_models`] 按客户端类型填好。
     pub model_choices: Vec<ModelChoice>,
 }
 
@@ -28,7 +45,7 @@ impl ApplyContext {
         self.model_choices
             .first()
             .map(|choice| choice.id.as_str())
-            .unwrap_or_default()
+            .unwrap_or(GATEWAY_ALIAS)
     }
 }
 
@@ -60,6 +77,11 @@ pub trait AppConfigurator: Send + Sync {
     fn descriptor(&self) -> AppDescriptor;
     fn detect(&self) -> AppResult<DetectResult>;
     fn is_configured(&self) -> AppResult<bool>;
+
+    /// 该客户端在模型选择器里应当看到的条目。暴露几条由客户端自己决定：
+    /// Claude Desktop 只认 Anthropic 形状的档位路由，其余客户端一个入口就够。
+    fn exposed_models(&self) -> Vec<ModelChoice>;
+
     fn apply(&self, ctx: &ApplyContext) -> AppResult<ApplyReport>;
     fn clear(&self) -> AppResult<()>;
 }
@@ -69,12 +91,20 @@ pub fn configurator_for(kind: AppKind) -> Box<dyn AppConfigurator> {
     match kind {
         AppKind::ClaudeDesktop => Box::new(windows::ClaudeDesktopConfigurator),
         AppKind::DeepseekDesktop => Box::new(windows::DeepseekDesktopConfigurator),
+        AppKind::Codex | AppKind::ZCode | AppKind::WorkBuddy => {
+            Box::new(manual::ManualConfigurator::new(kind))
+        }
     }
 }
 
 #[cfg(not(windows))]
 pub fn configurator_for(kind: AppKind) -> Box<dyn AppConfigurator> {
-    Box::new(fallback::UnsupportedConfigurator::new(kind))
+    match kind {
+        AppKind::Codex | AppKind::ZCode | AppKind::WorkBuddy => {
+            Box::new(manual::ManualConfigurator::new(kind))
+        }
+        _ => Box::new(fallback::UnsupportedConfigurator::new(kind)),
+    }
 }
 
 pub fn expand_env(raw: &str) -> String {

@@ -28,8 +28,16 @@ pub struct CheckSnapshot {
 
 /// Walks the descriptor's sources in order (official first, mirror as fallback)
 /// and returns the first version that can be read off the response.
-pub async fn latest_version(kind: AppKind) -> Option<FoundVersion> {
-    for url in catalog::builtin_app(kind).latest_version_urls {
+///
+/// `installed` 供**版本感知**的探测源使用：少数官方 feed 必须带上当前版本才会
+/// 返回「这台机器该升到的目标版本」（WorkBuddy 的 `v2/update` 就是如此，服务端按
+/// 版本灰度，给 `0.0.0` 只会返回一个旧目标）。URL 里的 `{version}` 会被替换成
+/// 已安装版本；不含占位符的源（Claude RELEASES、GitHub release…）不受影响。
+pub async fn latest_version(kind: AppKind, installed: Option<&str>) -> Option<FoundVersion> {
+    for template in catalog::builtin_app(kind).latest_version_urls {
+        let Some(url) = resolve_probe_url(&template, installed) else {
+            continue;
+        };
         let Some(body) = fetch(&url).await else {
             continue;
         };
@@ -41,6 +49,17 @@ pub async fn latest_version(kind: AppKind) -> Option<FoundVersion> {
         }
     }
     None
+}
+
+/// 替换探测 URL 里的 `{version}` 占位符。
+///
+/// 缺已安装版本时返回 `None`（调用方跳过这条源）：与其拿一个填不出占位符的地址
+/// 去猜，不如老实放弃——这条源本就回答不了「该升到哪个版本」。
+fn resolve_probe_url(template: &str, installed: Option<&str>) -> Option<String> {
+    if !template.contains("{version}") {
+        return Some(template.to_string());
+    }
+    installed.map(|version| template.replace("{version}", version))
 }
 
 async fn fetch(url: &str) -> Option<String> {
@@ -70,12 +89,25 @@ fn parse_latest(body: &str, url: &str) -> Option<String> {
         let value: serde_json::Value = serde_json::from_str(body).ok()?;
         return extract_version(value.get("tag_name")?.as_str()?);
     }
+    if url.contains("copilot.tencent.com") {
+        // WorkBuddy 的 `/v2/update`：JSON，目标版本在 `productVersion`（旧版回退 `version`）。
+        // 已是最新时服务端返回 204 空体，`from_str` 失败 → `None`，即「本次读不出目标版本」。
+        let value: serde_json::Value = serde_json::from_str(body).ok()?;
+        let raw = value
+            .get("productVersion")
+            .or_else(|| value.get("version"))?
+            .as_str()?;
+        return extract_version(raw);
+    }
     extract_version(body.trim().lines().next()?)
 }
 
 /// Pulls the first dotted numeric token out of arbitrary text,
 /// e.g. `AnthropicClaude-2.7032.0-full.nupkg` or `claude-app-v2.7032.0` -> `2.7032.0`.
-fn extract_version(text: &str) -> Option<String> {
+///
+/// 复用给 `install::sources`：资产文件名里的版本号是同一套解析规则，
+/// 不在那边重写一份，避免两处对「什么算版本号」的判断漂移。
+pub(crate) fn extract_version(text: &str) -> Option<String> {
     text.split(|c: char| !(c.is_ascii_digit() || c == '.'))
         .find(|token| token.starts_with(|c: char| c.is_ascii_digit()) && token.contains('.'))
         .map(str::to_string)
@@ -206,10 +238,14 @@ pub fn latest_checks() -> BTreeMap<AppKind, CheckSnapshot> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_newer, parse_latest};
+    use super::{is_newer, parse_latest, resolve_probe_url};
 
     const RELEASES_URL: &str = "https://downloads.claude.ai/releases/win32/x64/RELEASES";
     const MIRROR_URL: &str = "https://api.github.com/repos/Wangnov/claude-app-mirror/releases/latest";
+    const WORKBUDDY_TEMPLATE: &str =
+        "https://copilot.tencent.com/v2/update?platform=workbuddy-win32-x64-user&version={version}";
+    const WORKBUDDY_URL: &str =
+        "https://copilot.tencent.com/v2/update?platform=workbuddy-win32-x64-user&version=5.3.5";
 
     #[test]
     fn reads_newest_asset_from_squirrel_releases() {
@@ -231,6 +267,41 @@ mod tests {
             Some("3.1.4")
         );
         assert_eq!(parse_latest("   \n", "https://example.com/version"), None);
+    }
+
+    #[test]
+    fn reads_target_version_from_workbuddy_update_feed() {
+        // 实测形状：目标版本在 `productVersion`，`version` 同值，另有安装包直链。
+        let body = r#"{"version":"5.6.2.39298511","url":"https://download.codebuddy.cn/workbuddy/saas/win32-x64-user/WorkBuddy-win32-x64-user-5.6.2.39298511-37a65c0b.exe","productVersion":"5.6.2.39298511","sha256hash":"","timestamp":1790021711}"#;
+        assert_eq!(
+            parse_latest(body, WORKBUDDY_URL).as_deref(),
+            Some("5.6.2.39298511")
+        );
+    }
+
+    #[test]
+    fn empty_workbuddy_body_means_no_target_version() {
+        // 已是该目标版本时 feed 返回 204（空体）→ 读不出新版本，而不是解析出错。
+        assert_eq!(parse_latest("", WORKBUDDY_URL), None);
+    }
+
+    #[test]
+    fn probe_url_substitutes_version_only_when_installed_is_known() {
+        assert_eq!(
+            resolve_probe_url(WORKBUDDY_TEMPLATE, Some("5.3.5")).as_deref(),
+            Some(WORKBUDDY_URL)
+        );
+        // 没有已安装版本 → 跳过这条源，而不是发一个还带占位符的地址。
+        assert_eq!(resolve_probe_url(WORKBUDDY_TEMPLATE, None), None);
+        // 不含占位符的源原样返回，不受已安装版本有无的影响。
+        assert_eq!(
+            resolve_probe_url(RELEASES_URL, None).as_deref(),
+            Some(RELEASES_URL)
+        );
+        assert_eq!(
+            resolve_probe_url(MIRROR_URL, Some("1.0.0")).as_deref(),
+            Some(MIRROR_URL)
+        );
     }
 
     #[test]

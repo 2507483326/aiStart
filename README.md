@@ -5,9 +5,9 @@
 目前有左侧边栏的五个页面：
 
 - **面板** — 本地网关的运行状态、调用统计、自动切换情况，以及应用/模型总览
-- **应用** — Claude Desktop、DeepSeek Desktop，负责安装 / 更新 / 模型接入
+- **应用** — Claude Desktop、DeepSeek Desktop、Codex、ZCode、WorkBuddy，负责安装 / 更新 / 模型接入
 - **模型** — 统一管理三种上游协议的模型，并支持自动切换
-- **过滤器** — 在请求转发前按规则改写请求（注入系统提示词 / 覆盖参数 / 文本替换）
+- **过滤器** — 在请求转发前按规则改写请求（注入系统提示词）
 - **统计** — Token 消耗贡献图与每一次请求的明细
 
 技术栈：Tauri 2 + Vue 3 + vue-router + Tailwind CSS v4 + shadcn-vue + morphicons。
@@ -128,18 +128,16 @@ message_start → content_block_start → content_block_delta* → content_block
 
 ## 请求过滤器
 
-「过滤器」页面用于在网关把请求转发给上游**之前**按规则改写请求内容。每条过滤器一个动作，
+「过滤器」页面用于在网关把请求转发给上游**之前**，为请求注入系统提示词。每条过滤器一个动作，
 只有启用的参与执行，按列表顺序（即创建顺序）依次叠加：
 
 | 规则类型 | 作用 |
 | --- | --- |
-| 注入系统提示词 | 在 `system` 上追加 / 前置，或整体替换 |
-| 覆盖请求参数 | 覆盖 `temperature` / `max_tokens` / `top_p` / `stop_sequences`（只覆盖填写项） |
-| 文本查找替换 | 对 `system` 与 `messages` 的文本做字面量替换，可限定作用范围 |
+| 注入系统提示词 | 在 `system` 上追加或前置一段文本 |
 
 实现要点：改写作用在**规范请求**（Anthropic 形态）上，因此三种入站协议统一生效；
 注入点在 `gateway/server.rs::handle` 的 `decode_request` 之后、自动切换循环之外，
-保证一次请求只套用一次。文本替换只触及文本字段，不会改动 `tool_use.input` 等结构化字段。
+保证一次请求只套用一次。
 
 ## 用量统计
 
@@ -189,6 +187,18 @@ src-tauri/src/platform/
 DeepSeek Desktop 没有公开的程序化配置格式，因此这里是**按最通用的 OpenAI 兼容结构写出参考配置**
 （默认位置 `%APPDATA%\DeepSeek\config.json`，可在「设置」中改成你安装版本的真实路径）。
 这一点在应用卡片与保存提示中都会明确说明。
+
+### 「手动应用」的客户端
+
+Codex（OpenAI 的 ChatGPT 桌面版）、ZCode（智谱 GLM 官方 ADE）、WorkBuddy（腾讯 AI Agent 办公工作台）
+只能在各自 GUI 里手动添加「自定义 / OpenAI 兼容」供应商，官方未公开配置文件格式，因此这三个走
+`ApplyMode::Manual`：`ManualConfigurator` **不写任何第三方文件**，点「应用」只记录绑定并弹出
+「对接说明」（接口地址 / API Key / 模型名称 / 协议格式 + 调用示例，逐项可复制），由用户照着填写。
+
+- Codex 与 Codex CLI 共用 Codex home（`%USERPROFILE%\.codex`），协议为 **Responses**（`wire_api = "responses"`），
+  待实测确认桌面版读取该文件后再评估是否升级为 `DirectConfig`。
+- 三者的安装/更新目前只配了 `Manual` 兜底（打开官方下载页）；`upgrade` 里的探测锚点（进程名、注册表
+  `DisplayName`、安装位置）标为「待实测」，装上后按实际值回填，届时再接自动下载/静默安装。
 
 ---
 

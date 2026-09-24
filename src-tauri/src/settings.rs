@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
 use rusqlite::{params, Connection};
@@ -375,13 +375,13 @@ pub fn mutate<T>(f: impl FnOnce(&mut Settings) -> T) -> AppResult<T> {
 pub fn deepseek_config_path() -> String {
     let settings = snapshot();
     if let Some(path) = settings.deepseek_config_path.filter(|path| !path.trim().is_empty()) {
-        return path;
+        return crate::platform::expand_env(&path);
     }
-    let default = format!(
-        r"{}\DeepSeek\config.json",
-        std::env::var("APPDATA").unwrap_or_else(|_| ".".into())
-    );
-    crate::platform::expand_env(&default)
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    home.join(".dsh")
+        .join("settings.yaml")
+        .to_string_lossy()
+        .to_string()
 }
 
 pub fn require_model(id: i64) -> AppResult<ModelConfig> {

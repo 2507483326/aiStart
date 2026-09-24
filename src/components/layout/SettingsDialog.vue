@@ -100,12 +100,12 @@ async function copyToken() {
               id="deepseek-path"
               v-model="deepseekPath"
               class="font-mono text-xs"
-              placeholder="%APPDATA%\DeepSeek\config.json"
+              placeholder="%USERPROFILE%\.dsh\settings.yaml"
             />
           </div>
           <p class="text-xs text-muted-foreground">
-            DeepSeek Desktop 没有公开的程序化配置格式，这里写入的是一份标准 OpenAI
-            兼容参考配置，可按你的安装版本调整路径。
+            应用时会把 aiStart 作为一个 provider 合并进该文件，并把默认模型指向它；
+            同目录下的 .credentials.yaml 会写入网关 Key。文件里其他内容保持不变。
           </p>
         </div>
 

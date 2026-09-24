@@ -1,19 +1,37 @@
 use serde::{Deserialize, Serialize};
 
+use crate::domain::release::UpgradeSpec;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AppKind {
     ClaudeDesktop,
     DeepseekDesktop,
+    Codex,
+    // `rename_all = "kebab-case"` 会把 `ZCode` 变成 `z-code`、`WorkBuddy` 变成 `work-buddy`，
+    // 与前端 AppKind 联合类型要对上的 "zcode" / "workbuddy" 不符，故显式覆写。
+    #[serde(rename = "zcode")]
+    ZCode,
+    #[serde(rename = "workbuddy")]
+    WorkBuddy,
 }
 
 impl AppKind {
-    pub const ALL: [AppKind; 2] = [AppKind::ClaudeDesktop, AppKind::DeepseekDesktop];
+    pub const ALL: [AppKind; 5] = [
+        AppKind::ClaudeDesktop,
+        AppKind::DeepseekDesktop,
+        AppKind::Codex,
+        AppKind::ZCode,
+        AppKind::WorkBuddy,
+    ];
 
     pub fn as_str(&self) -> &'static str {
         match self {
             AppKind::ClaudeDesktop => "claude-desktop",
             AppKind::DeepseekDesktop => "deepseek-desktop",
+            AppKind::Codex => "codex",
+            AppKind::ZCode => "zcode",
+            AppKind::WorkBuddy => "workbuddy",
         }
     }
 
@@ -51,9 +69,14 @@ pub struct AppDescriptor {
     pub requires_gateway: bool,
     pub apply_mode: ApplyMode,
     pub config_target: String,
-    pub installer_url: Option<String>,
-    pub installer_sha256: Option<String>,
+    /// 版本探测源（有序：官方优先、镜像兜底）。只用来回答「有没有新版本」。
     pub latest_version_urls: Vec<String>,
+    /// 安装/升级规格：去哪找安装包、怎么静默装、怎么诊断锚定。
+    ///
+    /// 与 `latest_version_urls` 是**两件事**：官方下载地址常常只是在线引导器
+    /// （Claude 的 `ClaudeSetup.exe` 约 7MB，装的时候还会回 GCS 重下真正的 MSIX），
+    /// 所以「探测版本」和「拿安装包」必须分开配置。
+    pub upgrade: UpgradeSpec,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

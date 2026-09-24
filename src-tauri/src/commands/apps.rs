@@ -10,7 +10,8 @@ use crate::domain::catalog;
 use crate::error::{AppError, AppResult};
 use crate::events;
 use crate::gateway;
-use crate::platform::{self, ApplyContext, DetectResult, ModelChoice};
+use crate::install;
+use crate::platform::{self, ApplyContext, DetectResult};
 use crate::settings;
 use crate::updates;
 
@@ -102,10 +103,17 @@ pub fn list_apps() -> AppResult<Vec<ToolApp>> {
 
 #[tauri::command]
 pub async fn check_app_updates() -> AppResult<Vec<AppUpdate>> {
+    // 先探测本机已安装版本：版本感知的探测源（如 WorkBuddy 的 `v2/update`）要带上
+    // 当前版本才会返回「本机该升到的目标版本」，探测和比对共用同一次探测结果。
+    let installed: Vec<Option<String>> = AppKind::ALL
+        .iter()
+        .map(|kind| installed_version(*kind))
+        .collect();
     let latest = join_all(
         AppKind::ALL
             .iter()
-            .map(|kind| updates::latest_version(*kind)),
+            .zip(&installed)
+            .map(|(kind, installed)| updates::latest_version(*kind, installed.as_deref())),
     )
     .await;
     let known = updates::latest_checks();
@@ -113,18 +121,15 @@ pub async fn check_app_updates() -> AppResult<Vec<AppUpdate>> {
     Ok(AppKind::ALL
         .iter()
         .zip(latest)
-        .map(|(kind, found)| {
-            let installed = platform::configurator_for(*kind)
-                .detect()
-                .ok()
-                .filter(|detect| detect.installed)
-                .and_then(|detect| detect.version);
+        .enumerate()
+        .map(|(index, (kind, found))| {
+            let installed = installed[index].as_deref();
             let latest_version = found.as_ref().map(|found| found.version.clone());
 
             // 只有同时拿到「官方最新版本」和「已安装版本」才算一次有效检查：
             // 此时才比较并落库。查不到（离线 / 超时 / 版本号读不出）时既不落库也不清零，
             // 直接沿用上一次已知结果，避免把「有新版本」误抹成「已是最新」。
-            match (latest_version.as_deref(), installed.as_deref()) {
+            match (latest_version.as_deref(), installed) {
                 (Some(latest), Some(installed)) => {
                     let update_available = updates::is_newer(latest, installed);
                     updates::record_check(
@@ -151,7 +156,7 @@ pub async fn check_app_updates() -> AppResult<Vec<AppUpdate>> {
                         .or_else(|| previous.and_then(|snapshot| snapshot.latest_version.clone()));
                     let (latest_version, update_available) = resolve_update(
                         latest_version,
-                        installed.as_deref(),
+                        installed,
                         previous.map(|snapshot| snapshot.update_available).unwrap_or(false),
                     );
                     AppUpdate {
@@ -190,13 +195,7 @@ pub fn apply_model(kind: AppKind, model_id: Option<i64>) -> AppResult<ApplyRepor
         model: model.clone(),
         gateway_base_url: status.base_url.clone(),
         gateway_token: token.clone(),
-        model_choices: gateway::MODEL_ROLES
-            .iter()
-            .map(|role| ModelChoice {
-                id: role.id.to_string(),
-                label: role.picker_label(),
-            })
-            .collect(),
+        model_choices: configurator.exposed_models(),
     };
 
     let report = configurator.apply(&context)?;
@@ -312,52 +311,71 @@ fn launch_installer(path: &str) -> AppResult<()> {
 async fn run_install(app: &AppHandle, kind: AppKind, action: &str) -> AppResult<InstallReport> {
     let descriptor = catalog::builtin_app(kind);
 
-    if let Some(url) = descriptor.installer_url.clone() {
-        let file = download_installer(app, kind, action, &url).await?;
-        launch_installer(&file)?;
-        let _ = app.emit(
-            "install://progress",
-            DownloadProgress {
+    match install::sources::resolve(kind, &descriptor.upgrade).await {
+        Ok(install::sources::ResolveOutcome::Ready(asset)) => {
+            let file = download_installer(app, kind, action, &asset.url).await?;
+            launch_installer(&file)?;
+            let _ = app.emit(
+                "install://progress",
+                DownloadProgress {
+                    kind,
+                    action: action.to_string(),
+                    phase: "launched".into(),
+                    received: 0,
+                    total: None,
+                    percent: Some(100.0),
+                },
+            );
+            let version = asset.version.unwrap_or_else(|| "未知".into());
+            Ok(InstallReport {
                 kind,
                 action: action.to_string(),
-                phase: "launched".into(),
-                received: 0,
-                total: None,
-                percent: Some(100.0),
-            },
-        );
-        return Ok(InstallReport {
-            kind,
-            action: action.to_string(),
-            target: file.clone(),
-            launched: true,
-            steps: vec![
-                format!("已下载安装包到 {file}"),
-                "已启动安装程序，请按提示完成安装".into(),
-                "安装完成后回到本应用执行「一键应用模型」".into(),
-            ],
-        });
+                target: file.clone(),
+                launched: true,
+                steps: vec![
+                    format!("已从「{}」解析到版本 {version}", asset.source.as_str()),
+                    format!("已下载安装包到 {file}"),
+                    "已启动安装程序，请按提示完成安装".into(),
+                    "安装完成后回到本应用执行「应用」接入模型".into(),
+                ],
+            })
+        }
+
+        Ok(install::sources::ResolveOutcome::UpToDate { installed, latest }) => {
+            Err(AppError::Message(format!(
+                "已是最新版本（{}），无需安装",
+                installed.or(latest).unwrap_or_else(|| "未知".into())
+            )))
+        }
+
+        // 自动链路的全部候选源都不可用 → 降级到「打开下载页人工安装」，
+        // 并把失败原因一并告诉用户，而不是静默退回下载页。
+        Err(error) => {
+            app.opener()
+                .open_url(descriptor.download_page.clone(), None::<&str>)
+                .map_err(|open_error| {
+                    AppError::Message(format!("打开下载页失败: {open_error}"))
+                })?;
+
+            Ok(InstallReport {
+                kind,
+                action: action.to_string(),
+                target: descriptor.download_page.clone(),
+                launched: true,
+                steps: vec![
+                    format!("自动升级不可用：{error}"),
+                    format!(
+                        "已在浏览器打开 {} 的官方下载页 {}",
+                        descriptor.name, descriptor.download_page
+                    ),
+                    format!(
+                        "本应用会在注册表中自动识别 {}，安装完成后回到「应用」标签页刷新即可",
+                        descriptor.name
+                    ),
+                ],
+            })
+        }
     }
-
-    app.opener()
-        .open_url(descriptor.download_page.clone(), None::<&str>)
-        .map_err(|error| AppError::Message(format!("打开下载页失败: {error}")))?;
-
-    Ok(InstallReport {
-        kind,
-        action: action.to_string(),
-        target: descriptor.download_page.clone(),
-        launched: true,
-        steps: vec![
-            format!("已在浏览器打开官方下载页 {}", descriptor.download_page),
-            "下载并完成安装".into(),
-            format!(
-                "本应用会在注册表中自动识别 {}，安装完成后回到「应用」标签页刷新即可",
-                descriptor.name
-            ),
-            "如需全自动下载安装，可在应用目录中配置 installerUrl 指向直链".into(),
-        ],
-    })
 }
 
 fn installed_version(kind: AppKind) -> Option<String> {

@@ -14,7 +14,7 @@ use tower_http::cors::CorsLayer;
 
 use crate::domain::canonical::CanonicalRequest;
 use crate::domain::model::{ModelConfig, ModelFormat};
-use crate::error::{AppError, AppResult};
+use crate::error::AppError;
 use crate::providers::{http_client, provider_for, ResponseAssembler, SseEvent, StreamState, WireState};
 
 use super::sse::{encode_channel_event, parse_sse_stream};
@@ -241,7 +241,11 @@ async fn route(
     .await
     {
         Ok(response) => response,
-        Err(error) => {
+        Err(failure) => {
+            let RouteFailure {
+                error,
+                upstream_response,
+            } = failure;
             stats.record_error(&error.to_string());
             let message = error.to_string();
             let settings = crate::settings::snapshot();
@@ -272,17 +276,19 @@ async fn route(
                 },
                 Some(&crate::usage::UsagePayload {
                     inbound_request: Some(inbound_request),
-                    upstream_response: None,
+                    upstream_request: None,
+                    upstream_response,
                     stream: false,
                 }),
             );
 
-            let status = match error {
-                AppError::NotFound(_) => StatusCode::NOT_FOUND,
-                AppError::InvalidConfig(_) => StatusCode::BAD_REQUEST,
-                _ => StatusCode::BAD_GATEWAY,
+            let (status, kind) = match error {
+                AppError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "authentication_error"),
+                AppError::NotFound(_) => (StatusCode::NOT_FOUND, "api_error"),
+                AppError::InvalidConfig(_) => (StatusCode::BAD_REQUEST, "api_error"),
+                _ => (StatusCode::BAD_GATEWAY, "api_error"),
             };
-            api_error(inbound, status, "api_error", &message)
+            api_error(inbound, status, kind, &message)
         }
     }
 }
@@ -290,19 +296,38 @@ async fn route(
 struct UpstreamFailure {
     error: AppError,
     retryable: bool,
+    /// 上游返回的原始响应体（网络错误/超时没有响应体时为 None）。
+    raw_response: Option<String>,
 }
 
+/// 透传给 `route()` 的失败信息：错误本身 + 上游原始报文，供失败记录落库展示。
+struct RouteFailure {
+    error: AppError,
+    upstream_response: Option<String>,
+}
+
+impl From<AppError> for RouteFailure {
+    fn from(error: AppError) -> Self {
+        Self {
+            error,
+            upstream_response: None,
+        }
+    }
+}
+
+/// 把规范请求编码成上游协议原生报文并发起请求；成功时一并返回编码后的请求体（供落库展示）。
 async fn dispatch(
     request: &CanonicalRequest,
     headers: &HeaderMap,
     config: &ModelConfig,
-) -> Result<reqwest::Response, UpstreamFailure> {
+) -> Result<(reqwest::Response, Value), UpstreamFailure> {
     let provider = provider_for(config.format);
     let payload = provider
         .encode_request(config, request)
         .map_err(|error| UpstreamFailure {
             error,
             retryable: false,
+            raw_response: None,
         })?;
 
     let mut builder = http_client().post(provider.endpoint(config)).json(&payload);
@@ -321,25 +346,29 @@ async fn dispatch(
     let response = builder.send().await.map_err(|error| UpstreamFailure {
         error: error.into(),
         retryable: true,
+        raw_response: None,
     })?;
 
     let status = response.status();
     if !status.is_success() {
+        // 上游错误响应体完整保留（截断交给落库时的统一上限），错误文案只取前 400 字。
         let detail = response.text().await.unwrap_or_default();
         let retryable =
             status.is_server_error() || matches!(status.as_u16(), 401 | 403 | 404 | 408 | 429);
+        let error = AppError::Message(format!(
+            "上游 {} 返回 {}: {}",
+            config.name,
+            status.as_u16(),
+            truncate(&detail, 400)
+        ));
         return Err(UpstreamFailure {
-            error: AppError::Message(format!(
-                "上游 {} 返回 {}: {}",
-                config.name,
-                status.as_u16(),
-                truncate(&detail, 400)
-            )),
+            error,
             retryable,
+            raw_response: Some(detail),
         });
     }
 
-    Ok(response)
+    Ok((response, payload))
 }
 
 async fn handle(
@@ -350,17 +379,14 @@ async fn handle(
     body: Bytes,
     started: std::time::Instant,
     inbound_request: &str,
-) -> AppResult<Response> {
+) -> Result<Response, RouteFailure> {
     let settings = crate::settings::snapshot();
 
     // 只校验 Key 非空；具体来源靠 token 匹配应用（匹配不到则原样记录）。
     let Some(token) = token.filter(|value| !value.trim().is_empty()) else {
-        return Ok(api_error(
-            inbound,
-            StatusCode::UNAUTHORIZED,
-            "authentication_error",
-            "缺少网关 API Key",
-        ));
+        return Err(RouteFailure::from(AppError::Unauthorized(
+            "缺少网关 API Key".into(),
+        )));
     };
     let source_app = source_app_for(&token);
 
@@ -374,7 +400,9 @@ async fn handle(
 
     let candidates = settings.candidate_models();
     if candidates.is_empty() {
-        return Err(AppError::NotFound("网关没有启用中的模型".into()));
+        return Err(RouteFailure::from(AppError::NotFound(
+            "网关没有启用中的模型".into(),
+        )));
     }
 
     let primary = candidates[0].name.clone();
@@ -382,37 +410,47 @@ async fn handle(
         .active_model()
         .map(|model| model.name.clone())
         .unwrap_or_default();
-    let mut chosen: Option<(ModelConfig, reqwest::Response)> = None;
+    let mut chosen: Option<(ModelConfig, reqwest::Response, Value)> = None;
     let mut failover_used = false;
-    let mut last_error: Option<AppError> = None;
+    let mut last_error: Option<UpstreamFailure> = None;
 
     for (index, candidate) in candidates.iter().enumerate() {
         match dispatch(&request, &headers, candidate).await {
-            Ok(response) => {
+            Ok((response, payload)) => {
                 if index > 0 {
                     stats.record_failover(&primary, &candidate.name);
                     failover_used = true;
                 }
-                chosen = Some((candidate.clone(), response));
+                chosen = Some((candidate.clone(), response, payload));
                 break;
             }
             Err(failure) => {
-                last_error = Some(failure.error);
-                if !failure.retryable {
+                last_error = Some(failure);
+                if !last_error.as_ref().is_some_and(|failure| failure.retryable) {
                     break;
                 }
             }
         }
     }
 
-    let Some((config, upstream)) = chosen else {
-        return Err(last_error.unwrap_or_else(|| AppError::Message("没有可用的上游模型".into())));
+    let Some((config, upstream, upstream_payload)) = chosen else {
+        return Err(match last_error {
+            Some(failure) => RouteFailure {
+                error: failure.error,
+                upstream_response: failure.raw_response,
+            },
+            None => RouteFailure::from(AppError::Message("没有可用的上游模型".into())),
+        });
     };
+
+    // 记录实际发往上游的请求体（已套用提示词注入），供详情页核对注入结果。
+    let upstream_request_text = serde_json::to_string_pretty(&upstream_payload)
+        .unwrap_or_else(|_| upstream_payload.to_string());
 
     let upstream_provider = provider_for(config.format);
 
     if !request.stream() {
-        let raw_response = upstream.json::<Value>().await?;
+        let raw_response = upstream.json::<Value>().await.map_err(AppError::from)?;
         let canonical = upstream_provider.decode_response(&config, &raw_response)?;
         let input_tokens = canonical
             .pointer("/usage/input_tokens")
@@ -446,6 +484,7 @@ async fn handle(
             None,
             crate::usage::UsagePayload {
                 inbound_request: Some(inbound_request.to_string()),
+                upstream_request: Some(upstream_request_text),
                 upstream_response: Some(
                     serde_json::to_string_pretty(&raw_response)
                         .unwrap_or_else(|_| raw_response.to_string()),
@@ -551,6 +590,7 @@ async fn handle(
             stream_error,
             crate::usage::UsagePayload {
                 inbound_request: Some(inbound_request_owned),
+                upstream_request: Some(upstream_request_text),
                 upstream_response: Some({
                     // 拼装成 canonical 后转成上游协议的原生形状再落库，前端按协议解析（与非流式一致）
                     let mut canonical = assembler.to_value();

@@ -83,12 +83,12 @@ function blurOnEnter(event: KeyboardEvent) {
 
 <template>
   <div
-    class="flex items-center gap-4 rounded-lg border bg-card px-4 py-3 transition-all hover:shadow-sm"
+    class="flex items-center gap-4 rounded-lg border bg-card px-4 py-3 transition-[border-color,box-shadow,background-color] duration-200 hover:shadow-sm"
     :class="active ? 'border-emerald-500/40' : 'hover:border-foreground/20 hover:bg-accent/30'"
   >
     <div class="min-w-0 flex-1">
       <div class="flex flex-wrap items-center gap-2">
-        <p class="truncate text-base font-semibold">{{ model.name }}</p>
+        <p class="truncate text-sm font-semibold">{{ model.name }}</p>
         <FormatBadge :format="model.format" />
       </div>
       <p class="mt-0.5 truncate font-mono text-xs text-muted-foreground">
@@ -117,7 +117,7 @@ function blurOnEnter(event: KeyboardEvent) {
       <Input
         v-else
         v-model="modelId"
-        class="mr-1 h-6 w-56 px-2 font-mono text-xs"
+        class="mr-1 h-7 w-56 px-2 font-mono text-xs"
         spellcheck="false"
         aria-label="上游模型 ID"
         title="上游模型 ID，失焦或回车后自动保存"

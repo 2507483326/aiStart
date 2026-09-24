@@ -13,6 +13,7 @@ import {
 } from "lucide";
 
 import MorphIconBox from "@/components/common/MorphIconBox.vue";
+import AppBackdrop from "@/components/layout/AppBackdrop.vue";
 import SettingsDialog from "@/components/layout/SettingsDialog.vue";
 import SidebarNav from "@/components/layout/SidebarNav.vue";
 import { Badge } from "@/components/ui/badge";
@@ -44,7 +45,9 @@ const activeIcon = computed(
 
 <template>
   <div class="flex h-screen overflow-hidden bg-background">
-    <aside class="flex w-60 shrink-0 flex-col border-r bg-sidebar">
+    <aside
+      class="flex w-60 shrink-0 flex-col border-r bg-sidebar bg-gradient-to-b from-sidebar to-sidebar/90"
+    >
       <div class="flex items-center gap-2.5 px-5 py-4">
         <div
           class="flex size-8 items-center justify-center rounded-lg bg-primary text-primary-foreground"
@@ -62,7 +65,7 @@ const activeIcon = computed(
       <SidebarNav />
 
       <div class="mt-auto space-y-2 border-t p-3">
-        <div class="rounded-lg border bg-card px-3 py-2.5">
+        <div class="rounded-lg border bg-card px-3 py-2.5 transition-colors duration-200 hover:border-foreground/20">
           <div class="flex items-center justify-between">
             <span class="flex items-center gap-1.5 text-xs font-medium">
               <MorphIconBox
@@ -72,10 +75,7 @@ const activeIcon = computed(
               />
               本地网关
             </span>
-            <Badge
-              :variant="gateway.running.value ? 'default' : 'outline'"
-              class="text-[10px]"
-            >
+            <Badge :variant="gateway.running.value ? 'default' : 'outline'">
               {{ gateway.running.value ? "运行中" : "已停止" }}
             </Badge>
           </div>
@@ -93,17 +93,24 @@ const activeIcon = computed(
       </div>
     </aside>
 
-    <div class="flex min-w-0 flex-1 flex-col">
-      <header class="flex items-center gap-3 border-b px-6 py-3.5">
+    <div class="relative flex min-w-0 flex-1 flex-col">
+      <AppBackdrop />
+      <header
+        class="relative flex items-center gap-3 border-b bg-gradient-to-b from-background/80 to-background/60 px-6 py-3.5 backdrop-blur-sm shadow-[0_1px_2px_-1px_rgb(0_0_0/0.06)]"
+      >
         <MorphIconBox :icon="activeIcon" :size="19" class="text-muted-foreground" />
         <div class="leading-tight">
-          <p class="text-sm font-semibold">{{ title }}</p>
+          <p class="text-base font-semibold">{{ title }}</p>
           <p class="text-xs text-muted-foreground">{{ subtitle }}</p>
         </div>
       </header>
 
-      <main class="flex-1 overflow-y-auto px-6 py-5">
-        <RouterView />
+      <main class="relative flex-1 overflow-y-auto px-6 py-5">
+        <RouterView v-slot="{ Component }">
+          <Transition name="page" mode="out-in">
+            <component :is="Component" />
+          </Transition>
+        </RouterView>
       </main>
     </div>
   </div>

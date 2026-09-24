@@ -7,7 +7,9 @@ use crate::domain::app::{AppDescriptor, AppKind, ApplyMode, ApplyReport};
 use crate::domain::catalog;
 use crate::error::{AppError, AppResult};
 
-use super::{expand_env, AppConfigurator, ApplyContext, DetectResult};
+use super::{
+    dsh, expand_env, gateway_alias_choice, AppConfigurator, ApplyContext, DetectResult, ModelChoice,
+};
 
 const CLAUDE_POLICY_PATH: &str = r"SOFTWARE\Policies\Claude";
 
@@ -294,6 +296,39 @@ fn release_meta() -> AppResult<()> {
     write_meta(&meta)
 }
 
+/// 描述符驱动的通用探测：新增应用只要在目录里填好锚点字段，探测就自动可用，
+/// 不必为每个应用写一份 `detect`（Claude / DSH 的历史实现保留各自的特例逻辑）。
+///
+/// 依次尝试 MSIX 包名前缀 → 注册表 `DisplayName` 前缀 → 期望安装位置，命中即止。
+/// 这些锚点在应用未安装时都只是「待实测」的推测值，命中不了就诚实地报未安装。
+pub fn detect_by_descriptor(descriptor: &AppDescriptor) -> DetectResult {
+    if let Some(prefix) = descriptor.upgrade.msix_name_prefix.as_deref() {
+        if let Some(package) = find_msix(&[prefix]) {
+            return DetectResult::found(
+                package.location.unwrap_or(package.name),
+                package.version,
+            );
+        }
+    }
+
+    if let Some(needle) = descriptor.upgrade.display_name_match.as_deref() {
+        if let Some(app) = find_app(&[needle]) {
+            return DetectResult::found(
+                app.location.unwrap_or_else(|| app.name.clone()),
+                app.version,
+            );
+        }
+    }
+
+    if let Some(location) = descriptor.upgrade.expected_location.as_deref() {
+        if let Some(path) = existing_dir(&[location]) {
+            return DetectResult::found(path, None);
+        }
+    }
+
+    DetectResult::missing()
+}
+
 pub struct ClaudeDesktopConfigurator;
 
 impl AppConfigurator for ClaudeDesktopConfigurator {
@@ -329,6 +364,18 @@ impl AppConfigurator for ClaudeDesktopConfigurator {
             .and_then(serde_json::Value::as_str)
             == Some(CLAUDE_PROFILE_ID);
         Ok(applied && profile_path().exists())
+    }
+
+    /// Claude Desktop 会丢弃名字认不出是 Anthropic 模型的条目，因此这里必须逐个
+    /// 暴露网关的档位路由，不能像其他客户端那样只给一个别名。
+    fn exposed_models(&self) -> Vec<ModelChoice> {
+        crate::gateway::MODEL_ROLES
+            .iter()
+            .map(|role| ModelChoice {
+                id: role.id.to_string(),
+                label: role.picker_label(),
+            })
+            .collect()
     }
 
     fn apply(&self, ctx: &ApplyContext) -> AppResult<ApplyReport> {
@@ -420,12 +467,6 @@ impl AppConfigurator for ClaudeDesktopConfigurator {
 
 pub struct DeepseekDesktopConfigurator;
 
-impl DeepseekDesktopConfigurator {
-    fn config_path(&self) -> String {
-        crate::settings::deepseek_config_path()
-    }
-}
-
 impl AppConfigurator for DeepseekDesktopConfigurator {
     fn descriptor(&self) -> AppDescriptor {
         catalog::builtin_app(AppKind::DeepseekDesktop)
@@ -446,6 +487,7 @@ impl AppConfigurator for DeepseekDesktopConfigurator {
             None => match existing_dir(&[
                 r"%LOCALAPPDATA%\Programs\DSH Desktop",
                 r"%APPDATA%\DSH Desktop",
+                r"%USERPROFILE%\.dsh",
                 r"%APPDATA%\DeepSeek",
                 r"%LOCALAPPDATA%\DeepSeek",
             ]) {
@@ -456,56 +498,20 @@ impl AppConfigurator for DeepseekDesktopConfigurator {
     }
 
     fn is_configured(&self) -> AppResult<bool> {
-        Ok(PathBuf::from(self.config_path()).exists())
+        Ok(dsh::is_configured())
+    }
+
+    /// DSH 的模型列表是我们直接写进 settings.yaml 的，一个网关入口就够。
+    fn exposed_models(&self) -> Vec<ModelChoice> {
+        vec![gateway_alias_choice()]
     }
 
     fn apply(&self, ctx: &ApplyContext) -> AppResult<ApplyReport> {
-        let path = self.config_path();
-        let payload = serde_json::json!({
-            "provider": "openai",
-            "openai": {
-                "baseURL": ctx.gateway_base_url,
-                "apiKey": ctx.gateway_token,
-                "model": ctx.gateway_model_id(),
-            },
-            "upstream": {
-                "format": ctx.model.format.as_str(),
-                "model": ctx.model.model,
-                "baseURL": ctx.model.base_url,
-            }
-        });
-
-        if let Some(parent) = PathBuf::from(&path).parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, serde_json::to_string_pretty(&payload)?)?;
-
-        Ok(ApplyReport {
-            kind: AppKind::DeepseekDesktop,
-            model_id: ctx.model.id,
-            model_name: ctx.model.name.clone(),
-            apply_mode: ApplyMode::DirectConfig,
-            target: path.clone(),
-            restart_required: true,
-            steps: vec![
-                format!("写入配置文件 {path}"),
-                format!("指向本地网关 {}", ctx.gateway_base_url),
-                format!("上游模型: {} ({})", ctx.model.model, ctx.model.format.display_name()),
-                "重启 DeepSeek Desktop 后生效".into(),
-            ],
-            note: Some(
-                "DeepSeek Desktop 未公开程序化配置格式，这里按最通用的 OpenAI 兼容结构写出参考配置；若目标路径与你的安装版本不符，可在设置中改为实际配置路径。"
-                    .into(),
-            ),
-        })
+        dsh::apply(ctx)
     }
 
     fn clear(&self) -> AppResult<()> {
-        let path = PathBuf::from(self.config_path());
-        if path.exists() {
-            std::fs::remove_file(path)?;
-        }
-        Ok(())
+        dsh::clear()
     }
 }
 

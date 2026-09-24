@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import {
   CircleArrowUp,
   CircleCheck,
@@ -14,6 +14,7 @@ import {
 } from "lucide";
 
 import MorphIconBox from "@/components/common/MorphIconBox.vue";
+import ManualGuideDialog from "@/components/apps/ManualGuideDialog.vue";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -44,9 +45,13 @@ const { busyKind, download, apply, clear, install, update } = useApps();
 const APP_ICONS: Record<AppKind, string> = {
   "claude-desktop": "/app-icons/claude-desktop.svg",
   "deepseek-desktop": "/app-icons/deepseek-desktop.png",
+  codex: "/app-icons/codex.svg",
+  zcode: "/app-icons/zcode.svg",
+  workbuddy: "/app-icons/workbuddy.svg",
 };
 
 const busy = computed(() => busyKind.value === props.app.kind);
+const guideOpen = ref(false);
 const installIcon = computed(() => (props.app.installed ? RefreshCw : Download));
 const applyIcon = computed(() =>
   props.app.appliedModelId ? CircleCheck : Plug,
@@ -76,7 +81,12 @@ const progress = computed(() => {
 });
 
 async function doApply() {
-  await apply(props.app.kind);
+  // 手动应用的应用没有可写入的配置：应用成功后弹出「对接说明」，
+  // 让用户照着在客户端 GUI 里填写。
+  const applied = await apply(props.app.kind);
+  if (applied && props.app.applyMode === "manual") {
+    guideOpen.value = true;
+  }
 }
 
 async function copyApiKey() {
@@ -86,13 +96,15 @@ async function copyApiKey() {
 </script>
 
 <template>
-  <Card class="gap-4 transition-all hover:border-foreground/20 hover:shadow-md">
+  <Card
+    class="gap-4 transition-[border-color,box-shadow,background-color] duration-200 hover:border-foreground/20 hover:bg-accent/[0.03] hover:shadow-md"
+  >
     <CardHeader>
       <div class="flex items-start justify-between gap-4">
         <div class="flex min-w-0 items-center gap-3">
           <img :src="icon" :alt="app.name" class="size-10 shrink-0 object-contain" />
           <div class="min-w-0 space-y-0.5">
-            <CardTitle class="text-base">{{ app.name }}</CardTitle>
+            <CardTitle>{{ app.name }}</CardTitle>
             <p class="truncate text-xs text-muted-foreground">
               {{ app.publisher }}
             </p>
@@ -154,8 +166,8 @@ async function copyApiKey() {
 
     <CardFooter class="mt-auto gap-3">
       <Button
-        size="sm"
-        class="min-w-20 gap-2"
+        size="xs"
+        class="gap-1"
         :disabled="busy || !activeModelId"
         @click="doApply"
       >
@@ -169,8 +181,8 @@ async function copyApiKey() {
 
       <Button
         variant="outline"
-        size="sm"
-        class="min-w-20 gap-2"
+        size="xs"
+        class="gap-1"
         :disabled="busy"
         @click="app.installed ? update(app.kind) : install(app.kind)"
       >
@@ -180,7 +192,7 @@ async function copyApiKey() {
 
       <DropdownMenu>
         <DropdownMenuTrigger as-child>
-          <Button variant="ghost" size="icon-sm" class="ml-auto">
+          <Button variant="outline" size="icon-xs" class="ml-auto">
             <MorphIconBox :icon="Route" :size="15" />
           </Button>
         </DropdownMenuTrigger>
@@ -200,4 +212,6 @@ async function copyApiKey() {
       </DropdownMenu>
     </CardFooter>
   </Card>
+
+  <ManualGuideDialog v-model:open="guideOpen" :app="app" />
 </template>

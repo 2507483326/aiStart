@@ -2,7 +2,7 @@ use crate::domain::app::{AppDescriptor, AppKind, ApplyReport};
 use crate::domain::catalog;
 use crate::error::{AppError, AppResult};
 
-use super::{AppConfigurator, ApplyContext, DetectResult};
+use super::{AppConfigurator, ApplyContext, DetectResult, ModelChoice};
 
 pub struct UnsupportedConfigurator {
     kind: AppKind,
@@ -32,6 +32,10 @@ impl AppConfigurator for UnsupportedConfigurator {
 
     fn is_configured(&self) -> AppResult<bool> {
         Ok(false)
+    }
+
+    fn exposed_models(&self) -> Vec<ModelChoice> {
+        Vec::new()
     }
 
     fn apply(&self, _ctx: &ApplyContext) -> AppResult<ApplyReport> {

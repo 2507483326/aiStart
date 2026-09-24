@@ -30,9 +30,6 @@ fn validate(input: &FilterInput) -> AppResult<()> {
         FilterRule::SystemPrompt { text, .. } if text.trim().is_empty() => {
             Err(AppError::InvalidConfig("系统提示词不能为空".into()))
         }
-        FilterRule::TextReplace { find, .. } if find.is_empty() => {
-            Err(AppError::InvalidConfig("要查找的文本不能为空".into()))
-        }
         _ => Ok(()),
     }
 }

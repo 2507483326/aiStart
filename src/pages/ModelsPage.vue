@@ -73,7 +73,7 @@ onMounted(async () => {
 
       <div class="flex flex-wrap items-center gap-2">
         <label
-          class="flex cursor-pointer items-center gap-2 rounded-md border px-3 py-1.5"
+          class="flex cursor-pointer items-center gap-2 rounded-md border bg-background px-3 py-1.5 shadow-xs transition-colors hover:bg-accent/50"
           title="开启后，网关请求上游失败时会按列表顺序自动切换到下一个可用模型"
         >
           <MorphIconBox

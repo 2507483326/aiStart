@@ -34,7 +34,7 @@ export const router = createRouter({
       path: "/filters",
       name: "filters",
       component: FiltersPage,
-      meta: { title: "过滤器", subtitle: "在请求转发前按规则改写请求内容" },
+      meta: { title: "提示词注入", subtitle: "请求转发给上游前注入系统提示词" },
     },
     {
       path: "/stats",

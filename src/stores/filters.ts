@@ -20,8 +20,8 @@ export const useFiltersStore = defineStore("filters", {
     },
     async save(input: FilterInput): Promise<boolean> {
       const saved = await attempt(() => filterApi.save(input), {
-        success: "过滤器已保存",
-        error: "保存过滤器失败",
+        success: "提示词注入已保存",
+        error: "保存提示词注入失败",
       });
       if (!saved) return false;
       await this.refresh();
@@ -29,7 +29,7 @@ export const useFiltersStore = defineStore("filters", {
     },
     async setEnabled(id: number, enabled: boolean): Promise<boolean> {
       const updated = await attempt(() => filterApi.setEnabled(id, enabled), {
-        error: "切换过滤器状态失败",
+        error: "切换提示词注入状态失败",
       });
       if (!updated) return false;
       const index = this.filters.findIndex((filter) => filter.id === id);
@@ -38,8 +38,8 @@ export const useFiltersStore = defineStore("filters", {
     },
     async remove(id: number): Promise<boolean> {
       const next = await attempt(() => filterApi.remove(id), {
-        success: "过滤器已删除",
-        error: "删除过滤器失败",
+        success: "提示词注入已删除",
+        error: "删除提示词注入失败",
       });
       if (!next) return false;
       this.filters = next;

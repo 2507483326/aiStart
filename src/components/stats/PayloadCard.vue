@@ -36,7 +36,7 @@ const translateLabel = computed(() => {
 <template>
   <div class="rounded-lg border bg-card">
     <div class="flex items-center gap-2 border-b px-3 py-1.5">
-      <Badge v-if="label" variant="outline" class="text-[10px]" :class="labelClass">
+      <Badge v-if="label" variant="outline" :class="labelClass">
         {{ label }}
       </Badge>
       <slot name="meta" />

@@ -3,7 +3,12 @@ export type ModelFormat =
   | "openai-completions"
   | "openai-responses";
 
-export type AppKind = "claude-desktop" | "deepseek-desktop";
+export type AppKind =
+  | "claude-desktop"
+  | "deepseek-desktop"
+  | "codex"
+  | "zcode"
+  | "workbuddy";
 
 export type ApplyMode = "gateway" | "direct-config" | "manual";
 
@@ -35,20 +40,9 @@ export interface FormatInfo {
   defaultBaseUrl: string;
 }
 
-export type PromptMode = "append" | "prepend" | "replace";
+export type PromptMode = "append" | "prepend";
 
-export type ReplaceTarget = "system" | "messages" | "all";
-
-export type FilterRule =
-  | { kind: "system-prompt"; mode: PromptMode; text: string }
-  | {
-      kind: "request-params";
-      temperature: number | null;
-      maxTokens: number | null;
-      topP: number | null;
-      stopSequences: string[] | null;
-    }
-  | { kind: "text-replace"; find: string; replace: string; target: ReplaceTarget };
+export type FilterRule = { kind: "system-prompt"; mode: PromptMode; text: string };
 
 export interface RequestFilter {
   id: number;
@@ -90,8 +84,10 @@ export interface UsagePayloadDetail {
   id: number;
   time: string;
   inboundRequest: string | null;
+  upstreamRequest: string | null;
   upstreamResponse: string | null;
   requestTruncated: boolean;
+  upstreamRequestTruncated: boolean;
   responseTruncated: boolean;
   stream: boolean;
 }

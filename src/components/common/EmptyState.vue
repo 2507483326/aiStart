@@ -12,7 +12,7 @@ defineProps<{
 
 <template>
   <div
-    class="flex flex-col items-center justify-center gap-3 rounded-lg border border-dashed px-6 py-14 text-center"
+    class="flex flex-col items-center justify-center gap-3 rounded-lg border border-dashed bg-[radial-gradient(var(--border)_1px,transparent_1px)] bg-[size:16px_16px] px-6 py-14 text-center transition-colors duration-200 hover:border-foreground/20"
   >
     <div
       class="flex size-11 items-center justify-center rounded-full bg-muted text-muted-foreground"

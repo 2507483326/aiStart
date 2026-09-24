@@ -84,8 +84,9 @@ export const useAppsStore = defineStore("apps", {
         });
         if (!report) return;
         this.lastSteps = report.steps;
+        const name = this.apps.find((app) => app.kind === kind)?.name ?? kind;
         notifySuccess(
-          `${kind === "claude-desktop" ? "Claude Desktop" : "DeepSeek Desktop"} 安装流程已启动`,
+          `${name} 安装流程已启动`,
           report.steps[report.steps.length - 1],
         );
         await this.refresh();

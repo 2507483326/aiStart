@@ -5,6 +5,7 @@ mod error;
 mod events;
 mod filters;
 mod gateway;
+mod install;
 mod platform;
 mod providers;
 mod settings;

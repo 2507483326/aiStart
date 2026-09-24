@@ -16,14 +16,17 @@ import {
   sourceAppLabel,
 } from "@/lib/format";
 import type { UsageRecord } from "@/lib/types";
+import { cn } from "@/lib/utils";
 
 withDefaults(
   defineProps<{
     records: UsageRecord[];
     empty?: string;
+    scroll?: boolean;
   }>(),
   {
     empty: "还没有请求记录。让 Claude Desktop 或任意客户端调用一次网关即可看到数据。",
+    scroll: false,
   },
 );
 
@@ -43,13 +46,16 @@ function cacheHit(record: UsageRecord): string {
     {{ empty }}
   </div>
 
-  <div v-else class="overflow-x-auto">
+  <div
+    v-else
+    :class="cn('overflow-x-auto', scroll && 'max-h-[30rem] overflow-y-auto')"
+  >
     <table class="w-full text-xs">
-      <thead>
+      <thead :class="scroll ? 'sticky top-0 z-10 bg-card' : undefined">
         <tr class="border-b text-left text-muted-foreground">
           <th class="py-2 pr-3 font-medium">时间</th>
-          <th class="py-2 pr-3 font-medium">模型</th>
           <th class="py-2 pr-3 font-medium">来源</th>
+          <th class="py-2 pr-3 font-medium">模型</th>
           <th class="py-2 pr-3 font-medium">入站</th>
           <th class="py-2 pr-3 font-medium">上游</th>
           <th class="py-2 pr-3 text-right font-medium">输入</th>
@@ -65,17 +71,11 @@ function cacheHit(record: UsageRecord): string {
         <tr
           v-for="record in records"
           :key="record.id"
-          class="cursor-pointer border-b transition-colors last:border-0 hover:bg-accent/40"
+          class="cursor-pointer border-b transition-colors duration-150 last:border-0 hover:bg-accent/50"
           @click="openDetail(record)"
         >
           <td class="py-2 pr-3 whitespace-nowrap text-muted-foreground">
             {{ formatDateTime(record.timestamp) }}
-          </td>
-          <td class="py-2 pr-3">
-            <span class="font-medium">{{ record.servedBy || record.modelName || "—" }}</span>
-            <Badge v-if="record.failover" variant="outline" class="ml-1.5 text-[10px]">
-              自动切换
-            </Badge>
           </td>
           <td class="py-2 pr-3 whitespace-nowrap text-muted-foreground">
             <span class="inline-flex items-center gap-1.5">
@@ -87,6 +87,12 @@ function cacheHit(record: UsageRecord): string {
               />
               {{ sourceAppLabel(record.sourceApp) }}
             </span>
+          </td>
+          <td class="py-2 pr-3">
+            <span class="font-medium">{{ record.servedBy || record.modelName || "—" }}</span>
+            <Badge v-if="record.failover" variant="outline" class="ml-1.5">
+              自动切换
+            </Badge>
           </td>
           <td class="py-2 pr-3 whitespace-nowrap text-muted-foreground">
             {{ protocolLabel(record.inboundProtocol) }}

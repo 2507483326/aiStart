@@ -61,7 +61,7 @@ function messageText(message: PayloadMessage): string {
           <div class="flex items-center gap-2">
             <MorphIconBox :icon="Wrench" :size="13" class="shrink-0 text-muted-foreground" />
             <span class="text-xs font-medium">{{ part.name || "工具调用" }}</span>
-            <span v-if="part.id" class="truncate font-mono text-[10px] text-muted-foreground">
+            <span v-if="part.id" class="truncate font-mono text-[11px] text-muted-foreground">
               {{ part.id }}
             </span>
           </div>
@@ -89,7 +89,7 @@ function messageText(message: PayloadMessage): string {
             <span class="text-xs font-medium">
               {{ part.name ? `工具返回 · ${part.name}` : "工具返回" }}
             </span>
-            <span v-if="part.isError" class="text-[10px] text-destructive">错误</span>
+            <span v-if="part.isError" class="text-[11px] text-destructive">错误</span>
           </div>
           <pre
             v-if="part.output"

@@ -97,16 +97,22 @@ export const applyModeLabels: Record<ApplyMode, string> = {
 export const sourceAppLabels: Record<AppKind, string> = {
   "claude-desktop": "Claude Desktop",
   "deepseek-desktop": "DeepSeek Desktop",
+  codex: "Codex",
+  zcode: "ZCode",
+  workbuddy: "WorkBuddy",
 };
 
 export const sourceAppIcons: Record<AppKind, string> = {
   "claude-desktop": "/app-icons/claude-desktop.svg",
   "deepseek-desktop": "/app-icons/deepseek-desktop.png",
+  codex: "/app-icons/codex.svg",
+  zcode: "/app-icons/zcode.svg",
+  workbuddy: "/app-icons/workbuddy.svg",
 };
 
-/** 请求来源：匹配到的应用显示其名称，未匹配的（自定义 Key）原样展示 token。 */
+/** 请求来源：匹配到的应用显示其名称，未匹配的（自定义 Key）原样展示 token，未记录显示「未知」。 */
 export function sourceAppLabel(value: string): string {
-  if (!value) return "—";
+  if (!value) return "未知";
   return (sourceAppLabels as Record<string, string>)[value] ?? value;
 }
 

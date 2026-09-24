@@ -15,7 +15,7 @@ const label = computed(() =>
 <template>
   <Badge
     variant="outline"
-    class="px-1.5 py-0 text-[10px] font-normal leading-4 text-muted-foreground"
+    class="px-1.5 py-0 font-normal leading-4 text-muted-foreground"
     :title="formatLabels[format]"
   >
     {{ label }}

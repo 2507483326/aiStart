@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 
 use crate::db;
 use crate::domain::canonical::CanonicalRequest;
-use crate::domain::filter::{FilterRule, PromptMode, ReplaceTarget, RequestFilter};
+use crate::domain::filter::{FilterRule, PromptMode, RequestFilter};
 use crate::error::{AppError, AppResult};
 
 /// 过滤器进程内缓存：网关每个请求读一次快照（与 settings::snapshot 一致），
@@ -108,49 +108,11 @@ pub fn apply(rules: &[RequestFilter], request: CanonicalRequest) -> AppResult<Ca
 }
 
 fn apply_rule(request: CanonicalRequest, rule: &FilterRule) -> AppResult<CanonicalRequest> {
-    match rule {
-        FilterRule::SystemPrompt { mode, text } => request.map_raw(|raw| {
-            apply_system_prompt(raw, *mode, text);
-            Ok(())
-        }),
-        FilterRule::RequestParams {
-            temperature,
-            max_tokens,
-            top_p,
-            stop_sequences,
-        } => request.map_raw(|raw| {
-            let Some(object) = raw.as_object_mut() else {
-                return Ok(());
-            };
-            if let Some(value) = temperature {
-                object.insert("temperature".into(), json!(value));
-            }
-            if let Some(value) = max_tokens {
-                object.insert("max_tokens".into(), json!(value));
-            }
-            if let Some(value) = top_p {
-                object.insert("top_p".into(), json!(value));
-            }
-            if let Some(value) = stop_sequences {
-                object.insert("stop_sequences".into(), json!(value));
-            }
-            Ok(())
-        }),
-        FilterRule::TextReplace {
-            find,
-            replace,
-            target,
-        } => {
-            // 空查找串没有意义，且字符串 replace("") 会到处插入，直接跳过。
-            if find.is_empty() {
-                return Ok(request);
-            }
-            request.map_raw(|raw| {
-                apply_text_replace(raw, find, replace, *target);
-                Ok(())
-            })
-        }
-    }
+    let FilterRule::SystemPrompt { mode, text } = rule;
+    request.map_raw(|raw| {
+        apply_system_prompt(raw, *mode, text);
+        Ok(())
+    })
 }
 
 fn apply_system_prompt(raw: &mut Value, mode: PromptMode, text: &str) {
@@ -159,7 +121,6 @@ fn apply_system_prompt(raw: &mut Value, mode: PromptMode, text: &str) {
     };
     let current = object.remove("system");
     let next = match (mode, current) {
-        (PromptMode::Replace, _) => Value::String(text.to_string()),
         (PromptMode::Append | PromptMode::Prepend, None) => Value::String(text.to_string()),
         (PromptMode::Append, Some(Value::String(existing))) => {
             Value::String(join_text(&existing, text, true))
@@ -193,53 +154,4 @@ fn join_text(left: &str, right: &str, newline: bool) -> String {
     }
     result.push_str(right);
     result
-}
-
-fn apply_text_replace(raw: &mut Value, find: &str, replace: &str, target: ReplaceTarget) {
-    let Some(object) = raw.as_object_mut() else {
-        return;
-    };
-    if matches!(target, ReplaceTarget::System | ReplaceTarget::All) {
-        if let Some(system) = object.get_mut("system") {
-            replace_in_text_value(system, find, replace);
-        }
-    }
-    if matches!(target, ReplaceTarget::Messages | ReplaceTarget::All) {
-        if let Some(Value::Array(messages)) = object.get_mut("messages") {
-            for message in messages.iter_mut() {
-                if let Some(content) = message.get_mut("content") {
-                    replace_in_text_value(content, find, replace);
-                }
-            }
-        }
-    }
-}
-
-/// 只在文本字段里做字面量替换：字符串整体、块数组里带 `text` 字段的块、
-/// 以及 tool_result 的 `content`（可能是字符串或块数组）；绝不改动 tool_use.input
-/// 之类结构化字段。
-fn replace_in_text_value(value: &mut Value, find: &str, replace: &str) {
-    match value {
-        Value::String(text) => replace_in_string(text, find, replace),
-        Value::Array(items) => {
-            for item in items.iter_mut() {
-                replace_in_text_value(item, find, replace);
-            }
-        }
-        Value::Object(map) => {
-            if let Some(Value::String(text)) = map.get_mut("text") {
-                replace_in_string(text, find, replace);
-            }
-            if let Some(content) = map.get_mut("content") {
-                replace_in_text_value(content, find, replace);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn replace_in_string(text: &mut String, find: &str, replace: &str) {
-    if text.contains(find) {
-        *text = text.replace(find, replace);
-    }
 }

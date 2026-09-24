@@ -685,6 +685,7 @@ fn sqlite_persistence_round_trips() {
         },
         Some(&usage::UsagePayload {
             inbound_request: Some("{\"hello\":1}".into()),
+            upstream_request: Some("{\"system\":\"injected\"}".into()),
             upstream_response: Some("{\"ok\":true}".into()),
             stream: false,
         }),
@@ -693,8 +694,17 @@ fn sqlite_persistence_round_trips() {
     let latest = usage::recent(1);
     let detail = usage::payload_detail(latest[0].id).expect("payload should load");
     assert_eq!(detail.inbound_request.as_deref(), Some("{\"hello\":1}"));
+    assert_eq!(
+        detail.upstream_request.as_deref(),
+        Some("{\"system\":\"injected\"}")
+    );
     assert_eq!(detail.upstream_response.as_deref(), Some("{\"ok\":true}"));
-    assert!(!detail.stream && !detail.request_truncated && !detail.response_truncated);
+    assert!(
+        !detail.stream
+            && !detail.request_truncated
+            && !detail.upstream_request_truncated
+            && !detail.response_truncated
+    );
 
     // 某天首次写入时 usage_daily_total 会新建行，报文仍须挂到正确的明细行
     // （回归：last_insert_rowid 若在 daily upsert 之后取，会被覆盖成 daily 的行号）
@@ -719,6 +729,7 @@ fn sqlite_persistence_round_trips() {
         },
         Some(&usage::UsagePayload {
             inbound_request: Some("{\"day\":\"first\"}".into()),
+            upstream_request: None,
             upstream_response: None,
             stream: false,
         }),
@@ -749,6 +760,7 @@ fn sqlite_persistence_round_trips() {
         },
         Some(&usage::UsagePayload {
             inbound_request: Some("x".repeat(300 * 1024)),
+            upstream_request: None,
             upstream_response: None,
             stream: true,
         }),
@@ -783,6 +795,7 @@ fn sqlite_persistence_round_trips() {
             },
             Some(&usage::UsagePayload {
                 inbound_request: Some("{}".into()),
+                upstream_request: None,
                 upstream_response: None,
                 stream: false,
             }),
@@ -900,7 +913,7 @@ fn response_assembler_builds_canonical_message_then_native_shape() {
 
 // ── 请求过滤器（filters::apply）──────────────────────────────────────
 
-use crate::domain::filter::{FilterRule, PromptMode, ReplaceTarget, RequestFilter};
+use crate::domain::filter::{FilterRule, PromptMode, RequestFilter};
 use crate::filters;
 
 fn filter(enabled: bool, rule: FilterRule) -> RequestFilter {
@@ -916,7 +929,7 @@ fn filter(enabled: bool, rule: FilterRule) -> RequestFilter {
 }
 
 #[test]
-fn filter_injects_system_prompt_in_all_modes() {
+fn filter_injects_system_prompt() {
     // system 缺失 → 直接写入
     let out = filters::apply(
         &[filter(true, FilterRule::SystemPrompt { mode: PromptMode::Append, text: "B".into() })],
@@ -925,7 +938,7 @@ fn filter_injects_system_prompt_in_all_modes() {
     .unwrap();
     assert_eq!(out.raw()["system"], "B");
 
-    // 已有字符串 → 追加 / 前置 / 替换
+    // 已有字符串 → 追加 / 前置
     let append = filters::apply(
         &[filter(true, FilterRule::SystemPrompt { mode: PromptMode::Append, text: "B".into() })],
         request(json!({ "system": "A", "messages": [] })),
@@ -940,13 +953,6 @@ fn filter_injects_system_prompt_in_all_modes() {
     .unwrap();
     assert_eq!(prepend.raw()["system"], "B\nA");
 
-    let replace = filters::apply(
-        &[filter(true, FilterRule::SystemPrompt { mode: PromptMode::Replace, text: "B".into() })],
-        request(json!({ "system": "A", "messages": [] })),
-    )
-    .unwrap();
-    assert_eq!(replace.raw()["system"], "B");
-
     // 块数组 → 追加一个 text 块
     let blocks = filters::apply(
         &[filter(true, FilterRule::SystemPrompt { mode: PromptMode::Append, text: "B".into() })],
@@ -958,83 +964,10 @@ fn filter_injects_system_prompt_in_all_modes() {
 }
 
 #[test]
-fn filter_overrides_only_provided_params() {
-    let out = filters::apply(
-        &[filter(
-            true,
-            FilterRule::RequestParams {
-                temperature: Some(0.9),
-                max_tokens: None,
-                top_p: None,
-                stop_sequences: Some(vec!["END".into()]),
-            },
-        )],
-        request(json!({ "max_tokens": 100, "temperature": 0.1, "top_p": 0.5, "messages": [] })),
-    )
-    .unwrap();
-
-    assert_eq!(out.raw()["temperature"], 0.9);
-    assert_eq!(out.raw()["max_tokens"], 100); // 未填 → 保持原值
-    assert_eq!(out.raw()["top_p"], 0.5);
-    assert_eq!(out.raw()["stop_sequences"][0], "END");
-}
-
-#[test]
-fn filter_text_replace_touches_text_but_not_structured_fields() {
-    let out = filters::apply(
-        &[filter(
-            true,
-            FilterRule::TextReplace {
-                find: "FOO".into(),
-                replace: "BAR".into(),
-                target: ReplaceTarget::All,
-            },
-        )],
-        request(json!({
-            "system": "FOO system",
-            "messages": [
-                { "role": "user", "content": "FOO hello" },
-                { "role": "assistant", "content": [
-                    { "type": "tool_use", "id": "FOO-id", "name": "FOO-tool", "input": { "city": "FOO" } },
-                    { "type": "tool_result", "tool_use_id": "FOO-id", "content": "FOO result" }
-                ]}
-            ]
-        })),
-    )
-    .unwrap();
-
-    assert_eq!(out.raw()["system"], "BAR system");
-    assert_eq!(out.raw()["messages"][0]["content"], "BAR hello");
-    // tool_use 的结构化字段绝不被替换
-    assert_eq!(out.raw()["messages"][1]["content"][0]["id"], "FOO-id");
-    assert_eq!(out.raw()["messages"][1]["content"][0]["name"], "FOO-tool");
-    assert_eq!(out.raw()["messages"][1]["content"][0]["input"]["city"], "FOO");
-    // tool_result 的文本内容被替换，但 tool_use_id 不动
-    assert_eq!(out.raw()["messages"][1]["content"][1]["content"], "BAR result");
-    assert_eq!(out.raw()["messages"][1]["content"][1]["tool_use_id"], "FOO-id");
-
-    // target = system 时 messages 不受影响
-    let only_system = filters::apply(
-        &[filter(
-            true,
-            FilterRule::TextReplace {
-                find: "FOO".into(),
-                replace: "BAR".into(),
-                target: ReplaceTarget::System,
-            },
-        )],
-        request(json!({ "system": "FOO", "messages": [{ "role": "user", "content": "FOO" }] })),
-    )
-    .unwrap();
-    assert_eq!(only_system.raw()["system"], "BAR");
-    assert_eq!(only_system.raw()["messages"][0]["content"], "FOO");
-}
-
-#[test]
 fn filter_skips_disabled_and_stacks_in_order() {
     // 停用的规则不生效
     let disabled = filters::apply(
-        &[filter(false, FilterRule::SystemPrompt { mode: PromptMode::Replace, text: "X".into() })],
+        &[filter(false, FilterRule::SystemPrompt { mode: PromptMode::Append, text: "X".into() })],
         request(json!({ "system": "A", "messages": [] })),
     )
     .unwrap();

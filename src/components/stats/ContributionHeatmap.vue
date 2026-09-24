@@ -128,7 +128,7 @@ const todayTokens = computed(() => usageByDate.value.get(iso(today))?.totalToken
 <template>
   <div class="space-y-3">
     <div class="flex gap-2 overflow-x-auto pb-1">
-      <div class="grid grid-rows-7 gap-[3px] text-[10px] leading-3 text-muted-foreground">
+      <div class="grid grid-rows-7 gap-[3px] text-[11px] leading-3 text-muted-foreground">
         <span
           v-for="(day, index) in WEEKDAYS"
           :key="day"
@@ -140,7 +140,7 @@ const todayTokens = computed(() => usageByDate.value.get(iso(today))?.totalToken
       </div>
 
       <div class="min-w-0 space-y-1">
-        <div class="flex text-[10px] leading-3 text-muted-foreground">
+        <div class="flex text-[11px] leading-3 text-muted-foreground">
           <span
             v-for="label in monthLabels"
             :key="label.key"
@@ -165,7 +165,7 @@ const todayTokens = computed(() => usageByDate.value.get(iso(today))?.totalToken
       </div>
     </div>
 
-    <div class="flex items-center justify-between gap-3 text-[10px] text-muted-foreground">
+    <div class="flex items-center justify-between gap-3 text-[11px] text-muted-foreground">
       <div class="flex items-center gap-3">
         <span>
           {{ year }} 年
