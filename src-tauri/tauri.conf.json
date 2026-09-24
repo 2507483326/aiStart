@@ -13,8 +13,8 @@
     "windows": [
       {
         "title": "AI Start · 开发工具与模型管理",
-        "width": 1180,
-        "height": 780,
+        "width": 1400,
+        "height": 1000,
         "minWidth": 960,
         "minHeight": 640,
         "center": true

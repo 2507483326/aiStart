@@ -143,7 +143,7 @@ async function duplicateModel() {
         @click="activate(model.id)"
       >
         <MorphIconBox :icon="active ? CircleCheck : Play" :size="14" />
-        {{ active ? "使用中" : "启用" }}
+        <span class="w-9 text-center">{{ active ? "使用中" : "启用" }}</span>
       </Button>
 
       <Button size="xs" variant="outline" class="gap-1" :disabled="testing" @click="runTest">

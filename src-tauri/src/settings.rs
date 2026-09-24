@@ -160,8 +160,7 @@ fn store() -> &'static RwLock<Settings> {
 pub fn init(dir: &Path) -> AppResult<()> {
     db::init(dir)?;
 
-    let mut settings = load()?;
-    seed_default_models(&mut settings);
+    let settings = load()?;
 
     *store().write().expect("settings lock poisoned") = settings;
     persist()
@@ -257,47 +256,6 @@ fn load_app_tokens(connection: &Connection) -> AppResult<BTreeMap<String, String
         tokens.insert(app_kind, token);
     }
     Ok(tokens)
-}
-
-fn seed_default_models(settings: &mut Settings) {
-    if !settings.models.is_empty() {
-        return;
-    }
-    let now = chrono::Local::now().to_rfc3339();
-    let seeds = [
-        (
-            "DeepSeek Chat（示例）",
-            ModelFormat::OpenaiCompletions,
-            "https://api.deepseek.com/v1",
-            "deepseek-chat",
-        ),
-        (
-            "Claude Sonnet（示例）",
-            ModelFormat::AnthropicMessages,
-            "https://api.anthropic.com",
-            "claude-sonnet-4-5",
-        ),
-    ];
-
-    let mut next_id = settings.next_model_id();
-    for (name, format, base_url, model) in seeds {
-        let id = next_id;
-        next_id += 1;
-        settings.models.push(ModelConfig {
-            id,
-            name: name.into(),
-            format,
-            base_url: base_url.into(),
-            api_key: String::new(),
-            model: model.into(),
-            supports_1m: false,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        });
-        if settings.active_model_id.is_none() {
-            settings.active_model_id = Some(id);
-        }
-    }
 }
 
 fn setting_pairs(settings: &Settings) -> Vec<(&'static str, String)> {

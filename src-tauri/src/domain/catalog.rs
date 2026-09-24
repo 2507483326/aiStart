@@ -75,7 +75,7 @@ pub fn builtin_apps() -> Vec<AppDescriptor> {
             publisher: "DeepSeek".into(),
             description: "DeepSeek 桌面客户端（DSH）。把 aiStart 网关作为 provider 合并进 ~/.dsh/settings.yaml，并设为默认模型。"
                 .into(),
-            download_page: "https://www.deepseek.com/".into(),
+            download_page: "https://github.com/anywhere-labs/dsh-desktop".into(),
             homepage: "https://www.deepseek.com/".into(),
             requires_gateway: true,
             apply_mode: ApplyMode::DirectConfig,
