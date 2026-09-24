@@ -1,4 +1,4 @@
-import type { ApplyMode, ModelFormat } from "@/lib/types";
+import type { AppKind, ApplyMode, ModelFormat } from "@/lib/types";
 
 export function formatNumber(value: number): string {
   return new Intl.NumberFormat("zh-CN").format(value);
@@ -93,3 +93,24 @@ export const applyModeLabels: Record<ApplyMode, string> = {
   "direct-config": "写入配置",
   manual: "手动应用",
 };
+
+export const sourceAppLabels: Record<AppKind, string> = {
+  "claude-desktop": "Claude Desktop",
+  "deepseek-desktop": "DeepSeek Desktop",
+};
+
+export const sourceAppIcons: Record<AppKind, string> = {
+  "claude-desktop": "/app-icons/claude-desktop.svg",
+  "deepseek-desktop": "/app-icons/deepseek-desktop.png",
+};
+
+/** 请求来源：匹配到的应用显示其名称，未匹配的（自定义 Key）原样展示 token。 */
+export function sourceAppLabel(value: string): string {
+  if (!value) return "—";
+  return (sourceAppLabels as Record<string, string>)[value] ?? value;
+}
+
+/** 请求来源匹配到内置应用时返回其图标路径，未匹配（自定义 Key）返回 null。 */
+export function sourceAppIcon(value: string): string | null {
+  return (sourceAppIcons as Record<string, string>)[value] ?? null;
+}

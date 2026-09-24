@@ -2,7 +2,7 @@ import { defineStore } from "pinia";
 import { listen } from "@tauri-apps/api/event";
 
 import { appApi } from "@/lib/ipc";
-import { attempt, notifySuccess } from "@/lib/notify";
+import { attempt, notifyError, notifySuccess } from "@/lib/notify";
 import type { AppKind, AppUpdate, DownloadProgress, ToolApp } from "@/lib/types";
 
 export const useAppsStore = defineStore("apps", {
@@ -59,6 +59,22 @@ export const useAppsStore = defineStore("apps", {
         this.loading = false;
       }
       void this.checkUpdates();
+    },
+    // 「刷新」按钮专用：重新拉列表并等联网检查完成，让按钮的 loading 覆盖整段过程，
+    // 结束后给出明确反馈（否则后台检查静默，看起来像点了没反应）。
+    async recheck(): Promise<void> {
+      this.loading = true;
+      try {
+        this.apps = this.withKnownUpdates(await appApi.list());
+        await this.checkUpdates();
+      } catch (error) {
+        notifyError(error, "检查更新失败");
+        return;
+      } finally {
+        this.loading = false;
+      }
+      const count = this.apps.filter((app) => app.updateAvailable).length;
+      notifySuccess(count > 0 ? `发现 ${count} 个可更新的应用` : "未发现可更新的应用");
     },
     async install(kind: AppKind): Promise<void> {
       this.busyKind = kind;

@@ -7,6 +7,7 @@ export function useApps() {
   return {
     ...storeToRefs(store),
     refresh: store.refresh,
+    recheck: store.recheck,
     ensureListener: store.ensureListener,
     install: store.install,
     update: store.update,

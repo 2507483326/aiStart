@@ -11,7 +11,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { useApps } from "@/composables/useApps";
 import { useModels } from "@/composables/useModels";
 
-const { apps, loading, refresh, ensureListener } = useApps();
+const { apps, loading, refresh, recheck, ensureListener } = useApps();
 const { models, activeModelId, refresh: refreshModels } = useModels();
 
 onMounted(async () => {
@@ -29,7 +29,7 @@ onMounted(async () => {
           一键安装、一键更新，并把任意模型的推理能力接入这些客户端。
         </p>
       </div>
-      <Button variant="outline" size="sm" class="gap-2" :disabled="loading" @click="refresh">
+      <Button variant="outline" size="sm" class="gap-2" :disabled="loading" @click="recheck">
         <MorphIconBox :icon="RefreshCw" :size="15" :class="loading ? 'animate-spin' : ''" />
         刷新
       </Button>

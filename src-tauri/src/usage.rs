@@ -13,6 +13,9 @@ pub struct UsageRecord {
     pub date: String,
     pub model_name: String,
     pub served_by: String,
+    /// 来源应用：按请求 token 匹配到的 app_kind；未匹配则原样存该 token；空串=历史数据/未记录。
+    #[serde(default)]
+    pub source_app: String,
     pub inbound_protocol: String,
     pub upstream_protocol: String,
     pub input_tokens: u64,
@@ -112,7 +115,7 @@ pub struct UsageSummary {
 }
 
 const SELECT_COLUMNS: &str = "usage_detail_id, day, event_time, model_name, served_by, inbound_protocol, \
-     upstream_protocol, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, duration_ms, ok, failover, error";
+     upstream_protocol, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, duration_ms, ok, failover, error, source_app";
 
 fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRecord> {
     let event_time: i64 = row.get(2)?;
@@ -134,6 +137,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRecord> {
         ok: ok != 0,
         failover: failover != 0,
         error: row.get(14)?,
+        source_app: row.get(15)?,
     })
 }
 
@@ -164,8 +168,8 @@ pub fn record_with_payload(entry: &UsageRecord, payload: Option<&UsagePayload>) 
     let _ = db::with_tx(|transaction| {
         transaction.execute(
             "INSERT INTO usage_detail (day, event_time, model_name, served_by, inbound_protocol, upstream_protocol, \
-             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens, duration_ms, ok, failover, error, created_time, update_time) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)",
+             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens, duration_ms, ok, failover, error, source_app, created_time, update_time) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)",
             params![
                 entry.date,
                 event_time,
@@ -182,6 +186,7 @@ pub fn record_with_payload(entry: &UsageRecord, payload: Option<&UsagePayload>) 
                 i64::from(entry.ok),
                 i64::from(entry.failover),
                 entry.error,
+                entry.source_app,
                 event_time,
             ],
         )?;

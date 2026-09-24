@@ -73,6 +73,7 @@ export interface UsageRecord {
   date: string;
   modelName: string;
   servedBy: string;
+  sourceApp: string;
   inboundProtocol: string;
   upstreamProtocol: string;
   inputTokens: number;
@@ -147,6 +148,7 @@ export interface ToolApp {
   requiresGateway: boolean;
   applyMode: ApplyMode;
   configTarget: string;
+  apiKey: string;
   installed: boolean;
   version: string | null;
   installLocation: string | null;

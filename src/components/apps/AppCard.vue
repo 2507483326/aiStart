@@ -3,6 +3,7 @@ import { computed } from "vue";
 import {
   CircleArrowUp,
   CircleCheck,
+  Copy,
   Download,
   ExternalLink,
   LoaderCircle,
@@ -29,6 +30,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { useApps } from "@/composables/useApps";
+import { notifySuccess } from "@/lib/notify";
 import { openUrl } from "@/lib/open";
 import type { AppKind, ToolApp } from "@/lib/types";
 
@@ -76,6 +78,11 @@ const progress = computed(() => {
 async function doApply() {
   await apply(props.app.kind);
 }
+
+async function copyApiKey() {
+  await navigator.clipboard.writeText(props.app.apiKey);
+  notifySuccess("API Key 已复制");
+}
 </script>
 
 <template>
@@ -114,6 +121,18 @@ async function doApply() {
           @click="openUrl(app.homepage)"
         >
           {{ app.homepage }}
+        </button>
+      </p>
+      <p class="flex items-center gap-1.5 truncate">
+        <span class="text-muted-foreground">API Key: </span>
+        <span class="min-w-0 truncate">{{ app.apiKey }}</span>
+        <button
+          type="button"
+          class="shrink-0 text-muted-foreground transition-colors hover:text-foreground"
+          title="复制 API Key"
+          @click="copyApiKey"
+        >
+          <MorphIconBox :icon="Copy" :size="13" />
         </button>
       </p>
     </CardContent>

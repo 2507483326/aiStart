@@ -76,7 +76,7 @@ async function copyToken() {
         </div>
 
         <div class="space-y-2">
-          <Label for="gateway-token">网关 API Key</Label>
+          <Label for="gateway-token">通用 API Key（手动调用示例）</Label>
           <div class="flex gap-2">
             <Input
               id="gateway-token"
@@ -88,6 +88,9 @@ async function copyToken() {
               <MorphIconBox :icon="Copy" :size="15" />
             </Button>
           </div>
+          <p class="text-xs text-muted-foreground">
+            网关只校验 Key 非空，并按 Key 匹配来源应用。应用接入时会自动写入各自的专属 Key；此处仅为手动调用示例。
+          </p>
         </div>
 
         <div class="space-y-2">

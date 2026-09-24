@@ -18,6 +18,8 @@ pub struct Settings {
     pub auto_failover: bool,
     /// app_kind -> model_id
     pub applied: BTreeMap<String, i64>,
+    /// app_kind -> 应用专属网关 Key（固定可读，= app_kind）
+    pub app_tokens: BTreeMap<String, String>,
 }
 
 fn default_port() -> u16 {
@@ -33,6 +35,7 @@ impl Default for Settings {
             deepseek_config_path: None,
             auto_failover: false,
             applied: BTreeMap::new(),
+            app_tokens: BTreeMap::new(),
         }
     }
 }
@@ -46,6 +49,21 @@ impl Settings {
     pub fn applied_model(&self, kind: AppKind) -> Option<&ModelConfig> {
         let id = *self.applied.get(kind.as_str())?;
         self.models.iter().find(|model| model.id == id)
+    }
+
+    pub fn app_token(&self, kind: AppKind) -> Option<&str> {
+        self.app_tokens.get(kind.as_str()).map(String::as_str)
+    }
+
+    /// 按请求携带的 token 反查来源应用；空 token 视为未匹配。
+    pub fn app_for_token(&self, token: &str) -> Option<AppKind> {
+        if token.is_empty() {
+            return None;
+        }
+        self.app_tokens
+            .iter()
+            .find(|(_, value)| value.as_str() == token)
+            .and_then(|(kind, _)| AppKind::parse(kind))
     }
 
     pub fn candidate_models(&self) -> Vec<ModelConfig> {
@@ -159,6 +177,7 @@ fn load() -> AppResult<Settings> {
 
         settings.models = load_models(connection)?;
         settings.applied = load_bindings(connection)?;
+        settings.app_tokens = load_app_tokens(connection)?;
         Ok(settings)
     })
 }
@@ -202,6 +221,28 @@ fn load_bindings(connection: &Connection) -> AppResult<BTreeMap<String, i64>> {
         bindings.insert(app_kind, model_id);
     }
     Ok(bindings)
+}
+
+fn load_app_tokens(connection: &Connection) -> AppResult<BTreeMap<String, String>> {
+    let mut statement = connection.prepare("SELECT app_kind, token FROM app_model_bindings")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+
+    let mut tokens = BTreeMap::new();
+    for row in rows {
+        let (app_kind, token) = row?;
+        // 兼容补列后的旧行（token 为空）：回填为派生的专属 Key。
+        let token = if token.trim().is_empty() {
+            AppKind::parse(&app_kind)
+                .map(|kind| kind.gateway_token().to_string())
+                .unwrap_or(token)
+        } else {
+            token
+        };
+        tokens.insert(app_kind, token);
+    }
+    Ok(tokens)
 }
 
 fn seed_default_models(settings: &mut Settings) {
@@ -300,9 +341,17 @@ pub fn persist() -> AppResult<()> {
 
         transaction.execute("DELETE FROM app_model_bindings", [])?;
         for (app_kind, model_id) in &snapshot.applied {
+            let token = snapshot
+                .app_tokens
+                .get(app_kind)
+                .cloned()
+                .or_else(|| {
+                    AppKind::parse(app_kind).map(|kind| kind.gateway_token().to_string())
+                })
+                .unwrap_or_default();
             transaction.execute(
-                "INSERT INTO app_model_bindings (app_kind, model_id, created_time, update_time) VALUES (?1, ?2, ?3, ?3)",
-                params![app_kind, model_id, now],
+                "INSERT INTO app_model_bindings (app_kind, model_id, token, created_time, update_time) VALUES (?1, ?2, ?3, ?4, ?4)",
+                params![app_kind, model_id, token, now],
             )?;
         }
 

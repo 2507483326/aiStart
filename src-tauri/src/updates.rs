@@ -165,16 +165,18 @@ pub fn record_action(
     });
 }
 
-/// 最近一次 check 结果（按应用），用于重启后立刻显示徽标而不必等联网。
+/// 最近一次「有效」check 结果（按应用），用于重启后立刻显示徽标而不必等联网。
+/// 只认能真正比较出结果的检查（status = found / up-to-date）；早期落下的
+/// unreachable 行一律忽略，避免它们把已知的「有新版本」盖掉。
 pub fn latest_checks() -> BTreeMap<AppKind, CheckSnapshot> {
     db::with_conn(|connection| {
         let mut statement = connection.prepare(
             "SELECT r.app_kind, r.latest_version, r.update_available \
              FROM app_version_records r \
              JOIN (SELECT app_kind, MAX(event_time) AS newest FROM app_version_records \
-                   WHERE action = 'check' GROUP BY app_kind) m \
+                   WHERE action = 'check' AND status <> 'unreachable' GROUP BY app_kind) m \
                ON r.app_kind = m.app_kind AND r.event_time = m.newest \
-             WHERE r.action = 'check'",
+             WHERE r.action = 'check' AND r.status <> 'unreachable'",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -237,5 +239,7 @@ mod tests {
         assert!(is_newer("2.2553.2", "2.2553.1"));
         assert!(!is_newer("2.2553.1.0", "2.2553.1.0"));
         assert!(!is_newer("2.1000.0", "2.2553.1.0"));
+        // 尾随的 0 段不算更新：RELEASES 给 2.7032.0，MSIX 已安装版常是 2.7032.0.0
+        assert!(!is_newer("2.7032.0", "2.7032.0.0"));
     }
 }

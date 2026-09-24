@@ -9,7 +9,7 @@ use crate::error::{AppError, AppResult};
 pub const SCHEMA_SQL: &str = include_str!("schema.sql");
 
 /// 当前 schema 版本号，写入 schema_meta.db_schema_version。
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 static DB: OnceLock<Mutex<Connection>> = OnceLock::new();
 
@@ -21,6 +21,12 @@ pub fn init(dir: &Path) -> AppResult<()> {
     connection.execute_batch(
         "PRAGMA journal_mode = WAL;\nPRAGMA foreign_keys = OFF;\nPRAGMA busy_timeout = 5000;",
     )?;
+
+    // CREATE TABLE IF NOT EXISTS 只建新表，不会给已存在的旧库补列；schema.sql 里的索引又引用了新列，
+    // 所以必须在执行 DDL 之前对「已存在的表」补列（新库由 schema.sql 直接建出带列的表，这里跳过）。
+    ensure_column(&connection, "usage_detail", "source_app", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(&connection, "app_model_bindings", "token", "TEXT NOT NULL DEFAULT ''")?;
+
     connection.execute_batch(SCHEMA_SQL)?;
 
     let now = now_ms();
@@ -32,6 +38,31 @@ pub fn init(dir: &Path) -> AppResult<()> {
     )?;
 
     let _ = DB.set(Mutex::new(connection));
+    Ok(())
+}
+
+/// 幂等补列：旧库缺列时执行 ALTER TABLE ADD COLUMN（SQLite 无 ADD COLUMN IF NOT EXISTS）。
+/// 表尚不存在（全新库）时直接跳过——由 schema.sql 建出带该列的表。
+fn ensure_column(connection: &Connection, table: &str, column: &str, decl: &str) -> AppResult<()> {
+    let table_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get(0),
+    )?;
+    if !table_exists {
+        return Ok(());
+    }
+
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let column_exists = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(Result::ok)
+        .any(|name| name == column);
+    drop(statement);
+
+    if !column_exists {
+        connection.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+    }
     Ok(())
 }
 

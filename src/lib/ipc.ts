@@ -69,6 +69,10 @@ export const eventApi = {
   list: (limit?: number) => invoke<EventRecord[]>("list_events", { limit: limit ?? null }),
 };
 
+export const translateApi = {
+  text: (text: string) => invoke<string>("translate_text", { text }),
+};
+
 export const filterApi = {
   list: () => invoke<RequestFilter[]>("list_filters"),
   save: (input: FilterInput) => invoke<RequestFilter>("save_filter", { input }),

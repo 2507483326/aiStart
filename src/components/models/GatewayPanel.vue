@@ -31,7 +31,7 @@ const endpoints = computed(() => [
 const sample = computed(
   () => `curl ${baseUrl.value}/v1/messages \\
   -H "content-type: application/json" \\
-  -H "x-api-key: aiStart" \\
+  -H "x-api-key: claude-desktop" \\
   -d '{"model":"claude-sonnet-5","max_tokens":64,"messages":[{"role":"user","content":"ping"}]}'`,
 );
 
@@ -98,8 +98,10 @@ async function copySample() {
           </div>
         </div>
         <p class="text-[11px] text-muted-foreground">
-          三个端点都使用同一个 API Key：<span class="font-mono">aiStart</span>。模型名必须是 Claude
-          能识别的 <span class="font-mono">claude-*</span> 路由（对外提供
+          三个端点接受任意非空 API Key（网关只校验非空），并按 Key 匹配来源应用：应用接入时会自动写入各自的专属
+          Key（<span class="font-mono">claude-desktop</span> /
+          <span class="font-mono">deepseek-desktop</span>），未匹配的 Key 会原样记录在「请求」页的来源列。模型名必须是
+          Claude 能识别的 <span class="font-mono">claude-*</span> 路由（对外提供
           <span class="font-mono">claude-sonnet-5</span> /
           <span class="font-mono">claude-opus-5</span> /
           <span class="font-mono">claude-haiku-4-5</span> /

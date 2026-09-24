@@ -61,6 +61,7 @@ pub fn run() {
             commands::usage::usage_records,
             commands::usage::usage_page,
             commands::usage::usage_detail,
+            commands::translate::translate_text,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

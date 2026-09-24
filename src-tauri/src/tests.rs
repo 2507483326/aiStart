@@ -627,6 +627,7 @@ fn sqlite_persistence_round_trips() {
             date: date.clone(),
             model_name: "Temp".into(),
             served_by: "Temp".into(),
+            source_app: "claude-desktop".into(),
             inbound_protocol: "anthropic-messages".into(),
             upstream_protocol: "openai-responses".into(),
             input_tokens: 10,
@@ -644,6 +645,7 @@ fn sqlite_persistence_round_trips() {
     let records = usage::recent(10);
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].total_tokens(), 15);
+    assert_eq!(records[0].source_app, "claude-desktop");
     let summary = usage::summary(365);
     assert_eq!(summary.total_requests, 1);
     assert_eq!(summary.today_tokens, 15);
@@ -669,6 +671,7 @@ fn sqlite_persistence_round_trips() {
             date: date.clone(),
             model_name: "Temp".into(),
             served_by: "Temp".into(),
+            source_app: "claude-desktop".into(),
             inbound_protocol: "anthropic-messages".into(),
             upstream_protocol: "openai-responses".into(),
             input_tokens: 3,
@@ -702,6 +705,7 @@ fn sqlite_persistence_round_trips() {
             date: "2001-01-01".into(),
             model_name: "Temp".into(),
             served_by: "Temp".into(),
+            source_app: "claude-desktop".into(),
             inbound_protocol: "anthropic-messages".into(),
             upstream_protocol: "openai-responses".into(),
             input_tokens: 1,
@@ -731,6 +735,7 @@ fn sqlite_persistence_round_trips() {
             date: date.clone(),
             model_name: "Temp".into(),
             served_by: "Temp".into(),
+            source_app: "claude-desktop".into(),
             inbound_protocol: "anthropic-messages".into(),
             upstream_protocol: "openai-responses".into(),
             input_tokens: 1,
@@ -764,6 +769,7 @@ fn sqlite_persistence_round_trips() {
                 date: date.clone(),
                 model_name: "Temp".into(),
                 served_by: "Temp".into(),
+                source_app: "claude-desktop".into(),
                 inbound_protocol: "anthropic-messages".into(),
                 upstream_protocol: "openai-responses".into(),
                 input_tokens: 1,

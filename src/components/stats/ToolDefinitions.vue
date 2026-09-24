@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { ref } from "vue";
-import { Wrench } from "lucide";
+import { computed, ref, watch } from "vue";
+import { Languages, Wrench } from "lucide";
 
 import MorphIconBox from "@/components/common/MorphIconBox.vue";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
+import { useTranslate } from "@/composables/useTranslate";
 import type { ToolDefinition } from "@/lib/payload";
 
 defineProps<{ tools: ToolDefinition[] }>();
@@ -14,6 +16,17 @@ defineProps<{ tools: ToolDefinition[] }>();
 const openIndex = ref(-1);
 const wasOpen = ref(false);
 
+// 弹层同一时刻只开一个，翻译状态随之重置，避免串到下一个工具。
+const { translated, translating, showing, error, toggle, reset } = useTranslate();
+
+watch(openIndex, reset);
+
+const translateLabel = computed(() => {
+  if (translating.value) return "翻译中…";
+  if (!translated.value) return "翻译";
+  return showing.value ? "原文" : "译文";
+});
+
 function rememberOpen(index: number): void {
   wasOpen.value = openIndex.value === index;
 }
@@ -22,7 +35,7 @@ function toggleFromClick(index: number): void {
   openIndex.value = wasOpen.value ? -1 : index;
 }
 
-function toggle(index: number): void {
+function toggleOpen(index: number): void {
   openIndex.value = openIndex.value === index ? -1 : index;
 }
 
@@ -46,7 +59,7 @@ function close(): void {
           tabindex="0"
           @pointerdown="rememberOpen(index)"
           @click="toggleFromClick(index)"
-          @keydown.enter="toggle(index)"
+          @keydown.enter="toggleOpen(index)"
         >
           <MorphIconBox :icon="Wrench" :size="11" />
           <span class="font-mono">{{ tool.name }}</span>
@@ -62,10 +75,30 @@ function close(): void {
         <div class="flex items-center gap-1.5 font-mono font-medium">
           <MorphIconBox :icon="Wrench" :size="12" />
           {{ tool.name }}
+          <Button
+            v-if="tool.description.trim()"
+            variant="ghost"
+            size="xs"
+            class="ml-auto gap-1 px-1.5 font-sans text-[11px] text-muted-foreground"
+            :disabled="translating"
+            @click="toggle(tool.description)"
+          >
+            <MorphIconBox :icon="Languages" :size="12" />
+            {{ translateLabel }}
+          </Button>
         </div>
-        <p class="leading-relaxed break-words whitespace-pre-wrap text-muted-foreground">
+
+        <p
+          v-if="showing && translated"
+          class="leading-relaxed break-words whitespace-pre-wrap text-muted-foreground"
+        >
+          {{ translated }}
+        </p>
+        <p v-else class="leading-relaxed break-words whitespace-pre-wrap text-muted-foreground">
           {{ tool.description || "该工具没有提供说明。" }}
         </p>
+
+        <p v-if="error" class="text-[11px] text-destructive">{{ error }}</p>
       </HoverCardContent>
     </HoverCard>
   </div>

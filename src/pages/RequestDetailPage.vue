@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { ArrowLeft, FileQuestion } from "lucide";
+import { ArrowLeft, ArrowRight, FileQuestion } from "lucide";
 
 import EmptyState from "@/components/common/EmptyState.vue";
 import MorphIconBox from "@/components/common/MorphIconBox.vue";
+import CollapsibleCard from "@/components/stats/CollapsibleCard.vue";
 import MessageList from "@/components/stats/MessageList.vue";
+import PayloadCard from "@/components/stats/PayloadCard.vue";
 import RawPayload from "@/components/stats/RawPayload.vue";
 import ToolDefinitions from "@/components/stats/ToolDefinitions.vue";
 import { Badge } from "@/components/ui/badge";
@@ -18,7 +20,16 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { formatDateTime, formatLatency, formatNumber, protocolLabel } from "@/lib/format";
+import {
+  cacheHitRate,
+  formatDateTime,
+  formatLatency,
+  formatNumber,
+  formatPercent,
+  protocolLabel,
+  sourceAppIcon,
+  sourceAppLabel,
+} from "@/lib/format";
 import { usageApi } from "@/lib/ipc";
 import { parseRequest, parseResponse } from "@/lib/payload";
 import type { RequestDetail } from "@/lib/types";
@@ -32,6 +43,7 @@ const error = ref<string | null>(null);
 
 const record = computed(() => detail.value?.record ?? null);
 const payload = computed(() => detail.value?.payload ?? null);
+const sourceIcon = computed(() => (record.value ? sourceAppIcon(record.value.sourceApp) : null));
 
 const requestView = computed(() =>
   parseRequest(payload.value?.inboundRequest ?? null, record.value?.inboundProtocol ?? ""),
@@ -39,6 +51,32 @@ const requestView = computed(() =>
 const responseView = computed(() =>
   parseResponse(payload.value?.upstreamResponse ?? null, record.value?.upstreamProtocol ?? ""),
 );
+
+const systemLabelClass =
+  "border-transparent bg-amber-500/15 text-amber-600 dark:text-amber-400";
+
+/** null 表示上游未回报该字段，界面显「—」而不是 0。 */
+function tokenText(value: number | null): string {
+  return value === null ? "—" : formatNumber(value);
+}
+
+const tokenStats = computed(() => {
+  const value = record.value;
+  if (!value) return [];
+  const cacheRead = value.cacheReadTokens ?? 0;
+  return [
+    { label: "输入", value: formatNumber(value.inputTokens), tone: "" },
+    { label: "输出", value: formatNumber(value.outputTokens), tone: "" },
+    { label: "缓存读", value: tokenText(value.cacheReadTokens), tone: "" },
+    { label: "缓存写", value: tokenText(value.cacheWriteTokens), tone: "" },
+    {
+      label: "缓存命中",
+      value: formatPercent(cacheHitRate(value)),
+      tone: cacheRead > 0 ? "text-emerald-600 dark:text-emerald-400" : "",
+    },
+    { label: "合计", value: formatNumber(value.inputTokens + value.outputTokens), tone: "" },
+  ];
+});
 
 async function load(): Promise<void> {
   loading.value = true;
@@ -85,7 +123,7 @@ function goBack(): void {
       />
 
       <template v-else>
-        <Card>
+        <Card class="gap-4">
           <CardHeader>
             <div class="flex items-start justify-between gap-3">
               <div class="space-y-1">
@@ -109,18 +147,43 @@ function goBack(): void {
               </div>
             </div>
           </CardHeader>
-          <CardContent class="flex flex-wrap gap-x-5 gap-y-1.5 text-xs text-muted-foreground">
-            <span>
-              入站 {{ protocolLabel(record.inboundProtocol) }} → 上游
-              {{ protocolLabel(record.upstreamProtocol) }}
-            </span>
-            <span>输入 {{ formatNumber(record.inputTokens) }}</span>
-            <span>输出 {{ formatNumber(record.outputTokens) }}</span>
-            <span>合计 {{ formatNumber(record.inputTokens + record.outputTokens) }}</span>
-            <span>耗时 {{ formatLatency(record.durationMs) }}</span>
-          </CardContent>
-          <CardContent v-if="record.error" class="pt-0">
+
+          <CardContent class="space-y-4">
+            <div class="flex flex-wrap items-center gap-x-6 gap-y-2 text-xs">
+              <span class="inline-flex items-center gap-1.5">
+                <span class="text-muted-foreground">来源</span>
+                <img v-if="sourceIcon" :src="sourceIcon" alt="" class="size-4 shrink-0 object-contain" />
+                <span class="font-medium">{{ sourceAppLabel(record.sourceApp) }}</span>
+              </span>
+              <span class="inline-flex items-center gap-1.5">
+                <span class="text-muted-foreground">协议</span>
+                <span class="inline-flex items-center gap-1 font-medium">
+                  {{ protocolLabel(record.inboundProtocol) }}
+                  <MorphIconBox :icon="ArrowRight" :size="12" class="text-muted-foreground" />
+                  {{ protocolLabel(record.upstreamProtocol) }}
+                </span>
+              </span>
+              <span class="inline-flex items-center gap-1.5">
+                <span class="text-muted-foreground">耗时</span>
+                <span class="font-mono font-medium tabular-nums">
+                  {{ formatLatency(record.durationMs) }}
+                </span>
+              </span>
+            </div>
+
+            <dl
+              class="grid grid-cols-3 gap-px overflow-hidden rounded-lg border bg-border sm:grid-cols-6"
+            >
+              <div v-for="stat in tokenStats" :key="stat.label" class="bg-card px-3 py-2">
+                <dt class="text-[11px] text-muted-foreground">{{ stat.label }}</dt>
+                <dd class="mt-0.5 font-mono text-sm font-medium tabular-nums" :class="stat.tone">
+                  {{ stat.value }}
+                </dd>
+              </div>
+            </dl>
+
             <div
+              v-if="record.error"
               class="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive"
             >
               {{ record.error }}
@@ -133,88 +196,66 @@ function goBack(): void {
         </div>
 
         <template v-else>
-          <Card v-if="requestView?.tools.length">
-            <CardHeader>
-              <CardTitle class="text-base">工具定义</CardTitle>
-              <CardDescription class="text-xs">
-                本次请求向模型声明的工具，点击查看说明。
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <ToolDefinitions :tools="requestView.tools" />
-            </CardContent>
-          </Card>
+          <CollapsibleCard
+            v-if="requestView?.tools.length"
+            title="工具定义"
+            description="本次请求向模型声明的工具，点击查看说明。"
+          >
+            <ToolDefinitions :tools="requestView.tools" />
+          </CollapsibleCard>
 
-          <Card>
-            <CardHeader>
-              <div class="flex items-center justify-between gap-3">
-                <div class="space-y-1">
-                  <CardTitle class="text-base">入站请求</CardTitle>
-                  <CardDescription class="text-xs">客户端发来的原始请求</CardDescription>
-                </div>
-                <Badge v-if="payload.requestTruncated" variant="outline">已截断</Badge>
-              </div>
-            </CardHeader>
-            <CardContent class="space-y-3">
-              <template v-if="requestView">
-                <div v-if="requestView.system" class="rounded-lg border bg-card">
-                  <div class="border-b px-3 py-1.5">
-                    <Badge
-                      variant="outline"
-                      class="border-transparent bg-amber-500/15 text-[10px] text-amber-600 dark:text-amber-400"
-                    >
-                      system
-                    </Badge>
-                  </div>
-                  <pre
-                    class="px-3 py-2.5 text-xs leading-relaxed break-words whitespace-pre-wrap"
-                    >{{ requestView.system }}</pre
-                  >
-                </div>
-                <MessageList v-if="requestView.messages.length" :messages="requestView.messages" />
-              </template>
-              <RawPayload
-                v-else
-                :raw="payload.inboundRequest"
-                label="原始请求（无法解析）"
-                :truncated="payload.requestTruncated"
-              />
-            </CardContent>
-          </Card>
+          <CollapsibleCard title="入站请求" description="客户端发来的原始请求">
+            <template #action>
+              <Badge v-if="payload.requestTruncated" variant="outline">已截断</Badge>
+            </template>
 
-          <Card>
-            <CardHeader>
-              <div class="flex items-center justify-between gap-3">
-                <div class="space-y-1">
-                  <CardTitle class="text-base">上游响应</CardTitle>
-                  <CardDescription class="text-xs">
-                    {{ payload.stream ? "流式（已按事件拼装）" : "非流式" }} · 上游原生返回
-                  </CardDescription>
-                </div>
-                <Badge v-if="payload.responseTruncated" variant="outline">已截断</Badge>
+            <template v-if="requestView">
+              <PayloadCard
+                v-if="requestView.system"
+                label="system"
+                :label-class="systemLabelClass"
+                :text="requestView.system"
+              >
+                <pre
+                  class="text-xs leading-relaxed break-words whitespace-pre-wrap"
+                  >{{ requestView.system }}</pre
+                >
+              </PayloadCard>
+              <MessageList v-if="requestView.messages.length" :messages="requestView.messages" />
+            </template>
+            <RawPayload
+              v-else
+              :raw="payload.inboundRequest"
+              label="原始请求（无法解析）"
+              :truncated="payload.requestTruncated"
+            />
+          </CollapsibleCard>
+
+          <CollapsibleCard
+            title="上游响应"
+            :description="`${payload.stream ? '流式（已按事件拼装）' : '非流式'} · 上游原生返回`"
+          >
+            <template #action>
+              <Badge v-if="payload.responseTruncated" variant="outline">已截断</Badge>
+            </template>
+
+            <template v-if="responseView">
+              <MessageList :messages="responseView.messages" />
+              <div class="flex flex-wrap gap-x-5 gap-y-1 text-xs text-muted-foreground">
+                <span v-if="responseView.stopReason">停止原因 {{ responseView.stopReason }}</span>
+                <span v-if="responseView.usage">
+                  Token 输入 {{ formatNumber(responseView.usage.input) }} · 输出
+                  {{ formatNumber(responseView.usage.output) }}
+                </span>
               </div>
-            </CardHeader>
-            <CardContent class="space-y-3">
-              <template v-if="responseView">
-                <MessageList :messages="responseView.messages" />
-                <div class="flex flex-wrap gap-x-5 gap-y-1 text-xs text-muted-foreground">
-                  <span v-if="responseView.stopReason">
-                    停止原因 {{ responseView.stopReason }}
-                  </span>
-                  <span v-if="responseView.usage">
-                    Token 输入 {{ formatNumber(responseView.usage.input) }} · 输出
-                    {{ formatNumber(responseView.usage.output) }}
-                  </span>
-                </div>
-              </template>
-              <RawPayload
-                v-else
-                :raw="payload.upstreamResponse"
-                label="原始响应（无法解析）"
-                :truncated="payload.responseTruncated"
-              />
-            </CardContent>
-          </Card>
+            </template>
+            <RawPayload
+              v-else
+              :raw="payload.upstreamResponse"
+              label="原始响应（无法解析）"
+              :truncated="payload.responseTruncated"
+            />
+          </CollapsibleCard>
 
           <Card>
             <CardHeader>

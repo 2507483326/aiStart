@@ -1,10 +1,11 @@
 -- =====================================================================
--- AI Start SQLite schema v3（db_schema_version = 3）
+-- AI Start SQLite schema v4（db_schema_version = 4）
 -- v1 首次落库：app_settings / models / app_model_bindings（配置与模型，取代 settings.json）、
 -- usage_detail / usage_daily_total（token 消耗，取代 usage.jsonl）、events（审计事件）、
 -- app_version_records（应用版本检查与更新记录）。
 -- v2 新增：usage_payload（单次调用的请求/响应报文，供「请求明细抽屉」查看）。
 -- v3 新增：request_filters（请求转发前按规则改写请求的过滤器）。
+-- v4 新增：usage_detail.source_app（请求来源应用 / 原样 token）、app_model_bindings.token（应用专属网关 Key）。
 --
 -- 规范（对齐 eTeam：C:\eTeam\src\host\state\schema.sql）：
 --   主键 = 每张表自己的编号列，统一 INTEGER 自增（仅 schema_meta / app_settings 以 key 为主键，
@@ -50,6 +51,7 @@ CREATE TABLE IF NOT EXISTS usage_detail (
   ok                INTEGER NOT NULL DEFAULT 1,   -- 1=成功 / 0=失败
   failover          INTEGER NOT NULL DEFAULT 0,   -- 1=由自动切换接手 / 0=否
   error             TEXT,                   -- 失败原因；成功为 NULL
+  source_app        TEXT NOT NULL DEFAULT '',  -- 来源应用：按请求 token 匹配到的 app_kind；未匹配则原样存该 token；''=历史数据/未记录
   created_time      INTEGER NOT NULL,       -- 入库时刻
   update_time       INTEGER NOT NULL        -- 明细行只插不改，= created_time
 );
@@ -57,6 +59,7 @@ CREATE TABLE IF NOT EXISTS usage_detail (
 CREATE INDEX IF NOT EXISTS idx_usage_detail_day    ON usage_detail (day);
 CREATE INDEX IF NOT EXISTS idx_usage_detail_time   ON usage_detail (event_time DESC);
 CREATE INDEX IF NOT EXISTS idx_usage_detail_served ON usage_detail (served_by, day);
+CREATE INDEX IF NOT EXISTS idx_usage_detail_source ON usage_detail (source_app);
 CREATE INDEX IF NOT EXISTS idx_usage_detail_failed ON usage_detail (day, ok) WHERE ok = 0;
 
 -- ---------------------------------------------------------------------
@@ -158,6 +161,7 @@ CREATE TABLE IF NOT EXISTS app_model_bindings (
   app_model_binding_id INTEGER PRIMARY KEY AUTOINCREMENT,  -- 自增主键
   app_kind       TEXT NOT NULL,                -- 应用：claude-desktop / deepseek-desktop（一行一应用）
   model_id       INTEGER NOT NULL,             -- 接入的模型号（models.model_id，松引用，不建外键）
+  token          TEXT NOT NULL DEFAULT '',     -- 该应用接入时使用的网关 Key（固定可读、不加前缀，= app_kind；网关据此匹配请求来源）
   created_time   INTEGER NOT NULL,             -- 创建时间
   update_time    INTEGER NOT NULL              -- 更新时间
 );

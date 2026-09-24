@@ -25,15 +25,38 @@ struct DownloadProgress {
     percent: Option<f64>,
 }
 
+/// 用「当前检测到的已安装版本」重新判定是否有新版本：库里存下的 update_available
+/// 可能已经过期（用户升级过应用），不能直接信任；只有在最新版本或已安装版本读不到、
+/// 无从比较时，才退回库里存下的标记。
+fn resolve_update(
+    latest_version: Option<String>,
+    installed: Option<&str>,
+    stored: bool,
+) -> (Option<String>, bool) {
+    match (latest_version.as_deref(), installed) {
+        (Some(latest), Some(installed)) => (
+            Some(latest.to_string()),
+            updates::is_newer(latest, installed),
+        ),
+        _ => (latest_version, stored),
+    }
+}
+
 fn build_app_view(
     kind: AppKind,
     applied: Option<&crate::domain::model::ModelConfig>,
     known: Option<&updates::CheckSnapshot>,
+    api_key: String,
 ) -> ToolApp {
     let configurator = platform::configurator_for(kind);
     let descriptor = configurator.descriptor();
     let detect = configurator.detect().unwrap_or_else(|_| DetectResult::missing());
     let applied = applied.filter(|_| configurator.is_configured().unwrap_or(false));
+    let (latest_version, update_available) = resolve_update(
+        known.and_then(|snapshot| snapshot.latest_version.clone()),
+        detect.version.as_deref(),
+        known.map(|snapshot| snapshot.update_available).unwrap_or(false),
+    );
 
     ToolApp {
         kind,
@@ -45,11 +68,12 @@ fn build_app_view(
         requires_gateway: descriptor.requires_gateway,
         apply_mode: descriptor.apply_mode,
         config_target: descriptor.config_target,
+        api_key,
         installed: detect.installed,
         version: detect.version,
         install_location: detect.location,
-        latest_version: known.and_then(|snapshot| snapshot.latest_version.clone()),
-        update_available: known.map(|snapshot| snapshot.update_available).unwrap_or(false),
+        latest_version,
+        update_available,
         applied_model_id: applied.map(|model| model.id),
         applied_model_name: applied.map(|model| model.name.clone()),
     }
@@ -61,7 +85,18 @@ pub fn list_apps() -> AppResult<Vec<ToolApp>> {
     let known = updates::latest_checks();
     Ok(AppKind::ALL
         .iter()
-        .map(|kind| build_app_view(*kind, settings.applied_model(*kind), known.get(kind)))
+        .map(|kind| {
+            let api_key = settings
+                .app_token(*kind)
+                .unwrap_or_else(|| kind.gateway_token())
+                .to_string();
+            build_app_view(
+                *kind,
+                settings.applied_model(*kind),
+                known.get(kind),
+                api_key,
+            )
+        })
         .collect())
 }
 
@@ -73,6 +108,7 @@ pub async fn check_app_updates() -> AppResult<Vec<AppUpdate>> {
             .map(|kind| updates::latest_version(*kind)),
     )
     .await;
+    let known = updates::latest_checks();
 
     Ok(AppKind::ALL
         .iter()
@@ -84,29 +120,46 @@ pub async fn check_app_updates() -> AppResult<Vec<AppUpdate>> {
                 .filter(|detect| detect.installed)
                 .and_then(|detect| detect.version);
             let latest_version = found.as_ref().map(|found| found.version.clone());
-            let update_available = match (&latest_version, &installed) {
-                (Some(latest), Some(installed)) => updates::is_newer(latest, installed),
-                _ => false,
-            };
-            let status = match (&latest_version, update_available) {
-                (None, _) => "unreachable",
-                (Some(_), true) => "found",
-                (Some(_), false) => "up-to-date",
-            };
-            updates::record_check(
-                *kind,
-                installed.as_deref(),
-                latest_version.as_deref(),
-                found.as_ref().map(|found| found.source_url.as_str()),
-                update_available,
-                status,
-                None,
-            );
 
-            AppUpdate {
-                kind: *kind,
-                latest_version,
-                update_available,
+            // 只有同时拿到「官方最新版本」和「已安装版本」才算一次有效检查：
+            // 此时才比较并落库。查不到（离线 / 超时 / 版本号读不出）时既不落库也不清零，
+            // 直接沿用上一次已知结果，避免把「有新版本」误抹成「已是最新」。
+            match (latest_version.as_deref(), installed.as_deref()) {
+                (Some(latest), Some(installed)) => {
+                    let update_available = updates::is_newer(latest, installed);
+                    updates::record_check(
+                        *kind,
+                        Some(installed),
+                        Some(latest),
+                        found.as_ref().map(|found| found.source_url.as_str()),
+                        update_available,
+                        if update_available { "found" } else { "up-to-date" },
+                        None,
+                    );
+                    AppUpdate {
+                        kind: *kind,
+                        latest_version: Some(latest.to_string()),
+                        update_available,
+                    }
+                }
+                _ => {
+                    // 本次没能确认（离线 / 超时 / 版本号读不出）：不落库、不清零。
+                    // 但仍要用「已知最新版本 vs 当前已安装版本」重算，避免把库里过期的
+                    // update_available=1 原样透出（例如应用已升级、新旧版本号已一致）。
+                    let previous = known.get(kind);
+                    let latest_version = latest_version
+                        .or_else(|| previous.and_then(|snapshot| snapshot.latest_version.clone()));
+                    let (latest_version, update_available) = resolve_update(
+                        latest_version,
+                        installed.as_deref(),
+                        previous.map(|snapshot| snapshot.update_available).unwrap_or(false),
+                    );
+                    AppUpdate {
+                        kind: *kind,
+                        latest_version,
+                        update_available,
+                    }
+                }
             }
         })
         .collect())
@@ -128,11 +181,15 @@ pub fn apply_model(kind: AppKind, model_id: Option<i64>) -> AppResult<ApplyRepor
         gateway::ensure_running()?;
     }
     let status = gateway::status();
+    let token = settings
+        .app_token(kind)
+        .map(str::to_string)
+        .unwrap_or_else(|| kind.gateway_token().to_string());
 
     let context = ApplyContext {
         model: model.clone(),
         gateway_base_url: status.base_url.clone(),
-        gateway_token: status.token.clone(),
+        gateway_token: token.clone(),
         model_choices: gateway::MODEL_ROLES
             .iter()
             .map(|role| ModelChoice {
@@ -146,6 +203,9 @@ pub fn apply_model(kind: AppKind, model_id: Option<i64>) -> AppResult<ApplyRepor
 
     settings::mutate(|settings| {
         settings.applied.insert(kind.as_str().to_string(), model.id);
+        settings
+            .app_tokens
+            .insert(kind.as_str().to_string(), token.clone());
     })?;
 
     events::log(
@@ -166,6 +226,7 @@ pub fn clear_app_model(kind: AppKind) -> AppResult<()> {
     configurator.clear()?;
     settings::mutate(|settings| {
         settings.applied.remove(kind.as_str());
+        settings.app_tokens.remove(kind.as_str());
     })?;
     events::log(
         "user",

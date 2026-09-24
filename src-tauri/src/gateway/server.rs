@@ -18,7 +18,7 @@ use crate::error::{AppError, AppResult};
 use crate::providers::{http_client, provider_for, ResponseAssembler, SseEvent, StreamState, WireState};
 
 use super::sse::{encode_channel_event, parse_sse_stream};
-use super::{GatewayStats, GATEWAY_TOKEN, MODEL_ROLES};
+use super::{GatewayStats, MODEL_ROLES};
 
 pub fn router() -> Router {
     Router::new()
@@ -61,6 +61,14 @@ fn extract_token(headers: &HeaderMap) -> Option<String> {
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .map(|value| value.trim_start_matches("Bearer ").trim().to_string())
+}
+
+/// 把请求携带的 token 匹配回来源应用；匹配不到时原样返回该 token（空则返回空串）。
+fn source_app_for(token: &str) -> String {
+    crate::settings::snapshot()
+        .app_for_token(token)
+        .map(|kind| kind.as_str().to_string())
+        .unwrap_or_else(|| token.to_string())
 }
 
 fn encode_event(event: &SseEvent) -> String {
@@ -108,6 +116,7 @@ fn sse_response(
 fn record_usage(
     active_model_name: &str,
     config: &ModelConfig,
+    source_app: &str,
     inbound: ModelFormat,
     input_tokens: u64,
     output_tokens: u64,
@@ -127,6 +136,7 @@ fn record_usage(
             date,
             model_name: active_model_name.to_string(),
             served_by: config.name.clone(),
+            source_app: source_app.to_string(),
             inbound_protocol: inbound.as_str().to_string(),
             upstream_protocol: config.format.as_str().to_string(),
             input_tokens,
@@ -217,8 +227,19 @@ async fn route(
     stats.requests.fetch_add(1, Ordering::Relaxed);
     let started = std::time::Instant::now();
     let inbound_request = String::from_utf8_lossy(&body).into_owned();
+    let token = extract_token(&headers);
 
-    match handle(inbound, stats.clone(), headers, body, started, &inbound_request).await {
+    match handle(
+        inbound,
+        stats.clone(),
+        headers,
+        token.clone(),
+        body,
+        started,
+        &inbound_request,
+    )
+    .await
+    {
         Ok(response) => response,
         Err(error) => {
             stats.record_error(&error.to_string());
@@ -228,6 +249,7 @@ async fn route(
                 .active_model()
                 .map(|model| model.name.clone())
                 .unwrap_or_default();
+            let source_app = source_app_for(token.as_deref().unwrap_or_default());
             let (timestamp, date) = crate::usage::current_timestamp();
             crate::usage::record_with_payload(
                 &crate::usage::UsageRecord {
@@ -236,6 +258,7 @@ async fn route(
                     date,
                     model_name: active_name,
                     served_by: String::new(),
+                    source_app,
                     inbound_protocol: inbound.as_str().to_string(),
                     upstream_protocol: String::new(),
                     input_tokens: 0,
@@ -323,20 +346,23 @@ async fn handle(
     inbound: ModelFormat,
     stats: Arc<GatewayStats>,
     headers: HeaderMap,
+    token: Option<String>,
     body: Bytes,
     started: std::time::Instant,
     inbound_request: &str,
 ) -> AppResult<Response> {
     let settings = crate::settings::snapshot();
 
-    if extract_token(&headers).as_deref() != Some(GATEWAY_TOKEN) {
+    // 只校验 Key 非空；具体来源靠 token 匹配应用（匹配不到则原样记录）。
+    let Some(token) = token.filter(|value| !value.trim().is_empty()) else {
         return Ok(api_error(
             inbound,
             StatusCode::UNAUTHORIZED,
             "authentication_error",
-            &format!("网关 API Key 不匹配，应为 {GATEWAY_TOKEN}"),
+            "缺少网关 API Key",
         ));
-    }
+    };
+    let source_app = source_app_for(&token);
 
     let raw: Value = serde_json::from_slice(&body)
         .map_err(|error| AppError::InvalidConfig(format!("请求体不是合法 JSON: {error}")))?;
@@ -408,6 +434,7 @@ async fn handle(
         record_usage(
             &active_name,
             &config,
+            &source_app,
             inbound,
             input_tokens,
             output_tokens,
@@ -512,6 +539,7 @@ async fn handle(
         record_usage(
             &active_name,
             &config,
+            &source_app,
             inbound,
             upstream_state.input_tokens,
             upstream_state.output_tokens,

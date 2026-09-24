@@ -17,6 +17,12 @@ impl AppKind {
         }
     }
 
+    /// 该应用接入网关时使用的专属 Key：固定可读、不加前缀，直接取 app_kind。
+    /// 网关据此把入站请求匹配回来源应用。
+    pub fn gateway_token(&self) -> &'static str {
+        self.as_str()
+    }
+
     pub fn parse(value: &str) -> Option<AppKind> {
         AppKind::ALL
             .iter()
@@ -70,6 +76,7 @@ pub struct ToolApp {
     pub requires_gateway: bool,
     pub apply_mode: ApplyMode,
     pub config_target: String,
+    pub api_key: String,
     pub installed: bool,
     pub version: Option<String>,
     pub install_location: Option<String>,

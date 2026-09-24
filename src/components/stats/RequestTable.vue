@@ -12,6 +12,8 @@ import {
   formatNumber,
   formatPercent,
   protocolLabel,
+  sourceAppIcon,
+  sourceAppLabel,
 } from "@/lib/format";
 import type { UsageRecord } from "@/lib/types";
 
@@ -47,6 +49,7 @@ function cacheHit(record: UsageRecord): string {
         <tr class="border-b text-left text-muted-foreground">
           <th class="py-2 pr-3 font-medium">时间</th>
           <th class="py-2 pr-3 font-medium">模型</th>
+          <th class="py-2 pr-3 font-medium">来源</th>
           <th class="py-2 pr-3 font-medium">入站</th>
           <th class="py-2 pr-3 font-medium">上游</th>
           <th class="py-2 pr-3 text-right font-medium">输入</th>
@@ -73,6 +76,17 @@ function cacheHit(record: UsageRecord): string {
             <Badge v-if="record.failover" variant="outline" class="ml-1.5 text-[10px]">
               自动切换
             </Badge>
+          </td>
+          <td class="py-2 pr-3 whitespace-nowrap text-muted-foreground">
+            <span class="inline-flex items-center gap-1.5">
+              <img
+                v-if="sourceAppIcon(record.sourceApp)"
+                :src="sourceAppIcon(record.sourceApp)!"
+                alt=""
+                class="size-4 shrink-0 object-contain"
+              />
+              {{ sourceAppLabel(record.sourceApp) }}
+            </span>
           </td>
           <td class="py-2 pr-3 whitespace-nowrap text-muted-foreground">
             {{ protocolLabel(record.inboundProtocol) }}
