@@ -203,16 +203,52 @@ WorkBuddy 的本地自定义模型就落在**用户级**的 `%USERPROFILE%\.work
   写了会把自带模型全部隐藏。
 - 写完后**无需重启**，新建一个对话即可刷新模型选择器。企业管理员若禁用了「个人自定义模型」，该条目会被忽略。
 
+### Codex 的接入方式
+
+Codex 桌面版与 Codex CLI 共用 Codex home（`CODEX_HOME` 优先，默认 `%USERPROFILE%\.codex`），
+自定义 provider 就写在这里的 `config.toml`。写入形状参考 CC Switch：
+
+```toml
+model_provider = "aistart"
+model = "aiStart"
+
+[model_providers.aistart]
+name = "aiStart"
+base_url = "http://127.0.0.1:<port>/v1"
+wire_api = "responses"
+experimental_bearer_token = "<该应用专属的网关 Key>"
+```
+
+- **顶层 `model_provider` 必须声明**：缺了它，Codex 会回落到内置 `openai` provider，
+  顶层的 base_url 被整个忽略，请求直连 api.openai.com。
+- **模型目录是必需的一环**：Codex 的模型列表（GUI 选择器与 `/model`）完全由
+  `model_catalog_json` 指向的目录决定，**不在目录里的 slug 会被忽略，顶层 `model` 还会被
+  桌面版回落成目录里的某个模型**（实测：只写 provider 时，应用后 46 秒 `model` 就从
+  `aiStart` 被改回了别的）。所以应用时会把 `aiStart` 作为一条目录条目并进当前那份目录里。
+  条目字段很多（含大段提示词），凭空造会被判非法，因此实现是**克隆目录里已有的条目**
+  再改 slug / 显示名 / 上下文窗口（CC Switch 也是靠它自己的那份目录做到模型可见的）。
+  勾选「支持 1M 上下文」时会把条目的 `context_window` / `max_context_window` 提到 1M。
+- **不写 `auth.json`**：那里存的是官方 ChatGPT / Codex 登录缓存，桌面版靠它识别官方账号
+  （远程控制、官方插件）。凭据放在 provider 表的 `experimental_bearer_token` 里，
+  与 CC Switch「切换第三方供应商时保留官方登录」的做法一致。
+- 只合并 aiStart 自己的 provider、目录条目与顶层 `model_provider` / `model`；文件里其余的
+  provider、模型条目、注释与未知字段原样保留，「移除模型配置」也只删这一部分。
+- **不要和 CC Switch 同时接管**：两者都写这同一份 `config.toml`（本机上 CC Switch 还会在
+  `[model_providers.custom]` 里放 `PROXY_MANAGED` 占着 15721 端口），谁后写谁生效。
+  用本应用接入前先关掉 CC Switch 的接管，免得互相覆盖。
+- 已知边界：Codex 桌面版的模型选择器还会按官方登录态做门控，未登录官方账号时自定义模型
+  可能不出现在 GUI 里（上游标记为 not planned，CC Switch 同样修不了）；命令行 `codex` 的
+  `/model` 菜单与请求路由不受此限制。目录里若没有可克隆的条目（例如从未配过自定义模型），
+  应用只写 provider 而不动目录，并在结果里说明。
+
 ### 「手动应用」的客户端
 
-Codex（OpenAI 的 ChatGPT 桌面版）、ZCode（智谱 GLM 官方 ADE）只能在各自 GUI 里手动添加
-「自定义 / OpenAI 兼容」供应商，官方未公开配置文件格式，因此这两个走 `ApplyMode::Manual`：
-`ManualConfigurator` **不写任何第三方文件**，点「应用」只记录绑定并弹出
-「对接说明」（接口地址 / API Key / 模型名称 / 协议格式 + 调用示例，逐项可复制），由用户照着填写。
+ZCode（智谱 GLM 官方 ADE）只能在 GUI 里手动添加「自定义 / OpenAI 兼容」供应商，官方未公开
+配置文件格式，因此走 `ApplyMode::Manual`：`ManualConfigurator` **不写任何第三方文件**，
+点「应用」只记录绑定并弹出「对接说明」（接口地址 / API Key / 模型名称 / 协议格式 + 调用示例，
+逐项可复制），由用户照着填写。
 
-- Codex 与 Codex CLI 共用 Codex home（`%USERPROFILE%\.codex`），协议为 **Responses**（`wire_api = "responses"`），
-  待实测确认桌面版读取该文件后再评估是否升级为 `DirectConfig`。
-- 两者的安装/更新目前只配了 `Manual` 兜底（打开官方下载页）；`upgrade` 里的探测锚点（进程名、注册表
+- 安装/更新目前只配了 `Manual` 兜底（打开官方下载页）；`upgrade` 里的探测锚点（进程名、注册表
   `DisplayName`、安装位置）标为「待实测」，装上后按实际值回填，届时再接自动下载/静默安装。
 
 ---

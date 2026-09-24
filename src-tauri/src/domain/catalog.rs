@@ -120,15 +120,17 @@ pub fn builtin_apps() -> Vec<AppDescriptor> {
             kind: AppKind::Codex,
             name: "Codex".into(),
             publisher: "OpenAI".into(),
-            description: "OpenAI Codex 桌面版（即 ChatGPT 桌面版）。在应用内添加自定义模型供应商，把推理指向本地网关的 Responses 入口。"
+            description: "OpenAI Codex 桌面版（即 ChatGPT 桌面版）。把自定义 provider 合并进 Codex home 的 config.toml，推理走本地网关的 Responses 入口。"
                 .into(),
             homepage: "https://chatgpt.com/codex".into(),
             download_page: "https://chatgpt.com/download/".into(),
             requires_gateway: true,
-            apply_mode: ApplyMode::Manual,
-            // 桌面版与 Codex CLI 共用 Codex home（`CODEX_HOME`），自定义 provider 就写在这里的
-            // `[model_providers.*]`（`wire_api` 目前只支持 `responses`）。本期**不写入**，只作为
-            // 「手动接入」的目标告知用户；待装后实测桌面版是否读取该文件，再决定是否升级为 DirectConfig。
+            apply_mode: ApplyMode::DirectConfig,
+            // 桌面版与 Codex CLI 共用 Codex home：`CODEX_HOME` 优先，默认 `%USERPROFILE%\.codex`。
+            // 写入形状与 CC Switch 一致 —— 顶层 `model_provider` 指向 `[model_providers.aistart]`，
+            // 表内 `base_url` + `wire_api = "responses"`，凭据放 provider 级的
+            // `experimental_bearer_token`，`auth.json`（官方登录缓存）刻意不碰。
+            // 见 `platform/codex.rs`。
             config_target: r"%USERPROFILE%\.codex\config.toml".into(),
             // 桌面版经 Microsoft Store（MSIX）分发，没有可解析的公开「最新版本」源；
             // 留空即不做版本探测，卡片只显示已安装版本。

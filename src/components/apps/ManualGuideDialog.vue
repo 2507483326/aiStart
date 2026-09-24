@@ -43,12 +43,9 @@ watch(
   () => props.open,
   (open) => {
     if (!open) return;
-    const preferred =
-      props.app.kind === "codex"
-        ? "/v1/responses"
-        : "/v1/chat/completions";
     selectedEndpoint.value =
-      endpoints.find((endpoint) => endpoint.path === preferred) ?? endpoints[0];
+      endpoints.find((endpoint) => endpoint.path === "/v1/chat/completions") ??
+      endpoints[0];
   },
 );
 
@@ -56,8 +53,6 @@ const endpointUrl = computed(() => `${baseUrl.value}${selectedEndpoint.value.pat
 
 const protocolHint = computed(() => {
   switch (props.app.kind) {
-    case "codex":
-      return "Responses（wire_api = \"responses\"）";
     case "workbuddy":
       return "OpenAI 兼容（Chat Completions）";
     case "zcode":
