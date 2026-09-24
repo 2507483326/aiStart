@@ -29,14 +29,14 @@ const { info } = useSettings();
 
 const gatewayLabel = computed(() => gatewayStateLabels[gateway.phase.value]);
 const gatewayVariant = computed(() =>
-  gateway.running.value ? "default" : gateway.transitioning.value ? "secondary" : "outline",
+  gateway.running.value ? "default" : gateway.transitioning.value ? "secondary" : "destructive",
 );
 const gatewayTone = computed(() =>
   gateway.running.value
     ? "text-emerald-500"
     : gateway.transitioning.value
       ? "text-amber-500"
-      : "text-muted-foreground",
+      : "text-destructive",
 );
 
 const title = computed(() => (route.meta.title as string) ?? "AI Start");
@@ -63,11 +63,7 @@ const activeIcon = computed(
       class="flex w-60 shrink-0 flex-col border-r bg-sidebar bg-gradient-to-b from-sidebar to-sidebar/90"
     >
       <div class="flex items-center gap-2.5 px-5 py-4">
-        <div
-          class="flex size-8 items-center justify-center rounded-lg bg-primary text-primary-foreground"
-        >
-          <MorphIconBox :icon="Sparkles" :size="17" />
-        </div>
+        <img src="/app-icon.svg" alt="" class="size-9 shrink-0" draggable="false" />
         <div class="leading-tight">
           <p class="text-sm font-semibold">{{ info?.name ?? "AI Start" }}</p>
           <p class="text-[11px] text-muted-foreground">

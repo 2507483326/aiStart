@@ -137,7 +137,7 @@ onMounted(async () => {
           </div>
           <EmptyState
             v-else
-            icon="M12 3v18 M3 12h18"
+            :icon="BrainCircuit"
             title="还没有模型"
             description="添加模型后即可启用网关并把推理能力接入桌面客户端。"
           />

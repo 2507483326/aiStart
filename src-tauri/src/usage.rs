@@ -39,8 +39,13 @@ pub struct UsageRecord {
 }
 
 impl UsageRecord {
+    /// 真实消耗 token（口径对齐 cc-switch「真实消耗」）：输入 + 输出 + 缓存读 + 缓存写。
+    /// 输入 / 输出各自不含缓存，只有总量把它们合并。
     pub fn total_tokens(&self) -> u64 {
-        self.input_tokens + self.output_tokens
+        self.input_tokens
+            + self.output_tokens
+            + self.cache_read_tokens.unwrap_or(0)
+            + self.cache_write_tokens.unwrap_or(0)
     }
 }
 
@@ -155,8 +160,6 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRecord> {
 
 /// 单条报文保存上限：流式大响应可能极大，超过即截断并置 truncated 标记，避免撑爆本地库。
 const PAYLOAD_MAX_BYTES: usize = 256 * 1024;
-/// 报文保留条数上限：只留最近这么多条（配套前端「最新 N 条」展示），插入时清理更早的。
-const PAYLOAD_RETENTION: usize = 1000;
 
 /// 按 UTF-8 字节截断文本（不切坏多字节字符），返回 (截断后文本, 是否发生截断)。
 fn cap_bytes(text: &str, limit: usize) -> (String, bool) {
@@ -170,7 +173,7 @@ fn cap_bytes(text: &str, limit: usize) -> (String, bool) {
     (text[..end].to_string(), true)
 }
 
-/// 明细 INSERT + 每日总和增量 upsert +（可选）报文 INSERT + 报文保留清理，单事务。
+/// 明细 INSERT + 每日总和增量 upsert +（可选）报文 INSERT，单事务。
 /// 写入失败只丢弃记录，不影响调用方。
 pub fn record_with_payload(entry: &UsageRecord, payload: Option<&UsagePayload>) {
     let event_time = db::ms_from_iso(&entry.timestamp).unwrap_or_else(db::now_ms);
@@ -254,12 +257,6 @@ pub fn record_with_payload(entry: &UsageRecord, payload: Option<&UsagePayload>) 
                 i64::from(payload.stream),
                 event_time,
             ],
-        )?;
-
-        transaction.execute(
-            "DELETE FROM usage_payload WHERE usage_payload_id NOT IN (\
-             SELECT usage_payload_id FROM usage_payload ORDER BY usage_payload_id DESC LIMIT ?1)",
-            params![PAYLOAD_RETENTION as i64],
         )?;
 
         Ok(())
@@ -452,7 +449,10 @@ pub fn summary(days: u32) -> UsageSummary {
         model.output_tokens += entry.output_tokens;
     }
 
-    summary.total_tokens = summary.input_tokens + summary.output_tokens;
+    summary.total_tokens = summary.input_tokens
+        + summary.output_tokens
+        + summary.cache_read_tokens
+        + summary.cache_write_tokens;
     summary.daily = daily.into_values().collect();
     summary.by_model = by_model.into_values().collect();
     summary.by_model.sort_by(|a, b| b.requests.cmp(&a.requests));

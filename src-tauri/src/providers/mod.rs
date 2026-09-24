@@ -44,6 +44,8 @@ impl SseEvent {
 pub struct WireState {
     pub started: bool,
     pub done_sent: bool,
+    /// 入站客户端是否要求流式 usage（OpenAI `stream_options.include_usage`），只有 OpenAI completions 出站用。
+    pub include_usage: bool,
     pub model: String,
     pub response_id: String,
     pub input_tokens: u64,

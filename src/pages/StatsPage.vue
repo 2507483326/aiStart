@@ -13,7 +13,6 @@ import {
   Card,
   CardAction,
   CardContent,
-  CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
@@ -95,9 +94,6 @@ function openAll(): void {
         <div class="flex items-start justify-between gap-3">
           <div class="space-y-1">
             <CardTitle>Token 贡献</CardTitle>
-            <CardDescription class="text-xs">
-              {{ year }} 年每天的 Token 消耗量，颜色越深消耗越多。
-            </CardDescription>
           </div>
           <Select :model-value="year" @update:model-value="selectYear">
             <SelectTrigger size="sm" class="w-[110px]">
@@ -120,9 +116,6 @@ function openAll(): void {
       <CardHeader>
         <div class="space-y-1">
           <CardTitle>请求明细</CardTitle>
-          <CardDescription class="text-xs">
-            每次经由网关的调用及其 Token 消耗，最新 {{ PREVIEW_LIMIT }} 条。
-          </CardDescription>
         </div>
         <CardAction>
           <Button

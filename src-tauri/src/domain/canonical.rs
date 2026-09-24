@@ -182,6 +182,10 @@ pub struct RequestBody {
     pub stop_sequences: Option<Vec<String>>,
     #[serde(default)]
     pub stream: bool,
+    /// 客户端是否要求流式响应末尾附带 usage（OpenAI 的 `stream_options.include_usage`）。
+    /// 由 OpenAI completions 入站解析；上游编码时据此带上 `stream_options`，出站时据此补最终 usage 事件。
+    #[serde(default)]
+    pub include_usage: bool,
 }
 
 #[derive(Debug, Clone)]

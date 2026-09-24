@@ -29,6 +29,7 @@ import {
   protocolLabel,
   sourceAppIcon,
   sourceAppLabel,
+  totalTokens,
 } from "@/lib/format";
 import { usageApi } from "@/lib/ipc";
 import { parseRequest, parseResponse } from "@/lib/payload";
@@ -111,7 +112,7 @@ const tokenStats = computed(() => {
       value: formatPercent(cacheHitRate(value)),
       tone: cacheRead > 0 ? "text-emerald-600 dark:text-emerald-400" : "",
     },
-    { label: "合计", value: formatNumber(value.inputTokens + value.outputTokens), tone: "" },
+    { label: "合计", value: formatNumber(totalTokens(value)), tone: "" },
   ];
 });
 

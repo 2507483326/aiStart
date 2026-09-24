@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from "vue";
-import { ArrowLeftRight, Plus, RefreshCw } from "lucide";
+import { ArrowLeftRight, BrainCircuit, Plus, RefreshCw } from "lucide";
 
 import EmptyState from "@/components/common/EmptyState.vue";
 import MorphIconBox from "@/components/common/MorphIconBox.vue";
@@ -135,7 +135,7 @@ onMounted(async () => {
 
     <EmptyState
       v-else-if="!models.length"
-      icon="M12 3v18 M3 12h18"
+      :icon="BrainCircuit"
       title="还没有模型"
       description="添加一个上游模型后即可启用本地网关，并把推理能力接入桌面客户端。"
     >

@@ -897,7 +897,7 @@ fn sqlite_persistence_round_trips() {
     assert!(detail.stream);
     assert_eq!(detail.inbound_request.as_ref().unwrap().len(), 256 * 1024);
 
-    // 报文保留只留最近 1000 条（此时共写入 3 条，再补 1001 条后应清到 1000）
+    // 报文不再做条数保留清理：写入多少就留多少（此时已有 3 条，再补 1001 条后应为 1004 条）
     for _ in 0..1001 {
         usage::record_with_payload(
             &UsageRecord {
@@ -932,7 +932,7 @@ fn sqlite_persistence_round_trips() {
         Ok(connection.query_row("SELECT COUNT(*) FROM usage_payload", [], |row| row.get(0))?)
     })
     .expect("count should load");
-    assert_eq!(payload_count, 1000);
+    assert_eq!(payload_count, 1004);
 
     events::log(
         "user",

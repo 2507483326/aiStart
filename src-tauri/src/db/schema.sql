@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS usage_detail (
   cache_read_tokens  INTEGER,               -- 缓存读；未上报为 NULL（Anthropic cache_read_input_tokens / OpenAI cached_tokens）
   cache_write_tokens INTEGER,               -- 缓存写；未上报为 NULL（Anthropic cache_creation_input_tokens；OpenAI 无写入）
   reasoning_tokens   INTEGER,               -- 思考 token；不计入 total_tokens；未解析写 NULL（预留）
-  total_tokens      INTEGER NOT NULL DEFAULT 0,   -- 当前口径 = input_tokens + output_tokens
+  total_tokens      INTEGER NOT NULL DEFAULT 0,   -- 真实消耗（对齐 cc-switch 口径）= input + output + cache_read + cache_write
   duration_ms       INTEGER NOT NULL DEFAULT 0,   -- 请求耗时（毫秒）
   ok                INTEGER NOT NULL DEFAULT 1,   -- 1=成功 / 0=失败
   failover          INTEGER NOT NULL DEFAULT 0,   -- 1=由自动切换接手 / 0=否
@@ -177,7 +177,7 @@ CREATE INDEX IF NOT EXISTS idx_app_model_bindings_kind ON app_model_bindings (ap
 --    与 usage_detail 一比一（usage_detail_id 松引用，不建外键）；
 --    存「原生报文」：入站请求为客户端原始 body，上游请求为注入后实际发出的 body，
 --    响应为上游原生形状（流式按事件拼装后再转回上游协议原生形状），
---    由前端按入站/上游协议解析展示；受写入时的保留策略约束（只留最近若干条，会被清理）
+--    由前端按入站/上游协议解析展示；写入后不再做条数清理，全部保留
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS usage_payload (
   usage_payload_id   INTEGER PRIMARY KEY AUTOINCREMENT,  -- 报文行号，自增

@@ -22,13 +22,13 @@ export const router = createRouter({
       path: "/apps",
       name: "apps",
       component: AppsPage,
-      meta: { title: "应用", subtitle: "一键安装、更新并把模型接入桌面客户端" },
+      meta: { title: "应用", subtitle: "一键把模型接入桌面客户端" },
     },
     {
       path: "/models",
       name: "models",
       component: ModelsPage,
-      meta: { title: "模型", subtitle: "统一管理三种协议的上游模型" },
+      meta: { title: "模型", subtitle: "统一管理上游模型" },
     },
     {
       path: "/filters",
@@ -46,7 +46,7 @@ export const router = createRouter({
       path: "/stats/requests",
       name: "requests",
       component: RequestsPage,
-      meta: { title: "请求明细", subtitle: "全部网关调用记录，支持分页" },
+      meta: { title: "请求明细", subtitle: "全部网关调用记录" },
     },
     {
       path: "/stats/requests/:id",

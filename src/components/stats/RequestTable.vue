@@ -14,6 +14,7 @@ import {
   protocolLabel,
   sourceAppIcon,
   sourceAppLabel,
+  totalTokens,
 } from "@/lib/format";
 import type { UsageRecord } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -25,7 +26,7 @@ withDefaults(
     scroll?: boolean;
   }>(),
   {
-    empty: "还没有请求记录。让 Claude Desktop 或任意客户端调用一次网关即可看到数据。",
+    empty: "还没有请求记录。让 任意客户端调用一次网关即可看到数据。",
     scroll: false,
   },
 );
@@ -60,7 +61,9 @@ function cacheHit(record: UsageRecord): string {
           <th class="py-2 pr-3 font-medium">上游</th>
           <th class="py-2 pr-3 text-right font-medium">输入</th>
           <th class="py-2 pr-3 text-right font-medium">输出</th>
-          <th class="py-2 pr-3 text-right font-medium">合计</th>
+          <th class="py-2 pr-3 text-right font-medium" title="输入 + 输出 + 缓存读 + 缓存写">
+            合计
+          </th>
           <th class="py-2 pr-3 text-right font-medium">缓存</th>
           <th class="py-2 pr-3 text-right font-medium">耗时</th>
           <th class="py-2 pr-3 font-medium">状态</th>
@@ -107,7 +110,7 @@ function cacheHit(record: UsageRecord): string {
             {{ formatNumber(record.outputTokens) }}
           </td>
           <td class="py-2 pr-3 text-right font-mono font-medium tabular-nums">
-            {{ formatNumber(record.inputTokens + record.outputTokens) }}
+            {{ formatNumber(totalTokens(record)) }}
           </td>
           <td class="py-2 pr-3 text-right font-mono tabular-nums text-muted-foreground">
             {{ cacheHit(record) }}

@@ -114,6 +114,11 @@ impl ModelProvider for AnthropicMessagesProvider {
                     state.cache_write_tokens = tokens;
                 }
             }
+            "message_delta" => {
+                if let Some(tokens) = data.pointer("/usage/output_tokens").and_then(Value::as_u64) {
+                    state.output_tokens = tokens;
+                }
+            }
             "message_stop" => state.finished = true,
             "error" => state.finished = true,
             _ => {}

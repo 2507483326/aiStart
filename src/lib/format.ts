@@ -17,6 +17,19 @@ export interface CacheTokens {
 }
 
 /**
+ * 真实消耗 token（口径对齐 cc-switch「真实消耗」）：输入 + 输出 + 缓存读 + 缓存写。
+ * 输入 / 输出各自不含缓存，缓存读写单列，只有总量把它们合并。
+ */
+export function totalTokens(value: CacheTokens & { outputTokens: number }): number {
+  return (
+    value.inputTokens +
+    value.outputTokens +
+    (value.cacheReadTokens ?? 0) +
+    (value.cacheWriteTokens ?? 0)
+  );
+}
+
+/**
  * 缓存命中率（口径对齐 dsh）：缓存读 / 计费输入（未命中输入 + 缓存读 + 缓存写）。
  * 无计费输入时返回 null，界面应显「—」而不是 0%。
  */

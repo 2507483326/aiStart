@@ -33,7 +33,7 @@ const phaseView = computed(() => {
       state === "running"
         ? ("default" as const)
         : state === "stopped"
-          ? ("outline" as const)
+          ? ("destructive" as const)
           : ("secondary" as const),
     spinning: state === "starting" || state === "stopping",
   };

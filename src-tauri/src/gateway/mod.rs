@@ -279,11 +279,7 @@ pub fn start() -> AppResult<GatewayStatus> {
         return Err(AppError::Message("网关正在启动中，请稍候再试".into()));
     }
 
-    let settings = crate::settings::snapshot();
-    if settings.active_model().is_none() {
-        return Err(AppError::NotFound("请先添加并启用一个模型".into()));
-    }
-    let port = settings.gateway_port;
+    let port = crate::settings::snapshot().gateway_port;
     let (shutdown_tx, shutdown_rx) = sse::shutdown_channel();
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();

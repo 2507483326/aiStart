@@ -1,0 +1,21 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="aistart-tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#31313D"/>
+      <stop offset="1" stop-color="#121216"/>
+    </linearGradient>
+    <radialGradient id="aistart-glow" cx="0.76" cy="0.2" r="0.75">
+      <stop offset="0" stop-color="#38BDF8" stop-opacity="0.32"/>
+      <stop offset="1" stop-color="#38BDF8" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="aistart-glyph" x1="0.2" y1="0" x2="0.8" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#D8E9FF"/>
+    </linearGradient>
+  </defs>
+  <rect x="102" y="102" width="820" height="820" rx="205" fill="url(#aistart-tile)"/>
+  <rect x="102" y="102" width="820" height="820" rx="205" fill="url(#aistart-glow)"/>
+  <rect x="102.5" y="102.5" width="819" height="819" rx="204.5" fill="none" stroke="#FFFFFF" stroke-opacity="0.08"/>
+  <path d="M470 295 C470 515 500 545 720 545 C500 545 470 575 470 795 C470 575 440 545 220 545 C440 545 470 515 470 295 Z" fill="url(#aistart-glyph)"/>
+  <path d="M760 185 C760 286 774 300 875 300 C774 300 760 314 760 415 C760 314 746 300 645 300 C746 300 760 286 760 185 Z" fill="url(#aistart-glyph)"/>
+</svg>
