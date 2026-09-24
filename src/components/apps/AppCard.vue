@@ -41,7 +41,7 @@ const props = defineProps<{
   activeModelId: number | null;
 }>();
 
-const { pending, download, apply, clear, install, update, downloadUrl } = useApps();
+const { pending, download, apply, clear, downloadUrl } = useApps();
 
 const APP_ICONS: Record<AppKind, string> = {
   "claude-desktop": "/app-icons/claude-desktop.svg",
@@ -57,9 +57,6 @@ const pendingAction = computed(() =>
 // 整卡禁用（有任一操作在跑），但转圈只画在真正被点击的那个按钮上
 const busy = computed(() => pendingAction.value !== null);
 const applying = computed(() => pendingAction.value === "apply");
-const installing = computed(
-  () => pendingAction.value === "install" || pendingAction.value === "update",
-);
 const guideOpen = ref(false);
 const installIcon = computed(() => (props.app.installed ? ArrowUpToLine : Download));
 const applyIcon = computed(() =>
@@ -205,14 +202,9 @@ function onMenuOpen(value: boolean) {
         variant="outline"
         size="xs"
         class="gap-1"
-        :disabled="busy"
-        @click="app.installed ? update(app.kind) : install(app.kind)"
+        @click="openUrl(app.downloadPage)"
       >
-        <MorphIconBox
-          :icon="installing ? LoaderCircle : installIcon"
-          :size="15"
-          :class="installing ? 'animate-spin' : ''"
-        />
+        <MorphIconBox :icon="installIcon" :size="15" />
         {{ app.installed ? "升级" : "安装" }}
       </Button>
 

@@ -75,6 +75,74 @@ fn candidate_models_puts_active_first_and_only_expands_when_failover_is_on() {
 }
 
 #[test]
+fn candidates_for_routes_aliases_to_the_usual_logic_and_named_models_to_themselves() {
+    let mut settings = Settings::default();
+    for name in ["A", "B", "C"] {
+        settings.upsert(crate::domain::model::ModelInput {
+            id: None,
+            name: name.into(),
+            format: ModelFormat::OpenaiCompletions,
+            base_url: "https://example.com/v1".into(),
+            api_key: String::new(),
+            model: name.into(),
+            supports_1m: false,
+        });
+    }
+    settings.active_model_id = Some(2);
+    settings.auto_failover = true;
+
+    let names = |list: Vec<ModelConfig>| {
+        list.into_iter()
+            .map(|model| model.name)
+            .collect::<Vec<String>>()
+    };
+
+    // 网关别名与 auto（任意大小写、带空白）→ 现有逻辑：当前模型优先，其后依次是其余模型。
+    for alias in [
+        "aiStart", "aistart", "AISTART", "auto", "Auto", "AUTO", "  auto  ", "  aiStart ",
+    ] {
+        assert_eq!(
+            names(settings.candidates_for(Some(alias))),
+            vec!["B", "A", "C"],
+            "{alias:?} 应走现有逻辑"
+        );
+    }
+    // 未指定 / 空 → 现有逻辑。
+    assert_eq!(names(settings.candidates_for(None)), vec!["B", "A", "C"]);
+    assert_eq!(names(settings.candidates_for(Some("   "))), vec!["B", "A", "C"]);
+    // 未命中模型列表 → 现有逻辑。
+    assert_eq!(
+        names(settings.candidates_for(Some("不存在"))),
+        vec!["B", "A", "C"]
+    );
+
+    // 命中模型列表里的显示名（不区分大小写）→ 只调用该模型，自动切换对它无效。
+    for name in ["C", "c", "  C  "] {
+        assert_eq!(
+            names(settings.candidates_for(Some(name))),
+            vec!["C"],
+            "{name:?} 应只调用 C"
+        );
+    }
+
+    // 关掉自动切换同样成立（本来就是单模型）。
+    settings.auto_failover = false;
+    assert_eq!(names(settings.candidates_for(Some("A"))), vec!["A"]);
+    assert_eq!(names(settings.candidates_for(Some("auto"))), vec!["B"]);
+}
+
+#[test]
+fn auto_alias_detection_is_case_insensitive() {
+    use crate::gateway::is_auto_alias;
+    for name in ["aiStart", "aistart", "AISTART", "aiSTART", "auto", "AUTO"] {
+        assert!(is_auto_alias(name), "{name}");
+    }
+    for name in ["", " autos", "autoo", "claude-sonnet-5", "我的模型"] {
+        assert!(!is_auto_alias(name), "{name}");
+    }
+}
+
+#[test]
 fn anthropic_passthrough_replaces_model_and_keeps_body() {
     let config = model(ModelFormat::AnthropicMessages, "https://api.anthropic.com");
     let provider = provider_for(ModelFormat::AnthropicMessages);

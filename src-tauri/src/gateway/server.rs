@@ -418,18 +418,18 @@ async fn handle(
     // 保证重试多个上游时规则只套用一次。
     let request = crate::filters::apply(&crate::filters::snapshot(), request)?;
 
-    let candidates = settings.candidate_models();
+    // 请求里的模型名决定候选上游：别名（aiStart / auto）或未命中时走现有逻辑，
+    // 命中模型列表里的显示名时只调用那一个模型（自动切换对它无效）。
+    let candidates = settings.candidates_for(Some(request.body().model.as_str()));
     if candidates.is_empty() {
         return Err(RouteFailure::from(AppError::NotFound(
             "网关没有启用中的模型".into(),
         )));
     }
 
+    // 首选模型：自动切换登记「X → Y」时用它，落库的 model_name 也用它
+    // （现有逻辑下它就是当前模型；指定模型名时就是被指定的那个）。
     let primary = candidates[0].name.clone();
-    let active_name = settings
-        .active_model()
-        .map(|model| model.name.clone())
-        .unwrap_or_default();
     let mut chosen: Option<(ModelConfig, reqwest::Response, Value)> = None;
     let mut failover_used = false;
     let mut last_error: Option<UpstreamFailure> = None;
@@ -519,7 +519,7 @@ async fn handle(
             .filter(|tokens| *tokens > 0);
         stats.record_tokens(input_tokens, output_tokens);
         record_usage(
-            &active_name,
+            &primary,
             &config,
             &source_app,
             inbound,
@@ -625,7 +625,7 @@ async fn handle(
             stats.record_error(message);
         }
         record_usage(
-            &active_name,
+            &primary,
             &config,
             &source_app,
             inbound,

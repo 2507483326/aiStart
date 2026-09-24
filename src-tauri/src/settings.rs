@@ -81,6 +81,25 @@ impl Settings {
         list
     }
 
+    /// 请求里带的模型名决定本次的候选上游：
+    /// - 网关别名（`aiStart`）与 `auto`（不区分大小写）→ 现有逻辑，见 [`Self::candidate_models`]；
+    /// - 命中模型列表里的某个显示名（不区分大小写）→ **只调用该模型**，自动切换对它无效；
+    /// - 其余（含未指定、未命中）→ 现有逻辑。
+    pub fn candidates_for(&self, requested: Option<&str>) -> Vec<ModelConfig> {
+        let Some(needle) = requested
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && !crate::gateway::is_auto_alias(name))
+        else {
+            return self.candidate_models();
+        };
+        let needle = needle.to_lowercase();
+        self.models
+            .iter()
+            .find(|model| model.name.to_lowercase() == needle)
+            .map(|model| vec![model.clone()])
+            .unwrap_or_else(|| self.candidate_models())
+    }
+
     fn next_model_id(&self) -> i64 {
         self.models.iter().map(|model| model.id).max().unwrap_or(0) + 1
     }

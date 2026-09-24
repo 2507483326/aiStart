@@ -13,6 +13,7 @@ export function useModels() {
     remove: store.remove,
     activate: store.activate,
     test: store.test,
+    testConfig: store.testConfig,
     fetchUpstream: store.fetchUpstream,
     fetchUpstreamQuiet: store.fetchUpstreamQuiet,
     prefetchUpstream: store.prefetchUpstream,

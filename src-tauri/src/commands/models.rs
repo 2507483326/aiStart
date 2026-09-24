@@ -235,9 +235,9 @@ fn preview_from_response(response: &Value) -> Option<String> {
     }
 }
 
-#[tauri::command]
-pub async fn test_model(id: i64) -> AppResult<TestResult> {
-    let config = settings::require_model(id)?;
+/// 用给定配置真实发一次最小补全请求，返回连通性结果。已保存模型（`test_model`）
+/// 与表单未保存值（`test_model_config`）共用这一条路径，避免两份实现漂移。
+async fn probe_completion(config: &ModelConfig) -> AppResult<TestResult> {
     let provider = provider_for(config.format);
 
     let request = CanonicalRequest::parse(json!({
@@ -247,12 +247,12 @@ pub async fn test_model(id: i64) -> AppResult<TestResult> {
         "stream": false
     }))?;
 
-    let payload = provider.encode_request(&config, &request)?;
+    let payload = provider.encode_request(config, &request)?;
     let mut builder = http_client()
-        .post(provider.endpoint(&config))
+        .post(provider.endpoint(config))
         .timeout(PROBE_TIMEOUT)
         .json(&payload);
-    for (name, value) in provider.headers(&config) {
+    for (name, value) in provider.headers(config) {
         builder = builder.header(name, value);
     }
 
@@ -275,7 +275,7 @@ pub async fn test_model(id: i64) -> AppResult<TestResult> {
 
     let value: Value = serde_json::from_str(&raw)
         .map_err(|error| AppError::Message(format!("上游响应不是合法 JSON: {error}")))?;
-    let decoded = provider.decode_response(&config, &value)?;
+    let decoded = provider.decode_response(config, &value)?;
 
     Ok(TestResult {
         ok: true,
@@ -291,6 +291,35 @@ pub async fn test_model(id: i64) -> AppResult<TestResult> {
             .and_then(Value::as_u64)
             .unwrap_or(0),
     })
+}
+
+#[tauri::command]
+pub async fn test_model(id: i64) -> AppResult<TestResult> {
+    let config = settings::require_model(id)?;
+    probe_completion(&config).await
+}
+
+/// 连通性测试的表单版本：用尚未保存的 Base URL / API Key / 上游模型 ID / 协议探测，
+/// 让「添加模型」弹窗在保存前就能验证配置。
+#[tauri::command]
+pub async fn test_model_config(
+    base_url: String,
+    api_key: String,
+    model: String,
+    format: ModelFormat,
+) -> AppResult<TestResult> {
+    if base_url.trim().is_empty() {
+        return Err(AppError::InvalidConfig("请先填写 Base URL".into()));
+    }
+    if model.trim().is_empty() {
+        return Err(AppError::InvalidConfig("请先填写上游模型 ID".into()));
+    }
+
+    let mut config = probe_config(&base_url, &api_key, format);
+    config.model = model.trim().to_string();
+    // 结果文案里用上游模型 ID，比 probe_config 默认的 "probe" 有意义
+    config.name = model.trim().to_string();
+    probe_completion(&config).await
 }
 
 fn truncate(input: &str, limit: usize) -> String {

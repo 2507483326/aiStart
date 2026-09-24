@@ -99,6 +99,16 @@ export const useModelsStore = defineStore("models", {
         this.testingId = null;
       }
     },
+    async testConfig(
+      baseUrl: string,
+      apiKey: string,
+      model: string,
+      format: ModelFormat,
+    ): Promise<TestResult | undefined> {
+      return attempt(() => modelApi.testConfig(baseUrl, apiKey, model, format), {
+        error: "连通性测试失败",
+      });
+    },
     async fetchUpstream(
       baseUrl: string,
       apiKey: string,

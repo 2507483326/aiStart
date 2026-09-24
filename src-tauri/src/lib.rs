@@ -50,6 +50,7 @@ pub fn run() {
             commands::models::delete_model,
             commands::models::activate_model,
             commands::models::test_model,
+            commands::models::test_model_config,
             commands::models::fetch_upstream_models,
             commands::filters::list_filters,
             commands::filters::save_filter,

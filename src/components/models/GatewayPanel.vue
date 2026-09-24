@@ -224,7 +224,9 @@ onMounted(loadToday);
 
           <div class="flex items-center gap-2 px-3 py-2.5 transition-colors duration-150 hover:bg-accent/30">
             <span class="shrink-0 text-muted-foreground">模型名称</span>
-            <span class="min-w-0 flex-1 font-mono text-foreground">aiStart</span>
+            <span class="min-w-0 flex-1 font-mono text-foreground">
+              aiStart<span class="text-muted-foreground"> 或 auto</span>
+            </span>
             <Button
               variant="ghost"
               size="icon-xs"
@@ -236,6 +238,10 @@ onMounted(loadToday);
             </Button>
           </div>
         </div>
+        <p class="text-xs text-muted-foreground">
+          模型名传 aiStart / auto（不区分大小写）时按现有逻辑路由；
+          传「模型」页里的模型名称时只调用该模型，自动切换对它无效。
+        </p>
       </div>
 
       <div class="space-y-2">

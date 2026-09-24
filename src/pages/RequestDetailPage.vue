@@ -45,6 +45,13 @@ const record = computed(() => detail.value?.record ?? null);
 const payload = computed(() => detail.value?.payload ?? null);
 const sourceIcon = computed(() => (record.value ? sourceAppIcon(record.value.sourceApp) : null));
 
+/** 自动切换时展示「切换前」的模型：modelName 为请求到达时生效的模型，servedBy 为接手方。 */
+const failoverFrom = computed(() => {
+  const value = record.value;
+  if (!value?.failover || !value.modelName) return null;
+  return value.modelName === value.servedBy ? null : value.modelName;
+});
+
 const responseView = computed(() =>
   parseResponse(payload.value?.upstreamResponse ?? null, record.value?.upstreamProtocol ?? ""),
 );
@@ -173,7 +180,9 @@ function goBack(): void {
                   成功
                 </Badge>
                 <Badge v-else variant="destructive">失败</Badge>
-                <Badge v-if="record.failover" variant="outline">自动切换</Badge>
+                <Badge v-if="record.failover" variant="outline">
+                  自动切换{{ failoverFrom ? ` · 从 ${failoverFrom}` : "" }}
+                </Badge>
               </div>
             </div>
           </CardHeader>

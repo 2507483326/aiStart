@@ -22,6 +22,14 @@ const STOP_WAIT: Duration = Duration::from_secs(10);
 /// Brand shown in the Claude Desktop model picker.
 pub const MODEL_LABEL_PREFIX: &str = "aiStart";
 
+/// 与网关别名等价的「自动」入口，客户端也可以传它。
+pub const AUTO_ALIAS: &str = "auto";
+
+/// 请求里的模型名是否表示「走现有路由逻辑」（网关别名或 `auto`，不区分大小写）。
+pub fn is_auto_alias(name: &str) -> bool {
+    name.eq_ignore_ascii_case(MODEL_LABEL_PREFIX) || name.eq_ignore_ascii_case(AUTO_ALIAS)
+}
+
 /// One route the gateway advertises and Claude Desktop accepts.
 #[derive(Debug, Clone, Copy)]
 pub struct ModelRole {

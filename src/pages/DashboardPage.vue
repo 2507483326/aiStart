@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted } from "vue";
+import { computed, onMounted } from "vue";
 import { useRouter } from "vue-router";
 import { ArrowRight, Boxes, CircleCheck, BrainCircuit } from "lucide";
 
@@ -25,6 +25,10 @@ const router = useRouter();
 const gateway = useGateway();
 const { apps, refresh: refreshApps, ensureListener } = useApps();
 const { models, activeModel, refresh: refreshModels } = useModels();
+
+// 面板只做概览：模型多了也不铺开，最多列 5 个，其余到「模型」页看。
+const PREVIEW_LIMIT = 5;
+const previewModels = computed(() => models.value.slice(0, PREVIEW_LIMIT));
 
 onMounted(async () => {
   await ensureListener();
@@ -102,7 +106,7 @@ onMounted(async () => {
         </CardHeader>
         <CardContent>
           <div v-if="models.length" class="space-y-2.5">
-            <template v-for="(model, index) in models" :key="model.id">
+            <template v-for="(model, index) in previewModels" :key="model.id">
               <Separator v-if="index > 0" />
               <div class="-mx-2 flex items-center justify-between gap-3 rounded-md px-2 py-1.5 transition-colors duration-150 hover:bg-accent/50">
                 <div class="flex min-w-0 items-center gap-2.5">

@@ -42,6 +42,8 @@ export const modelApi = {
   remove: (id: number) => invoke<ModelConfig[]>("delete_model", { id }),
   activate: (id: number) => invoke<GatewayStatus>("activate_model", { id }),
   test: (id: number) => invoke<TestResult>("test_model", { id }),
+  testConfig: (baseUrl: string, apiKey: string, model: string, format: ModelFormat) =>
+    invoke<TestResult>("test_model_config", { baseUrl, apiKey, model, format }),
   fetchUpstream: (baseUrl: string, apiKey: string, format: ModelFormat) =>
     invoke<string[]>("fetch_upstream_models", { baseUrl, apiKey, format }),
 };
