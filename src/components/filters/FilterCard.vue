@@ -4,7 +4,6 @@ import { Pencil, Trash2 } from "lucide";
 
 import ConfirmDialog from "@/components/common/ConfirmDialog.vue";
 import MorphIconBox from "@/components/common/MorphIconBox.vue";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { useFilters } from "@/composables/useFilters";
@@ -14,8 +13,6 @@ const props = defineProps<{ filter: RequestFilter }>();
 const emit = defineEmits<{ edit: [filter: RequestFilter] }>();
 
 const { setEnabled, remove } = useFilters();
-
-const KIND_LABEL = "系统提示词";
 
 const MODE_LABELS: Record<PromptMode, string> = {
   append: "追加到末尾",
@@ -40,10 +37,7 @@ function truncate(text: string): string {
     "
   >
     <div class="min-w-0 flex-1">
-      <div class="flex flex-wrap items-center gap-2">
-        <p class="truncate text-sm font-medium">{{ filter.name }}</p>
-        <Badge variant="outline">{{ KIND_LABEL }}</Badge>
-      </div>
+      <p class="truncate text-sm font-medium">{{ filter.name }}</p>
       <p class="mt-0.5 truncate font-mono text-xs text-muted-foreground">{{ summary }}</p>
     </div>
 

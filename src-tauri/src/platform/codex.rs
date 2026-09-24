@@ -131,7 +131,10 @@ fn merge_provider(doc: &mut DocumentMut, ctx: &ApplyContext) -> AppResult<()> {
     table.insert("base_url", value(gateway_base(ctx)));
     table.insert("wire_api", value(WIRE_API));
     // 凭据挂在 provider 上，auth.json 里的官方登录缓存因此得以保留。
-    table.insert("experimental_bearer_token", value(ctx.gateway_token.clone()));
+    table.insert(
+        "experimental_bearer_token",
+        value(ctx.gateway_token.clone()),
+    );
     Ok(())
 }
 
@@ -338,7 +341,10 @@ pub fn apply(ctx: &ApplyContext) -> AppResult<ApplyReport> {
             path.display()
         ),
         format!("model_provider = \"{PROVIDER_ID}\"，指向 [model_providers.{PROVIDER_ID}]"),
-        format!("base_url = {}（wire_api = \"{WIRE_API}\"）", gateway_base(ctx)),
+        format!(
+            "base_url = {}（wire_api = \"{WIRE_API}\"）",
+            gateway_base(ctx)
+        ),
         format!(
             "网关 Key 写在该 provider 的 experimental_bearer_token（{} 专属）",
             ctx.gateway_token
@@ -441,7 +447,8 @@ mod tests {
     use crate::domain::model::{ModelConfig, ModelFormat};
 
     fn parse(text: &str) -> DocumentMut {
-        text.parse::<DocumentMut>().expect("test fixture is valid toml")
+        text.parse::<DocumentMut>()
+            .expect("test fixture is valid toml")
     }
 
     fn context() -> ApplyContext {
@@ -493,7 +500,10 @@ mod tests {
             Some(WIRE_API)
         );
         assert_eq!(
-            string_at(&doc, &[PROVIDERS_KEY, PROVIDER_ID, "experimental_bearer_token"]),
+            string_at(
+                &doc,
+                &[PROVIDERS_KEY, PROVIDER_ID, "experimental_bearer_token"]
+            ),
             Some("codex")
         );
     }
@@ -544,7 +554,10 @@ mod tests {
         merge_provider(&mut doc, &context()).expect("merge succeeds");
 
         assert_eq!(
-            string_at(&doc, &[PROVIDERS_KEY, PROVIDER_ID, "experimental_bearer_token"]),
+            string_at(
+                &doc,
+                &[PROVIDERS_KEY, PROVIDER_ID, "experimental_bearer_token"]
+            ),
             Some("codex"),
             "凭据补上"
         );
@@ -573,7 +586,10 @@ mod tests {
             .expect("providers table");
         assert_eq!(providers.iter().count(), 1);
         assert_eq!(
-            string_at(&doc, &[PROVIDERS_KEY, PROVIDER_ID, "experimental_bearer_token"]),
+            string_at(
+                &doc,
+                &[PROVIDERS_KEY, PROVIDER_ID, "experimental_bearer_token"]
+            ),
             Some("codex")
         );
         assert_eq!(
@@ -597,12 +613,11 @@ mod tests {
             string_at(&doc, &[PROVIDERS_KEY, "my-relay", "base_url"]),
             Some("https://relay.example.com")
         );
-        assert!(
-            doc.as_table()
-                .get(PROVIDERS_KEY)
-                .and_then(|providers| providers.get(PROVIDER_ID))
-                .is_none()
-        );
+        assert!(doc
+            .as_table()
+            .get(PROVIDERS_KEY)
+            .and_then(|providers| providers.get(PROVIDER_ID))
+            .is_none());
     }
 
     #[test]
@@ -708,7 +723,8 @@ mod tests {
 
     #[test]
     fn apply_catalog_merges_into_the_configured_catalog_file() {
-        let dir = std::env::temp_dir().join(format!("aistart-codex-catalog-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("aistart-codex-catalog-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
 
@@ -862,10 +878,7 @@ mod tests {
             PathBuf::from(r"D:\codex-home")
         );
         // 空串等同于没设置，回落到 ~/.codex。
-        assert_eq!(
-            resolve_home(Some("   ".into())),
-            resolve_home(None)
-        );
+        assert_eq!(resolve_home(Some("   ".into())), resolve_home(None));
         assert!(resolve_home(None).ends_with(".codex"));
     }
 }

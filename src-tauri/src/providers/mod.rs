@@ -233,7 +233,10 @@ impl StreamState {
                 "usage": { "output_tokens": self.output_tokens }
             }),
         ));
-        events.push(SseEvent::new("message_stop", json!({ "type": "message_stop" })));
+        events.push(SseEvent::new(
+            "message_stop",
+            json!({ "type": "message_stop" }),
+        ));
         events
     }
 
@@ -301,8 +304,7 @@ impl ResponseAssembler {
                 }
             }
             "content_block_start" => {
-                if data.pointer("/content_block/type").and_then(Value::as_str) == Some("tool_use")
-                {
+                if data.pointer("/content_block/type").and_then(Value::as_str) == Some("tool_use") {
                     let index = data.get("index").and_then(Value::as_i64).unwrap_or(0);
                     self.tool_calls.push(AssembledToolCall {
                         id: data
@@ -330,8 +332,7 @@ impl ResponseAssembler {
                         }
                     }
                     Some("thinking_delta") => {
-                        if let Some(text) =
-                            data.pointer("/delta/thinking").and_then(Value::as_str)
+                        if let Some(text) = data.pointer("/delta/thinking").and_then(Value::as_str)
                         {
                             self.thinking.push_str(text);
                         }
@@ -427,7 +428,11 @@ pub trait ModelProvider: Send + Sync {
         state: &mut StreamState,
     ) -> AppResult<Vec<SseEvent>>;
 
-    fn decode_stream_done(&self, _cfg: &ModelConfig, state: &mut StreamState) -> AppResult<Vec<SseEvent>> {
+    fn decode_stream_done(
+        &self,
+        _cfg: &ModelConfig,
+        state: &mut StreamState,
+    ) -> AppResult<Vec<SseEvent>> {
         Ok(state.finish("end_turn"))
     }
 

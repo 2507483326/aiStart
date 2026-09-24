@@ -20,7 +20,7 @@ import { usageApi } from "@/lib/ipc";
 import { notifySuccess } from "@/lib/notify";
 import type { UsageSummary } from "@/lib/types";
 
-const { status, running, busy, phase, transitioning, restart } = useGateway();
+const { status, busy, phase, transitioning, restart } = useGateway();
 
 // 按钮忙碌 = 重启请求在途，或后端正处于启动/停止的过渡态。
 const working = computed(() => busy.value || transitioning.value);

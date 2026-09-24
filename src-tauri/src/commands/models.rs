@@ -93,7 +93,10 @@ pub fn delete_model(id: i64) -> AppResult<Vec<ModelConfig>> {
 
 #[tauri::command]
 pub async fn activate_model(id: i64) -> AppResult<gateway::GatewayStatus> {
-    let exists = settings::snapshot().models.iter().any(|model| model.id == id);
+    let exists = settings::snapshot()
+        .models
+        .iter()
+        .any(|model| model.id == id);
     if !exists {
         return Err(AppError::NotFound(format!("模型 {id} 不存在")));
     }
@@ -184,7 +187,9 @@ pub async fn fetch_upstream_models(
     let config = probe_config(&base_url, &api_key, format);
     let provider = provider_for(format);
 
-    let mut builder = http_client().get(config.models_url()).timeout(PROBE_TIMEOUT);
+    let mut builder = http_client()
+        .get(config.models_url())
+        .timeout(PROBE_TIMEOUT);
     for (name, value) in provider.headers(&config) {
         builder = builder.header(name, value);
     }

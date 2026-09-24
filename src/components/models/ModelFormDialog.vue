@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-import { LoaderCircle, RefreshCw } from "lucide";
+import { Eye, EyeOff, LoaderCircle, RefreshCw } from "lucide";
 
 import MorphIconBox from "@/components/common/MorphIconBox.vue";
 import UpstreamModelSelect from "@/components/models/UpstreamModelSelect.vue";
@@ -39,6 +39,7 @@ const name = ref("");
 const format = ref<ModelFormat>("openai-completions");
 const baseUrl = ref("");
 const apiKey = ref("");
+const showApiKey = ref(false);
 const model = ref("");
 const supports1m = ref(false);
 const upstreamModels = ref<string[]>([]);
@@ -56,6 +57,7 @@ function reset() {
   format.value = source?.format ?? "openai-completions";
   baseUrl.value = source?.baseUrl ?? "https://api.openai.com/v1";
   apiKey.value = source?.apiKey ?? "";
+  showApiKey.value = false;
   model.value = source?.model ?? "";
   supports1m.value = source?.supports1m ?? false;
   // 编辑时直接用进入模型页预取到的上游列表，拉到过就展示成选择框
@@ -185,13 +187,25 @@ async function submit() {
 
         <div class="space-y-2">
           <Label for="model-api-key">API Key</Label>
-          <Input
-            id="model-api-key"
-            v-model="apiKey"
-            type="password"
-            class="font-mono text-xs"
-            placeholder="sk-…"
-          />
+          <div class="relative">
+            <Input
+              id="model-api-key"
+              v-model="apiKey"
+              :type="showApiKey ? 'text' : 'password'"
+              class="pr-9 font-mono text-xs"
+              placeholder="sk-…"
+            />
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-xs"
+              class="absolute top-1/2 right-0.5 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+              :aria-label="showApiKey ? '隐藏 API Key' : '显示 API Key'"
+              @click="showApiKey = !showApiKey"
+            >
+              <MorphIconBox :icon="showApiKey ? EyeOff : Eye" :size="14" />
+            </Button>
+          </div>
         </div>
 
         <div class="space-y-2">

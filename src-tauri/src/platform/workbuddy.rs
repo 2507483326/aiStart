@@ -147,7 +147,10 @@ fn owned_index(models: &[Value], gateway_base_url: Option<&str>) -> Option<usize
 
 /// 生成我们的条目；已有条目里的其他字段（用户手改的 token 上限、reasoning 等）保留。
 fn entry_value(ctx: &ApplyContext, existing: Option<&Value>) -> Value {
-    let mut map = existing.and_then(Value::as_object).cloned().unwrap_or_default();
+    let mut map = existing
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
     map.insert("id".into(), json!(GATEWAY_ALIAS));
     map.insert("name".into(), json!(GATEWAY_ALIAS));
     map.insert("vendor".into(), json!("aiStart"));
@@ -312,7 +315,10 @@ mod tests {
 
     fn entry(root: &Value) -> &Value {
         let list = models(root).expect("array-shaped model list");
-        let index = list.iter().position(is_ours).expect("aiStart entry present");
+        let index = list
+            .iter()
+            .position(is_ours)
+            .expect("aiStart entry present");
         &list[index]
     }
 

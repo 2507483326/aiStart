@@ -27,15 +27,24 @@ fn request(body: serde_json::Value) -> CanonicalRequest {
 #[test]
 fn urls_handle_base_with_and_without_v1_suffix() {
     let bare = model(ModelFormat::AnthropicMessages, "https://api.anthropic.com/");
-    assert_eq!(bare.completion_url(), "https://api.anthropic.com/v1/messages");
+    assert_eq!(
+        bare.completion_url(),
+        "https://api.anthropic.com/v1/messages"
+    );
     assert_eq!(bare.models_url(), "https://api.anthropic.com/v1/models");
 
     let with_v1 = model(ModelFormat::OpenaiCompletions, "https://api.openai.com/v1");
-    assert_eq!(with_v1.completion_url(), "https://api.openai.com/v1/chat/completions");
+    assert_eq!(
+        with_v1.completion_url(),
+        "https://api.openai.com/v1/chat/completions"
+    );
     assert_eq!(with_v1.models_url(), "https://api.openai.com/v1/models");
 
     let responses = model(ModelFormat::OpenaiResponses, "http://127.0.0.1:11434/v1/");
-    assert_eq!(responses.completion_url(), "http://127.0.0.1:11434/v1/responses");
+    assert_eq!(
+        responses.completion_url(),
+        "http://127.0.0.1:11434/v1/responses"
+    );
 }
 
 #[test]
@@ -107,7 +116,10 @@ fn openai_completions_lifts_system_and_converts_tools() {
     assert_eq!(encoded["messages"][1]["content"], "weather?");
     assert_eq!(encoded["tools"][0]["type"], "function");
     assert_eq!(encoded["tools"][0]["function"]["name"], "get_weather");
-    assert_eq!(encoded["tools"][0]["function"]["parameters"]["type"], "object");
+    assert_eq!(
+        encoded["tools"][0]["function"]["parameters"]["type"],
+        "object"
+    );
 }
 
 #[test]
@@ -207,7 +219,10 @@ fn openai_completions_splits_cached_prompt_tokens() {
     // 回写给 OpenAI 客户端时缓存读并回 prompt_tokens（OpenAI 语义：prompt_tokens 含缓存）
     let encoded = provider.encode_response(&config, &decoded).unwrap();
     assert_eq!(encoded["usage"]["prompt_tokens"], 1000);
-    assert_eq!(encoded["usage"]["prompt_tokens_details"]["cached_tokens"], 900);
+    assert_eq!(
+        encoded["usage"]["prompt_tokens_details"]["cached_tokens"],
+        900
+    );
 }
 
 #[test]
@@ -377,15 +392,28 @@ fn openai_completions_reencodes_canonical_stream_into_chunks() {
     let events = encode_all(ModelFormat::OpenaiCompletions);
     let types: Vec<&str> = events
         .iter()
-        .map(|event| event.get("object").and_then(|v| v.as_str()).unwrap_or("done"))
+        .map(|event| {
+            event
+                .get("object")
+                .and_then(|v| v.as_str())
+                .unwrap_or("done")
+        })
         .collect();
 
-    assert!(types.iter().all(|kind| *kind == "chat.completion.chunk" || *kind == "done"));
+    assert!(types
+        .iter()
+        .all(|kind| *kind == "chat.completion.chunk" || *kind == "done"));
 
     assert_eq!(events[0]["choices"][0]["delta"]["role"], "assistant");
     assert_eq!(events[1]["choices"][0]["delta"]["content"], "Hello");
-    assert_eq!(events[2]["choices"][0]["delta"]["tool_calls"][0]["id"], "call_1");
-    assert_eq!(events[2]["choices"][0]["delta"]["tool_calls"][0]["index"], 0);
+    assert_eq!(
+        events[2]["choices"][0]["delta"]["tool_calls"][0]["id"],
+        "call_1"
+    );
+    assert_eq!(
+        events[2]["choices"][0]["delta"]["tool_calls"][0]["index"],
+        0
+    );
     assert_eq!(
         events[3]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
         "{\"city\":\"Beijing\"}"
@@ -555,15 +583,24 @@ fn canonical_responses_are_re_encoded_for_openai_clients() {
     });
 
     let chat = provider_for(ModelFormat::OpenaiCompletions)
-        .encode_response(&model(ModelFormat::OpenaiCompletions, "https://api.openai.com/v1"), &canonical)
+        .encode_response(
+            &model(ModelFormat::OpenaiCompletions, "https://api.openai.com/v1"),
+            &canonical,
+        )
         .unwrap();
     assert_eq!(chat["choices"][0]["message"]["content"], "hi");
-    assert_eq!(chat["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"], "{\"a\":1}");
+    assert_eq!(
+        chat["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+        "{\"a\":1}"
+    );
     assert_eq!(chat["choices"][0]["finish_reason"], "tool_calls");
     assert_eq!(chat["usage"]["total_tokens"], 9);
 
     let responses = provider_for(ModelFormat::OpenaiResponses)
-        .encode_response(&model(ModelFormat::OpenaiResponses, "https://api.openai.com/v1"), &canonical)
+        .encode_response(
+            &model(ModelFormat::OpenaiResponses, "https://api.openai.com/v1"),
+            &canonical,
+        )
         .unwrap();
     let types: Vec<&str> = responses["output"]
         .as_array()
@@ -628,6 +665,8 @@ fn sqlite_persistence_round_trips() {
             model_name: "Temp".into(),
             served_by: "Temp".into(),
             source_app: "claude-desktop".into(),
+            upstream_url: "https://example.com/v1/responses".into(),
+            upstream_model: "temp-model".into(),
             inbound_protocol: "anthropic-messages".into(),
             upstream_protocol: "openai-responses".into(),
             input_tokens: 10,
@@ -646,12 +685,20 @@ fn sqlite_persistence_round_trips() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].total_tokens(), 15);
     assert_eq!(records[0].source_app, "claude-desktop");
+    assert_eq!(
+        records[0].upstream_url,
+        "https://example.com/v1/responses"
+    );
+    assert_eq!(records[0].upstream_model, "temp-model");
     let summary = usage::summary(365);
     assert_eq!(summary.total_requests, 1);
     assert_eq!(summary.today_tokens, 15);
 
     // 详情页按 id 单独取记录
-    assert_eq!(usage::find(records[0].id).expect("record should load").id, records[0].id);
+    assert_eq!(
+        usage::find(records[0].id).expect("record should load").id,
+        records[0].id
+    );
     assert!(usage::find(999_999).is_none());
 
     // 列表页分页：总数 + 倒序 + 越界空页
@@ -672,6 +719,8 @@ fn sqlite_persistence_round_trips() {
             model_name: "Temp".into(),
             served_by: "Temp".into(),
             source_app: "claude-desktop".into(),
+            upstream_url: "https://example.com/v1/responses".into(),
+            upstream_model: "temp-model".into(),
             inbound_protocol: "anthropic-messages".into(),
             upstream_protocol: "openai-responses".into(),
             input_tokens: 3,
@@ -716,6 +765,8 @@ fn sqlite_persistence_round_trips() {
             model_name: "Temp".into(),
             served_by: "Temp".into(),
             source_app: "claude-desktop".into(),
+            upstream_url: String::new(),
+            upstream_model: String::new(),
             inbound_protocol: "anthropic-messages".into(),
             upstream_protocol: "openai-responses".into(),
             input_tokens: 1,
@@ -735,8 +786,12 @@ fn sqlite_persistence_round_trips() {
         }),
     );
     let latest = usage::recent(1);
-    let detail = usage::payload_detail(latest[0].id).expect("payload should link to its own detail");
-    assert_eq!(detail.inbound_request.as_deref(), Some("{\"day\":\"first\"}"));
+    let detail =
+        usage::payload_detail(latest[0].id).expect("payload should link to its own detail");
+    assert_eq!(
+        detail.inbound_request.as_deref(),
+        Some("{\"day\":\"first\"}")
+    );
 
     // 超限报文被截断并置标记
     usage::record_with_payload(
@@ -747,6 +802,8 @@ fn sqlite_persistence_round_trips() {
             model_name: "Temp".into(),
             served_by: "Temp".into(),
             source_app: "claude-desktop".into(),
+            upstream_url: String::new(),
+            upstream_model: String::new(),
             inbound_protocol: "anthropic-messages".into(),
             upstream_protocol: "openai-responses".into(),
             input_tokens: 1,
@@ -782,6 +839,8 @@ fn sqlite_persistence_round_trips() {
                 model_name: "Temp".into(),
                 served_by: "Temp".into(),
                 source_app: "claude-desktop".into(),
+                upstream_url: String::new(),
+                upstream_model: String::new(),
                 inbound_protocol: "anthropic-messages".into(),
                 upstream_protocol: "openai-responses".into(),
                 input_tokens: 1,
@@ -829,7 +888,9 @@ fn sqlite_persistence_round_trips() {
         None,
     );
     let checks = updates::latest_checks();
-    let snapshot = checks.get(&AppKind::ClaudeDesktop).expect("check should load");
+    let snapshot = checks
+        .get(&AppKind::ClaudeDesktop)
+        .expect("check should load");
     assert!(snapshot.update_available);
     assert_eq!(snapshot.latest_version.as_deref(), Some("2.0.0"));
 
@@ -932,7 +993,13 @@ fn filter(enabled: bool, rule: FilterRule) -> RequestFilter {
 fn filter_injects_system_prompt() {
     // system 缺失 → 直接写入
     let out = filters::apply(
-        &[filter(true, FilterRule::SystemPrompt { mode: PromptMode::Append, text: "B".into() })],
+        &[filter(
+            true,
+            FilterRule::SystemPrompt {
+                mode: PromptMode::Append,
+                text: "B".into(),
+            },
+        )],
         request(json!({ "messages": [] })),
     )
     .unwrap();
@@ -940,14 +1007,26 @@ fn filter_injects_system_prompt() {
 
     // 已有字符串 → 追加 / 前置
     let append = filters::apply(
-        &[filter(true, FilterRule::SystemPrompt { mode: PromptMode::Append, text: "B".into() })],
+        &[filter(
+            true,
+            FilterRule::SystemPrompt {
+                mode: PromptMode::Append,
+                text: "B".into(),
+            },
+        )],
         request(json!({ "system": "A", "messages": [] })),
     )
     .unwrap();
     assert_eq!(append.raw()["system"], "A\nB");
 
     let prepend = filters::apply(
-        &[filter(true, FilterRule::SystemPrompt { mode: PromptMode::Prepend, text: "B".into() })],
+        &[filter(
+            true,
+            FilterRule::SystemPrompt {
+                mode: PromptMode::Prepend,
+                text: "B".into(),
+            },
+        )],
         request(json!({ "system": "A", "messages": [] })),
     )
     .unwrap();
@@ -955,7 +1034,13 @@ fn filter_injects_system_prompt() {
 
     // 块数组 → 追加一个 text 块
     let blocks = filters::apply(
-        &[filter(true, FilterRule::SystemPrompt { mode: PromptMode::Append, text: "B".into() })],
+        &[filter(
+            true,
+            FilterRule::SystemPrompt {
+                mode: PromptMode::Append,
+                text: "B".into(),
+            },
+        )],
         request(json!({ "system": [{ "type": "text", "text": "A" }], "messages": [] })),
     )
     .unwrap();
@@ -967,7 +1052,13 @@ fn filter_injects_system_prompt() {
 fn filter_skips_disabled_and_stacks_in_order() {
     // 停用的规则不生效
     let disabled = filters::apply(
-        &[filter(false, FilterRule::SystemPrompt { mode: PromptMode::Append, text: "X".into() })],
+        &[filter(
+            false,
+            FilterRule::SystemPrompt {
+                mode: PromptMode::Append,
+                text: "X".into(),
+            },
+        )],
         request(json!({ "system": "A", "messages": [] })),
     )
     .unwrap();
@@ -976,8 +1067,20 @@ fn filter_skips_disabled_and_stacks_in_order() {
     // 按列表顺序叠加：先追加 B，再前置 C
     let stacked = filters::apply(
         &[
-            filter(true, FilterRule::SystemPrompt { mode: PromptMode::Append, text: "B".into() }),
-            filter(true, FilterRule::SystemPrompt { mode: PromptMode::Prepend, text: "C".into() }),
+            filter(
+                true,
+                FilterRule::SystemPrompt {
+                    mode: PromptMode::Append,
+                    text: "B".into(),
+                },
+            ),
+            filter(
+                true,
+                FilterRule::SystemPrompt {
+                    mode: PromptMode::Prepend,
+                    text: "C".into(),
+                },
+            ),
         ],
         request(json!({ "system": "A", "messages": [] })),
     )

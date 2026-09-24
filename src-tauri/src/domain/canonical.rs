@@ -60,7 +60,10 @@ impl ContentBlock {
             return None;
         }
         Some(ToolResult {
-            tool_use_id: self.str_field("tool_use_id").unwrap_or_default().to_string(),
+            tool_use_id: self
+                .str_field("tool_use_id")
+                .unwrap_or_default()
+                .to_string(),
             content: self.field("content").cloned().unwrap_or(Value::Null),
             is_error: self
                 .field("is_error")
@@ -189,8 +192,9 @@ pub struct CanonicalRequest {
 
 impl CanonicalRequest {
     pub fn parse(raw: Value) -> crate::error::AppResult<Self> {
-        let body: RequestBody = serde_json::from_value(raw.clone())
-            .map_err(|err| crate::error::AppError::InvalidConfig(format!("请求体格式非法: {err}")))?;
+        let body: RequestBody = serde_json::from_value(raw.clone()).map_err(|err| {
+            crate::error::AppError::InvalidConfig(format!("请求体格式非法: {err}"))
+        })?;
         Ok(Self { raw, body })
     }
 
@@ -213,8 +217,9 @@ impl CanonicalRequest {
         f: impl FnOnce(&mut Value) -> crate::error::AppResult<()>,
     ) -> crate::error::AppResult<Self> {
         f(&mut self.raw)?;
-        self.body = serde_json::from_value(self.raw.clone())
-            .map_err(|err| crate::error::AppError::InvalidConfig(format!("请求体格式非法: {err}")))?;
+        self.body = serde_json::from_value(self.raw.clone()).map_err(|err| {
+            crate::error::AppError::InvalidConfig(format!("请求体格式非法: {err}"))
+        })?;
         Ok(self)
     }
 }

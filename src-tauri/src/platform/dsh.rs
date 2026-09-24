@@ -438,7 +438,10 @@ mod tests {
         let providers = providers_of(&reparsed);
         assert_eq!(providers.len(), 3);
         let kimi = providers.get("kimi-coding").expect("kimi kept");
-        assert_eq!(string_at(kimi, "baseURL"), Some("https://api.kimi.com/coding"));
+        assert_eq!(
+            string_at(kimi, "baseURL"),
+            Some("https://api.kimi.com/coding")
+        );
         assert_eq!(string_at(kimi, "api"), Some("anthropic-messages"));
         let kimi_models = kimi.get("models").and_then(Value::as_sequence).unwrap();
         assert_eq!(

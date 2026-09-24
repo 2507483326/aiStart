@@ -38,9 +38,12 @@ pub async fn translate_text(text: String) -> AppResult<String> {
         return Err(AppError::InvalidConfig("没有可翻译的文本".into()));
     }
 
-    let config = settings::snapshot().active_model().cloned().ok_or_else(|| {
-        AppError::InvalidConfig("请先在「模型」页面启用一个模型，翻译会复用它".into())
-    })?;
+    let config = settings::snapshot()
+        .active_model()
+        .cloned()
+        .ok_or_else(|| {
+            AppError::InvalidConfig("请先在「模型」页面启用一个模型，翻译会复用它".into())
+        })?;
     let provider = provider_for(config.format);
 
     // 用字符数粗略估算输出长度，避免长报文被 max_tokens 截断。

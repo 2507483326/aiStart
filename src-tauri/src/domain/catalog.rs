@@ -157,14 +157,17 @@ pub fn builtin_apps() -> Vec<AppDescriptor> {
             kind: AppKind::ZCode,
             name: "ZCode".into(),
             publisher: "Z.ai（智谱）".into(),
-            description: "智谱 ZCode（GLM 官方 ADE 桌面端）。添加自定义供应商时可选择 Chat Completions / Responses / Anthropic Messages 三种协议。"
+            description: "智谱 ZCode（GLM 官方 ADE 桌面端）。把自定义供应商合并进它的 config.json（kind 决定走 Chat Completions / Responses / Anthropic Messages 之一），推理走本地网关。"
                 .into(),
             homepage: "https://zcode.z.ai/".into(),
             download_page: "https://zcode.z.ai/cn".into(),
             requires_gateway: true,
-            apply_mode: ApplyMode::Manual,
-            // 自定义供应商在 GUI 里配置，官方未公开落盘格式；待实测后再定文件路径。
-            config_target: "ZCode 设置 → 模型供应商（自定义）".into(),
+            apply_mode: ApplyMode::DirectConfig,
+            // 供应商落盘在数据目录的 `v2/config.json`（`ZCODE_DATA_BASE_DIR` 可改数据根，
+            // 默认 `%USERPROFILE%\.zcode\v2\config.json`）。自定义供应商的 id 是 UUID，
+            // 用 `kind` 决定线协议，凭据与地址放在 `options.{apiKey,baseURL}`；aiStart 以
+            // 固定 id `aistart` 合并进去。见 `platform/zcode.rs`。
+            config_target: r"%USERPROFILE%\.zcode\v2\config.json".into(),
             // 待实测：`https://zcode.z.ai/changelog` 是 HTML，现有 `updates::parse_latest` 解析不了，
             // 暂不做版本探测。CDN 已是版本化直链（见 upgrade 注释），补上版本源即可开启自动安装。
             latest_version_urls: vec![],
@@ -325,7 +328,11 @@ mod tests {
         // 因此它必须走 `DirectConfig`；退回 `Manual` 说明有人把写入逻辑删了。
         let workbuddy = builtin_app(AppKind::WorkBuddy);
         assert_eq!(workbuddy.apply_mode, ApplyMode::DirectConfig);
-        assert!(workbuddy.config_target.contains("models.json"), "{}", workbuddy.config_target);
+        assert!(
+            workbuddy.config_target.contains("models.json"),
+            "{}",
+            workbuddy.config_target
+        );
     }
 
     #[test]

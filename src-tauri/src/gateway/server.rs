@@ -15,7 +15,9 @@ use tower_http::cors::CorsLayer;
 use crate::domain::canonical::CanonicalRequest;
 use crate::domain::model::{ModelConfig, ModelFormat};
 use crate::error::AppError;
-use crate::providers::{http_client, provider_for, ResponseAssembler, SseEvent, StreamState, WireState};
+use crate::providers::{
+    http_client, provider_for, ResponseAssembler, SseEvent, StreamState, WireState,
+};
 
 use super::sse::{encode_channel_event, parse_sse_stream};
 use super::{GatewayStats, MODEL_ROLES};
@@ -54,7 +56,10 @@ fn api_error(inbound: ModelFormat, status: StatusCode, kind: &str, message: &str
 }
 
 fn extract_token(headers: &HeaderMap) -> Option<String> {
-    if let Some(value) = headers.get("x-api-key").and_then(|value| value.to_str().ok()) {
+    if let Some(value) = headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+    {
         return Some(value.to_string());
     }
     headers
@@ -137,6 +142,8 @@ fn record_usage(
             model_name: active_model_name.to_string(),
             served_by: config.name.clone(),
             source_app: source_app.to_string(),
+            upstream_url: provider_for(config.format).endpoint(config),
+            upstream_model: config.model.clone(),
             inbound_protocol: inbound.as_str().to_string(),
             upstream_protocol: config.format.as_str().to_string(),
             input_tokens,
@@ -198,7 +205,11 @@ async fn models() -> Response {
     )
 }
 
-async fn messages(State(stats): State<Arc<GatewayStats>>, headers: HeaderMap, body: Bytes) -> Response {
+async fn messages(
+    State(stats): State<Arc<GatewayStats>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     route(ModelFormat::AnthropicMessages, stats, headers, body).await
 }
 
@@ -245,6 +256,8 @@ async fn route(
             let RouteFailure {
                 error,
                 upstream_response,
+                upstream_url,
+                upstream_model,
             } = failure;
             stats.record_error(&error.to_string());
             let message = error.to_string();
@@ -263,6 +276,8 @@ async fn route(
                     model_name: active_name,
                     served_by: String::new(),
                     source_app,
+                    upstream_url,
+                    upstream_model,
                     inbound_protocol: inbound.as_str().to_string(),
                     upstream_protocol: String::new(),
                     input_tokens: 0,
@@ -300,10 +315,12 @@ struct UpstreamFailure {
     raw_response: Option<String>,
 }
 
-/// 透传给 `route()` 的失败信息：错误本身 + 上游原始报文，供失败记录落库展示。
+/// 透传给 `route()` 的失败信息：错误本身 + 上游原始报文 + 最后尝试的地址与模型，供失败记录落库展示。
 struct RouteFailure {
     error: AppError,
     upstream_response: Option<String>,
+    upstream_url: String,
+    upstream_model: String,
 }
 
 impl From<AppError> for RouteFailure {
@@ -311,6 +328,8 @@ impl From<AppError> for RouteFailure {
         Self {
             error,
             upstream_response: None,
+            upstream_url: String::new(),
+            upstream_model: String::new(),
         }
     }
 }
@@ -413,8 +432,14 @@ async fn handle(
     let mut chosen: Option<(ModelConfig, reqwest::Response, Value)> = None;
     let mut failover_used = false;
     let mut last_error: Option<UpstreamFailure> = None;
+    // 最后一次真正发起（或尝试发起）的上游地址与模型，供失败记录展示。
+    let mut last_attempt: Option<(String, String)> = None;
 
     for (index, candidate) in candidates.iter().enumerate() {
+        last_attempt = Some((
+            provider_for(candidate.format).endpoint(candidate),
+            candidate.model.clone(),
+        ));
         match dispatch(&request, &headers, candidate).await {
             Ok((response, payload)) => {
                 if index > 0 {
@@ -434,10 +459,13 @@ async fn handle(
     }
 
     let Some((config, upstream, upstream_payload)) = chosen else {
+        let (upstream_url, upstream_model) = last_attempt.unwrap_or_default();
         return Err(match last_error {
             Some(failure) => RouteFailure {
                 error: failure.error,
                 upstream_response: failure.raw_response,
+                upstream_url,
+                upstream_model,
             },
             None => RouteFailure::from(AppError::Message("没有可用的上游模型".into())),
         });

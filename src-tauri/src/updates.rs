@@ -241,7 +241,8 @@ mod tests {
     use super::{is_newer, parse_latest, resolve_probe_url};
 
     const RELEASES_URL: &str = "https://downloads.claude.ai/releases/win32/x64/RELEASES";
-    const MIRROR_URL: &str = "https://api.github.com/repos/Wangnov/claude-app-mirror/releases/latest";
+    const MIRROR_URL: &str =
+        "https://api.github.com/repos/Wangnov/claude-app-mirror/releases/latest";
     const WORKBUDDY_TEMPLATE: &str =
         "https://copilot.tencent.com/v2/update?platform=workbuddy-win32-x64-user&version={version}";
     const WORKBUDDY_URL: &str =
@@ -251,12 +252,16 @@ mod tests {
     fn reads_newest_asset_from_squirrel_releases() {
         let body = "AAA111 AnthropicClaude-2.2449.0-full.nupkg 254988501\n\
                     BBB222 AnthropicClaude-2.7032.0-full.nupkg 254988501\n";
-        assert_eq!(parse_latest(body, RELEASES_URL).as_deref(), Some("2.7032.0"));
+        assert_eq!(
+            parse_latest(body, RELEASES_URL).as_deref(),
+            Some("2.7032.0")
+        );
     }
 
     #[test]
     fn reads_tag_from_github_release() {
-        let body = r#"{ "tag_name": "claude-app-v2.7032.0", "name": "Claude App Mirror 2.7032.0" }"#;
+        let body =
+            r#"{ "tag_name": "claude-app-v2.7032.0", "name": "Claude App Mirror 2.7032.0" }"#;
         assert_eq!(parse_latest(body, MIRROR_URL).as_deref(), Some("2.7032.0"));
     }
 

@@ -241,12 +241,24 @@ experimental_bearer_token = "<该应用专属的网关 Key>"
   `/model` 菜单与请求路由不受此限制。目录里若没有可克隆的条目（例如从未配过自定义模型），
   应用只写 provider 而不动目录，并在结果里说明。
 
-### 「手动应用」的客户端
+### ZCode 的接入方式
 
-ZCode（智谱 GLM 官方 ADE）只能在 GUI 里手动添加「自定义 / OpenAI 兼容」供应商，官方未公开
-配置文件格式，因此走 `ApplyMode::Manual`：`ManualConfigurator` **不写任何第三方文件**，
-点「应用」只记录绑定并弹出「对接说明」（接口地址 / API Key / 模型名称 / 协议格式 + 调用示例，
-逐项可复制），由用户照着填写。
+ZCode（智谱 GLM 官方 ADE 桌面端）把模型供应商落盘在数据目录的 `v2/config.json`（数据根由
+`ZCODE_DATA_BASE_DIR` 决定，其次 `HOME`，默认 `%USERPROFILE%\.zcode\v2\config.json`），
+因此走 `ApplyMode::DirectConfig`：`platform/zcode.rs` 把 aiStart 的一条供应商**合并**进顶层
+`provider` 表，其它供应商与未知字段原样保留。
+
+- 顶层 `provider` 是 `id → 供应商` 的表：内置供应商用 `builtin:<name>` 作 key，GUI 里加的
+  自定义供应商用 UUID。aiStart 固定用 `aistart` 作 id，重复应用只覆盖自己。
+- 每条供应商用 `kind` 决定线协议，ZCode 会按 kind 自行接上路径：`anthropic` → `/v1/messages`、
+  `openai` → `/responses`、`openai-compatible` → `/chat/completions`。本应用用 `anthropic`
+  （ZCode 自带的供应商全是这一档），所以 `options.baseURL` 只填网关**源地址**，最终地址即
+  `http://127.0.0.1:<port>/v1/messages`。
+- 凭据写在 `options.apiKey`（该应用专属的网关 Key），地址在 `options.baseURL`。
+- **不写 `credentials.json`**：那里是 `enc:v1:` 加密的官方登录缓存。
+- 只合并 aiStart 自己的那一条，「移除模型配置」也只删这一条；`provider` 表因此空了就顺手收干净，
+  文件若只剩空白说明是我们建的，会直接删掉还原成「从未配置」。
+- 自定义供应商需在 ZCode 的**模型选择器里选一次**才成为当前模型；改完完全退出重开生效。
 
 - 安装/更新目前只配了 `Manual` 兜底（打开官方下载页）；`upgrade` 里的探测锚点（进程名、注册表
   `DisplayName`、安装位置）标为「待实测」，装上后按实际值回填，届时再接自动下载/静默安装。

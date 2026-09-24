@@ -199,6 +199,16 @@ function goBack(): void {
                   {{ formatLatency(record.durationMs) }}
                 </span>
               </span>
+              <span class="inline-flex w-full min-w-0 items-center gap-1.5">
+                <span class="shrink-0 text-muted-foreground">接口地址</span>
+                <span class="font-mono font-medium break-all">{{ record.upstreamUrl || "—" }}</span>
+              </span>
+              <span class="inline-flex w-full min-w-0 items-center gap-1.5">
+                <span class="shrink-0 text-muted-foreground">上游模型</span>
+                <span class="font-mono font-medium break-all">{{
+                  record.upstreamModel || record.servedBy || "—"
+                }}</span>
+              </span>
             </div>
 
             <dl

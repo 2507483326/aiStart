@@ -122,7 +122,11 @@ impl ModelProvider for AnthropicMessagesProvider {
         Ok(vec![SseEvent::new(name, data.clone())])
     }
 
-    fn decode_stream_done(&self, _cfg: &ModelConfig, state: &mut StreamState) -> AppResult<Vec<SseEvent>> {
+    fn decode_stream_done(
+        &self,
+        _cfg: &ModelConfig,
+        state: &mut StreamState,
+    ) -> AppResult<Vec<SseEvent>> {
         if state.finished {
             return Ok(Vec::new());
         }

@@ -51,6 +51,23 @@ export const useModelsStore = defineStore("models", {
       await this.refresh();
       return true;
     },
+    async duplicate(model: ModelConfig): Promise<boolean> {
+      const saved = await attempt(
+        () =>
+          modelApi.save({
+            name: `${model.name} 副本`,
+            format: model.format,
+            baseUrl: model.baseUrl,
+            apiKey: model.apiKey,
+            model: model.model,
+            supports1m: model.supports1m,
+          }),
+        { success: "模型已复制", error: "复制模型失败" },
+      );
+      if (!saved) return false;
+      await this.refresh();
+      return true;
+    },
     async remove(id: number): Promise<boolean> {
       const next = await attempt(() => modelApi.remove(id), {
         success: "模型已删除",

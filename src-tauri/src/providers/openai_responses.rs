@@ -180,7 +180,10 @@ impl ModelProvider for OpenaiResponsesProvider {
                         }
                     }
                     Some("function_call") => {
-                        let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or("{}");
+                        let arguments = item
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .unwrap_or("{}");
                         content.push(json!({
                             "type": "tool_use",
                             "id": item.get("call_id").and_then(Value::as_str).unwrap_or_default(),
@@ -334,7 +337,11 @@ impl ModelProvider for OpenaiResponsesProvider {
         Ok(events)
     }
 
-    fn decode_stream_done(&self, _cfg: &ModelConfig, state: &mut StreamState) -> AppResult<Vec<SseEvent>> {
+    fn decode_stream_done(
+        &self,
+        _cfg: &ModelConfig,
+        state: &mut StreamState,
+    ) -> AppResult<Vec<SseEvent>> {
         if state.finished {
             return Ok(Vec::new());
         }
@@ -481,8 +488,12 @@ impl ModelProvider for OpenaiResponsesProvider {
             .unwrap_or_default()
         {
             match block.get("type").and_then(Value::as_str) {
-                Some("text") => text
-                    .push_str(block.get("text").and_then(Value::as_str).unwrap_or_default()),
+                Some("text") => text.push_str(
+                    block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                ),
                 Some("thinking") => reasoning.push_str(
                     block
                         .get("thinking")
@@ -652,7 +663,10 @@ impl ModelProvider for OpenaiResponsesProvider {
                 match delta.get("type").and_then(Value::as_str) {
                     Some("text_delta") => {
                         let mut events = open_text_item(state);
-                        let text = delta.get("text").and_then(Value::as_str).unwrap_or_default();
+                        let text = delta
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
                         state.text_buffer.push_str(text);
                         events.push(responses_event(
                             "response.output_text.delta",
@@ -721,10 +735,7 @@ impl ModelProvider for OpenaiResponsesProvider {
                 )]
             }
             "message_delta" => {
-                if let Some(output) = data
-                    .pointer("/usage/output_tokens")
-                    .and_then(Value::as_u64)
-                {
+                if let Some(output) = data.pointer("/usage/output_tokens").and_then(Value::as_u64) {
                     state.output_tokens = output;
                 }
                 Vec::new()

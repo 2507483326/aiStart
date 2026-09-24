@@ -60,7 +60,10 @@ fn encode_tool_choice(choice: &Value) -> Option<Value> {
         "any" => Value::String("required".into()),
         "none" => Value::String("none".into()),
         "tool" => {
-            let name = choice.get("name").and_then(Value::as_str).unwrap_or_default();
+            let name = choice
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             json!({ "type": "function", "function": { "name": name } })
         }
         _ => Value::String("auto".into()),
@@ -142,7 +145,8 @@ impl ModelProvider for OpenaiCompletionsProvider {
                     pending_parts.push(json!({ "type": "text", "text": block.text_value() }));
                 } else if block.is("image") {
                     if let Some(url) = image_url_from_block(block) {
-                        pending_parts.push(json!({ "type": "image_url", "image_url": { "url": url } }));
+                        pending_parts
+                            .push(json!({ "type": "image_url", "image_url": { "url": url } }));
                     }
                 } else if let Some(result) = block.tool_result() {
                     flush(&mut pending_parts, &mut messages);
@@ -353,7 +357,11 @@ impl ModelProvider for OpenaiCompletionsProvider {
         Ok(events)
     }
 
-    fn decode_stream_done(&self, _cfg: &ModelConfig, state: &mut StreamState) -> AppResult<Vec<SseEvent>> {
+    fn decode_stream_done(
+        &self,
+        _cfg: &ModelConfig,
+        state: &mut StreamState,
+    ) -> AppResult<Vec<SseEvent>> {
         if state.finished {
             return Ok(Vec::new());
         }
@@ -379,7 +387,10 @@ impl ModelProvider for OpenaiCompletionsProvider {
             .map(Vec::as_slice)
             .unwrap_or_default()
         {
-            let role = message.get("role").and_then(Value::as_str).unwrap_or("user");
+            let role = message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("user");
             match role {
                 "system" | "developer" => system_parts.push(content_to_text(
                     message.get("content").unwrap_or(&Value::Null),
@@ -520,8 +531,12 @@ impl ModelProvider for OpenaiCompletionsProvider {
             .unwrap_or_default()
         {
             match block.get("type").and_then(Value::as_str) {
-                Some("text") => text
-                    .push_str(block.get("text").and_then(Value::as_str).unwrap_or_default()),
+                Some("text") => text.push_str(
+                    block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                ),
                 Some("thinking") => reasoning.push_str(
                     block
                         .get("thinking")
@@ -647,7 +662,10 @@ impl ModelProvider for OpenaiCompletionsProvider {
                 };
                 match delta.get("type").and_then(Value::as_str) {
                     Some("text_delta") => {
-                        let text = delta.get("text").and_then(Value::as_str).unwrap_or_default();
+                        let text = delta
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
                         state.text_buffer.push_str(text);
                         vec![chunk(state, json!({ "content": text }), None)]
                     }
@@ -676,9 +694,7 @@ impl ModelProvider for OpenaiCompletionsProvider {
                 }
             }
             "message_delta" => {
-                let reason = data
-                    .pointer("/delta/stop_reason")
-                    .and_then(Value::as_str);
+                let reason = data.pointer("/delta/stop_reason").and_then(Value::as_str);
                 vec![chunk(state, json!({}), Some(map_finish_reason(reason)))]
             }
             "error" => vec![canonical.clone()],

@@ -99,11 +99,10 @@ onMounted(() => {
       </div>
 
       <div
+        v-if="pageCount > 1"
         class="flex items-center justify-between gap-3 border-t pt-3 text-xs text-muted-foreground"
       >
-        <span>{{ rangeLabel }}</span>
         <div class="flex items-center gap-2">
-          <span class="tabular-nums">第 {{ page }} / {{ pageCount }} 页</span>
           <Button
             variant="outline"
             size="xs"
@@ -120,7 +119,9 @@ onMounted(() => {
           >
             下一页
           </Button>
+          <span class="tabular-nums">第 {{ page }} / {{ pageCount }} 页</span>
         </div>
+        <span>{{ rangeLabel }}</span>
       </div>
     </div>
 

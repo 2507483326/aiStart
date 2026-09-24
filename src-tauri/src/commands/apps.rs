@@ -51,12 +51,16 @@ fn build_app_view(
 ) -> ToolApp {
     let configurator = platform::configurator_for(kind);
     let descriptor = configurator.descriptor();
-    let detect = configurator.detect().unwrap_or_else(|_| DetectResult::missing());
+    let detect = configurator
+        .detect()
+        .unwrap_or_else(|_| DetectResult::missing());
     let applied = applied.filter(|_| configurator.is_configured().unwrap_or(false));
     let (latest_version, update_available) = resolve_update(
         known.and_then(|snapshot| snapshot.latest_version.clone()),
         detect.version.as_deref(),
-        known.map(|snapshot| snapshot.update_available).unwrap_or(false),
+        known
+            .map(|snapshot| snapshot.update_available)
+            .unwrap_or(false),
     );
 
     ToolApp {
@@ -138,7 +142,11 @@ pub async fn check_app_updates() -> AppResult<Vec<AppUpdate>> {
                         Some(latest),
                         found.as_ref().map(|found| found.source_url.as_str()),
                         update_available,
-                        if update_available { "found" } else { "up-to-date" },
+                        if update_available {
+                            "found"
+                        } else {
+                            "up-to-date"
+                        },
                         None,
                     );
                     AppUpdate {
@@ -157,7 +165,9 @@ pub async fn check_app_updates() -> AppResult<Vec<AppUpdate>> {
                     let (latest_version, update_available) = resolve_update(
                         latest_version,
                         installed,
-                        previous.map(|snapshot| snapshot.update_available).unwrap_or(false),
+                        previous
+                            .map(|snapshot| snapshot.update_available)
+                            .unwrap_or(false),
                     );
                     AppUpdate {
                         kind: *kind,
@@ -353,9 +363,7 @@ async fn run_install(app: &AppHandle, kind: AppKind, action: &str) -> AppResult<
         Err(error) => {
             app.opener()
                 .open_url(descriptor.download_page.clone(), None::<&str>)
-                .map_err(|open_error| {
-                    AppError::Message(format!("打开下载页失败: {open_error}"))
-                })?;
+                .map_err(|open_error| AppError::Message(format!("打开下载页失败: {open_error}")))?;
 
             Ok(InstallReport {
                 kind,

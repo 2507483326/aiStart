@@ -117,7 +117,9 @@ impl GatewayStats {
 static STATS: OnceLock<Arc<GatewayStats>> = OnceLock::new();
 
 pub fn stats() -> Arc<GatewayStats> {
-    STATS.get_or_init(|| Arc::new(GatewayStats::default())).clone()
+    STATS
+        .get_or_init(|| Arc::new(GatewayStats::default()))
+        .clone()
 }
 
 /// 用数据库中的全量累计值初始化计数器，使面板数据跨重启保留。
@@ -127,8 +129,12 @@ pub fn hydrate() {
     let stats = stats();
     stats.requests.store(totals.requests, Ordering::Relaxed);
     stats.errors.store(totals.failed, Ordering::Relaxed);
-    stats.input_tokens.store(totals.input_tokens, Ordering::Relaxed);
-    stats.output_tokens.store(totals.output_tokens, Ordering::Relaxed);
+    stats
+        .input_tokens
+        .store(totals.input_tokens, Ordering::Relaxed);
+    stats
+        .output_tokens
+        .store(totals.output_tokens, Ordering::Relaxed);
     stats.failovers.store(totals.failovers, Ordering::Relaxed);
 }
 

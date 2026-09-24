@@ -345,9 +345,7 @@ pub fn persist() -> AppResult<()> {
                 .app_tokens
                 .get(app_kind)
                 .cloned()
-                .or_else(|| {
-                    AppKind::parse(app_kind).map(|kind| kind.gateway_token().to_string())
-                })
+                .or_else(|| AppKind::parse(app_kind).map(|kind| kind.gateway_token().to_string()))
                 .unwrap_or_default();
             transaction.execute(
                 "INSERT INTO app_model_bindings (app_kind, model_id, token, created_time, update_time) VALUES (?1, ?2, ?3, ?4, ?4)",
@@ -374,7 +372,10 @@ pub fn mutate<T>(f: impl FnOnce(&mut Settings) -> T) -> AppResult<T> {
 
 pub fn deepseek_config_path() -> String {
     let settings = snapshot();
-    if let Some(path) = settings.deepseek_config_path.filter(|path| !path.trim().is_empty()) {
+    if let Some(path) = settings
+        .deepseek_config_path
+        .filter(|path| !path.trim().is_empty())
+    {
         return crate::platform::expand_env(&path);
     }
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));

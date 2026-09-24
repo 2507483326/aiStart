@@ -68,6 +68,8 @@ export interface UsageRecord {
   modelName: string;
   servedBy: string;
   sourceApp: string;
+  upstreamUrl: string;
+  upstreamModel: string;
   inboundProtocol: string;
   upstreamProtocol: string;
   inputTokens: number;

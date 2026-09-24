@@ -1,5 +1,5 @@
 -- =====================================================================
--- AI Start SQLite schema v5（db_schema_version = 5）
+-- AI Start SQLite schema v6（db_schema_version = 6）
 -- v1 首次落库：app_settings / models / app_model_bindings（配置与模型，取代 settings.json）、
 -- usage_detail / usage_daily_total（token 消耗，取代 usage.jsonl）、events（审计事件）、
 -- app_version_records（应用版本检查与更新记录）。
@@ -7,6 +7,7 @@
 -- v3 新增：request_filters（请求转发前按规则改写请求的过滤器）。
 -- v4 新增：usage_detail.source_app（请求来源应用 / 原样 token）、app_model_bindings.token（应用专属网关 Key）。
 -- v5 新增：usage_payload.upstream_request / upstream_request_truncated（提示词注入后实际发往上游的请求体）。
+-- v6 新增：usage_detail.upstream_url / upstream_model（实际发往上游的接口地址与模型 ID，供「请求详情」展示）。
 --
 -- 规范（对齐 eTeam：C:\eTeam\src\host\state\schema.sql）：
 --   主键 = 每张表自己的编号列，统一 INTEGER 自增（仅 schema_meta / app_settings 以 key 为主键，
@@ -53,6 +54,8 @@ CREATE TABLE IF NOT EXISTS usage_detail (
   failover          INTEGER NOT NULL DEFAULT 0,   -- 1=由自动切换接手 / 0=否
   error             TEXT,                   -- 失败原因；成功为 NULL
   source_app        TEXT NOT NULL DEFAULT '',  -- 来源应用：按请求 token 匹配到的 app_kind；未匹配则原样存该 token；''=历史数据/未记录
+  upstream_url      TEXT NOT NULL DEFAULT '',  -- 实际发往上游的接口地址（完整 URL，含路径）；未发起上游请求为空
+  upstream_model    TEXT NOT NULL DEFAULT '',  -- 实际发往上游的模型 ID（wire model，与显示名 served_by 不同）；未发起上游请求为空
   created_time      INTEGER NOT NULL,       -- 入库时刻
   update_time       INTEGER NOT NULL        -- 明细行只插不改，= created_time
 );

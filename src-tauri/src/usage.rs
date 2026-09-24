@@ -16,6 +16,12 @@ pub struct UsageRecord {
     /// 来源应用：按请求 token 匹配到的 app_kind；未匹配则原样存该 token；空串=历史数据/未记录。
     #[serde(default)]
     pub source_app: String,
+    /// 实际发往上游的接口地址（完整 URL，含路径）；未发起上游请求（如缺 Key、无启用模型）为空。
+    #[serde(default)]
+    pub upstream_url: String,
+    /// 实际发往上游的模型 ID（wire model，与显示名 `served_by` 不同）；未发起上游请求为空。
+    #[serde(default)]
+    pub upstream_model: String,
     pub inbound_protocol: String,
     pub upstream_protocol: String,
     pub input_tokens: u64,
@@ -118,7 +124,8 @@ pub struct UsageSummary {
 }
 
 const SELECT_COLUMNS: &str = "usage_detail_id, day, event_time, model_name, served_by, inbound_protocol, \
-     upstream_protocol, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, duration_ms, ok, failover, error, source_app";
+     upstream_protocol, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, duration_ms, ok, failover, error, source_app, \
+     upstream_url, upstream_model";
 
 fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRecord> {
     let event_time: i64 = row.get(2)?;
@@ -141,6 +148,8 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRecord> {
         failover: failover != 0,
         error: row.get(14)?,
         source_app: row.get(15)?,
+        upstream_url: row.get(16)?,
+        upstream_model: row.get(17)?,
     })
 }
 
@@ -171,8 +180,9 @@ pub fn record_with_payload(entry: &UsageRecord, payload: Option<&UsagePayload>) 
     let _ = db::with_tx(|transaction| {
         transaction.execute(
             "INSERT INTO usage_detail (day, event_time, model_name, served_by, inbound_protocol, upstream_protocol, \
-             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens, duration_ms, ok, failover, error, source_app, created_time, update_time) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)",
+             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens, duration_ms, ok, failover, error, source_app, \
+             upstream_url, upstream_model, created_time, update_time) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?19)",
             params![
                 entry.date,
                 event_time,
@@ -190,6 +200,8 @@ pub fn record_with_payload(entry: &UsageRecord, payload: Option<&UsagePayload>) 
                 i64::from(entry.failover),
                 entry.error,
                 entry.source_app,
+                entry.upstream_url,
+                entry.upstream_model,
                 event_time,
             ],
         )?;
@@ -309,9 +321,8 @@ pub fn find(usage_detail_id: i64) -> Option<UsageRecord> {
 }
 
 pub fn recent(limit: usize) -> Vec<UsageRecord> {
-    let sql = format!(
-        "SELECT {SELECT_COLUMNS} FROM usage_detail ORDER BY usage_detail_id DESC LIMIT ?1"
-    );
+    let sql =
+        format!("SELECT {SELECT_COLUMNS} FROM usage_detail ORDER BY usage_detail_id DESC LIMIT ?1");
     db::with_conn(|connection| {
         let mut statement = connection.prepare(&sql)?;
         let rows = statement.query_map(params![limit as i64], row_to_record)?;
@@ -330,9 +341,8 @@ pub fn page(offset: usize, limit: usize) -> UsagePage {
         "SELECT {SELECT_COLUMNS} FROM usage_detail ORDER BY usage_detail_id DESC LIMIT ?1 OFFSET ?2"
     );
     db::with_conn(|connection| {
-        let total: i64 = connection.query_row("SELECT COUNT(*) FROM usage_detail", [], |row| {
-            row.get(0)
-        })?;
+        let total: i64 =
+            connection.query_row("SELECT COUNT(*) FROM usage_detail", [], |row| row.get(0))?;
         let mut statement = connection.prepare(&sql)?;
         let rows = statement.query_map(params![limit as i64, offset as i64], row_to_record)?;
         let mut items = Vec::new();
@@ -407,16 +417,18 @@ pub fn summary(days: u32) -> UsageSummary {
             summary.today_tokens += entry.total_tokens();
         }
 
-        let bucket = daily.entry(entry.date.clone()).or_insert_with(|| DailyUsage {
-            date: entry.date.clone(),
-            requests: 0,
-            failed: 0,
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-            total_tokens: 0,
-        });
+        let bucket = daily
+            .entry(entry.date.clone())
+            .or_insert_with(|| DailyUsage {
+                date: entry.date.clone(),
+                requests: 0,
+                failed: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                total_tokens: 0,
+            });
         bucket.requests += 1;
         if !entry.ok {
             bucket.failed += 1;

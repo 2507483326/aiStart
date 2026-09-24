@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, KEY_WOW64_64KEY};
+use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY, KEY_WRITE};
 use winreg::RegKey;
 
 use crate::domain::app::{AppDescriptor, AppKind, ApplyMode, ApplyReport};
@@ -256,7 +256,9 @@ fn adopt_meta() -> AppResult<()> {
         .get_mut("entries")
         .and_then(serde_json::Value::as_array_mut)
         .expect("an array was just ensured");
-    entries.retain(|entry| entry.get("id").and_then(serde_json::Value::as_str) != Some(CLAUDE_PROFILE_ID));
+    entries.retain(|entry| {
+        entry.get("id").and_then(serde_json::Value::as_str) != Some(CLAUDE_PROFILE_ID)
+    });
     entries.push(serde_json::json!({ "id": CLAUDE_PROFILE_ID, "name": CLAUDE_PROFILE_NAME }));
     object.insert("appliedId".into(), serde_json::json!(CLAUDE_PROFILE_ID));
     write_meta(&meta)
@@ -276,14 +278,11 @@ fn release_meta() -> AppResult<()> {
         .get_mut("entries")
         .and_then(serde_json::Value::as_array_mut)
     {
-        entries
-            .retain(|entry| entry.get("id").and_then(serde_json::Value::as_str) != Some(CLAUDE_PROFILE_ID));
+        entries.retain(|entry| {
+            entry.get("id").and_then(serde_json::Value::as_str) != Some(CLAUDE_PROFILE_ID)
+        });
     }
-    if object
-        .get("appliedId")
-        .and_then(serde_json::Value::as_str)
-        == Some(CLAUDE_PROFILE_ID)
-    {
+    if object.get("appliedId").and_then(serde_json::Value::as_str) == Some(CLAUDE_PROFILE_ID) {
         let next = object
             .get("entries")
             .and_then(serde_json::Value::as_array)
@@ -304,10 +303,7 @@ fn release_meta() -> AppResult<()> {
 pub fn detect_by_descriptor(descriptor: &AppDescriptor) -> DetectResult {
     if let Some(prefix) = descriptor.upgrade.msix_name_prefix.as_deref() {
         if let Some(package) = find_msix(&[prefix]) {
-            return DetectResult::found(
-                package.location.unwrap_or(package.name),
-                package.version,
-            );
+            return DetectResult::found(package.location.unwrap_or(package.name), package.version);
         }
     }
 

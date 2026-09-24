@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref, watch } from "vue";
-import { CircleCheck, LoaderCircle, Pencil, Play, Trash2, Wifi } from "lucide";
+import { CircleCheck, Copy, LoaderCircle, Pencil, Play, Trash2, Wifi } from "lucide";
 
 import ConfirmDialog from "@/components/common/ConfirmDialog.vue";
 import FormatBadge from "@/components/common/FormatBadge.vue";
@@ -20,7 +20,8 @@ const props = defineProps<{
 
 const emit = defineEmits<{ edit: [model: ModelConfig] }>();
 
-const { activate, remove, test, testingId, save, upstreamCache } = useModels();
+const { activate, duplicate, remove, test, testingId, save, prefetchUpstream, upstreamCache } =
+  useModels();
 
 const testing = computed(() => testingId.value === props.model.id);
 const result = ref<TestResult | null>(null);
@@ -78,6 +79,10 @@ async function commitModelId() {
 
 function blurOnEnter(event: KeyboardEvent) {
   (event.target as HTMLInputElement).blur();
+}
+
+async function duplicateModel() {
+  if (await duplicate(props.model)) prefetchUpstream();
 }
 </script>
 
@@ -150,6 +155,9 @@ function blurOnEnter(event: KeyboardEvent) {
         测试
       </Button>
 
+      <Button variant="ghost" size="icon-xs" title="复制模型" @click="duplicateModel">
+        <MorphIconBox :icon="Copy" :size="14" />
+      </Button>
       <Button variant="ghost" size="icon-xs" @click="emit('edit', model)">
         <MorphIconBox :icon="Pencil" :size="14" />
       </Button>

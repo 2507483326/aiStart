@@ -9,6 +9,7 @@ export function useModels() {
     refresh: store.refresh,
     loadMeta: store.loadMeta,
     save: store.save,
+    duplicate: store.duplicate,
     remove: store.remove,
     activate: store.activate,
     test: store.test,

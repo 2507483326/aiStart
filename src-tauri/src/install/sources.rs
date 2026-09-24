@@ -106,7 +106,10 @@ pub async fn resolve(kind: AppKind, spec: &UpgradeSpec) -> AppResult<ResolveOutc
                 "{} 的版本 {} 落后于探测到的最新版 {}",
                 source_label(source),
                 asset.version.as_deref().unwrap_or("未知"),
-                probed.as_ref().map(|f| f.version.as_str()).unwrap_or("未知"),
+                probed
+                    .as_ref()
+                    .map(|f| f.version.as_str())
+                    .unwrap_or("未知"),
             );
             record_stale(kind, &detail);
             problems.push(detail);
@@ -215,9 +218,7 @@ async fn prefer_mirror(kind: AppKind, asset: ReleaseAsset, mirror: &ReleaseSourc
     // 依据一：包大小。最便宜，实测可用（镜像与 GitHub 都是 287766830）。
     if let (Some(expected), Some(actual)) = (asset.size, head.size) {
         if expected != actual {
-            let detail = format!(
-                "镜像包大小 {actual} 与权威源 {expected} 不一致，判为过期",
-            );
+            let detail = format!("镜像包大小 {actual} 与权威源 {expected} 不一致，判为过期",);
             record_stale(kind, &detail);
             return asset;
         }
@@ -229,9 +230,7 @@ async fn prefer_mirror(kind: AppKind, asset: ReleaseAsset, mirror: &ReleaseSourc
         match fetch_checksums(endpoint, &head.file_name).await {
             Some(actual) if actual.eq_ignore_ascii_case(expected) => validated = true,
             Some(actual) => {
-                let detail = format!(
-                    "镜像校验值 {actual} 与权威源 {expected} 不一致，判为过期",
-                );
+                let detail = format!("镜像校验值 {actual} 与权威源 {expected} 不一致，判为过期",);
                 record_stale(kind, &detail);
                 return asset;
             }
@@ -546,7 +545,8 @@ mod tests {
 
     #[test]
     fn rejects_a_release_without_a_matching_asset() {
-        let error = GithubRelease::parse(&claude_release_json(), "Claude-win-x86.msix").unwrap_err();
+        let error =
+            GithubRelease::parse(&claude_release_json(), "Claude-win-x86.msix").unwrap_err();
         assert!(error.to_string().contains("没有匹配"));
     }
 
@@ -576,7 +576,8 @@ mod tests {
     #[test]
     fn parses_filename_from_content_disposition() {
         assert_eq!(
-            parse_content_disposition_filename("attachment; filename=\"Claude-win-x64.msix\"").as_deref(),
+            parse_content_disposition_filename("attachment; filename=\"Claude-win-x64.msix\"")
+                .as_deref(),
             Some("Claude-win-x64.msix")
         );
         assert_eq!(
@@ -596,7 +597,10 @@ mod tests {
             Some("Claude-win-x64.msix")
         );
         // 没有扩展名的路径段不算文件名（如 `.../latest/win-x64`）。
-        assert_eq!(file_name_from_url("https://example.com/latest/win-x64"), None);
+        assert_eq!(
+            file_name_from_url("https://example.com/latest/win-x64"),
+            None
+        );
         assert_eq!(file_name_from_url("https://example.com/"), None);
     }
 
@@ -606,7 +610,10 @@ mod tests {
         assert!(is_stale_authoritative(Some("2.7032.0"), Some("2.7031.0")));
         // 相等（含尾随 0 段差异）不算落后。
         assert!(!is_stale_authoritative(Some("2.7032.0"), Some("2.7032.0")));
-        assert!(!is_stale_authoritative(Some("2.7032.0"), Some("2.7032.0.0")));
+        assert!(!is_stale_authoritative(
+            Some("2.7032.0"),
+            Some("2.7032.0.0")
+        ));
         // 更高不算落后。
         assert!(!is_stale_authoritative(Some("2.7031.0"), Some("2.7032.0")));
         // 任一侧未知 → 一律不判 stale，避免把可用源全部否掉。
