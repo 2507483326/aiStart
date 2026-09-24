@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import {
+  ArrowUpToLine,
   CircleArrowUp,
   CircleCheck,
   Copy,
@@ -8,7 +9,6 @@ import {
   ExternalLink,
   LoaderCircle,
   Plug,
-  RefreshCw,
   Route,
   Trash2,
 } from "lucide";
@@ -52,7 +52,7 @@ const APP_ICONS: Record<AppKind, string> = {
 
 const busy = computed(() => busyKind.value === props.app.kind);
 const guideOpen = ref(false);
-const installIcon = computed(() => (props.app.installed ? RefreshCw : Download));
+const installIcon = computed(() => (props.app.installed ? ArrowUpToLine : Download));
 const applyIcon = computed(() =>
   props.app.appliedModelId ? CircleCheck : Plug,
 );
@@ -180,6 +180,7 @@ async function copyApiKey() {
       </Button>
 
       <Button
+        v-if="!app.installed || app.updateAvailable"
         variant="outline"
         size="xs"
         class="gap-1"

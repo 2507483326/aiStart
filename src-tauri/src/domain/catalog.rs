@@ -188,14 +188,16 @@ pub fn builtin_apps() -> Vec<AppDescriptor> {
             kind: AppKind::WorkBuddy,
             name: "WorkBuddy".into(),
             publisher: "Tencent".into(),
-            description: "腾讯 WorkBuddy AI Agent 办公工作台。在任务模型配置里添加 OpenAI 兼容的自定义模型，填入网关地址与 Key。"
+            description: "腾讯 WorkBuddy AI Agent 办公工作台。直接写入它的本地自定义模型配置（models.json），把网关地址与 Key 交给它。"
                 .into(),
             homepage: "https://www.workbuddy.ai/".into(),
             download_page: "https://www.workbuddy.ai/".into(),
             requires_gateway: true,
-            apply_mode: ApplyMode::Manual,
-            // 自定义模型在 GUI 里添加，官方未公开落盘格式；待实测后再定文件路径。
-            config_target: "WorkBuddy 设置 → 添加自定义模型（OpenAI 兼容）".into(),
+            apply_mode: ApplyMode::DirectConfig,
+            // 实测：`CustomModelsJSON` 特性已开启，WorkBuddy 会监听该文件并自动同步，
+            // 写入后无需重启。条目形如 { id, name, vendor, url, apiKey, ... }，url 必须是
+            // 以 /chat/completions 结尾的完整地址（见 `platform/workbuddy.rs`）。
+            config_target: r"%USERPROFILE%\.workbuddy\models.json".into(),
             // 实测：官方 `v2/update` feed（应用自身的更新检查接口）。它是**版本感知**的
             // ——必须带上当前已安装版本，服务端才按灰度返回「本机该升到的目标版本」；
             // 传 `0.0.0` 只会拿到一个旧目标。故 URL 用 `{version}` 占位，由
@@ -313,6 +315,15 @@ mod tests {
             .expect("WorkBuddy 应配置版本探测源");
         assert!(url.contains("copilot.tencent.com/v2/update"), "{url}");
         assert!(url.contains("{version}"), "{url}");
+    }
+
+    #[test]
+    fn workbuddy_writes_its_models_json_instead_of_going_manual() {
+        // WorkBuddy 的落盘格式已实测（`CustomModelsJSON` 特性开启，文件会被监听），
+        // 因此它必须走 `DirectConfig`；退回 `Manual` 说明有人把写入逻辑删了。
+        let workbuddy = builtin_app(AppKind::WorkBuddy);
+        assert_eq!(workbuddy.apply_mode, ApplyMode::DirectConfig);
+        assert!(workbuddy.config_target.contains("models.json"), "{}", workbuddy.config_target);
     }
 
     #[test]

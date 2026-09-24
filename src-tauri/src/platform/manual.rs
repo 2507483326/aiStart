@@ -43,7 +43,7 @@ impl AppConfigurator for ManualConfigurator {
             .contains_key(self.kind.as_str()))
     }
 
-    /// 这三个客户端都只认单个模型入口，给网关别名一个就够。
+    /// 这两个客户端都只认单个模型入口，给网关别名一个就够。
     fn exposed_models(&self) -> Vec<ModelChoice> {
         vec![gateway_alias_choice()]
     }
@@ -56,7 +56,6 @@ impl AppConfigurator for ManualConfigurator {
         // 各应用支持的协议不同，说明里要写清楚，否则用户会在 GUI 里选错格式。
         let protocol = match self.kind {
             AppKind::Codex => "Responses",
-            AppKind::WorkBuddy => "OpenAI 兼容（Chat Completions）",
             AppKind::ZCode => "Chat Completions / Responses / Anthropic Messages（任选其一）",
             _ => "OpenAI 兼容",
         };
@@ -124,30 +123,31 @@ mod tests {
                 updated_at: String::new(),
             },
             gateway_base_url: "http://127.0.0.1:8931".into(),
-            gateway_token: "workbuddy".into(),
+            gateway_token: "codex".into(),
             model_choices: vec![gateway_alias_choice()],
         }
     }
 
     #[test]
     fn apply_is_manual_and_spells_out_the_connection_details() {
-        let report = ManualConfigurator::new(AppKind::WorkBuddy)
+        let report = ManualConfigurator::new(AppKind::Codex)
             .apply(&context())
             .expect("manual apply never fails");
 
         assert_eq!(report.apply_mode, ApplyMode::Manual);
-        assert_eq!(report.kind, AppKind::WorkBuddy);
+        assert_eq!(report.kind, AppKind::Codex);
 
         let text = report.steps.join("\n");
         assert!(text.contains("http://127.0.0.1:8931/v1"), "{text}");
-        assert!(text.contains("workbuddy"), "{text}");
+        assert!(text.contains("codex"), "{text}");
+        assert!(text.contains("Responses"), "{text}");
         // 模型名走网关别名，与其它客户端一致。
         assert!(text.contains(GATEWAY_ALIAS), "{text}");
     }
 
     #[test]
     fn each_manual_app_exposes_exactly_one_gateway_entry() {
-        for kind in [AppKind::Codex, AppKind::ZCode, AppKind::WorkBuddy] {
+        for kind in [AppKind::Codex, AppKind::ZCode] {
             let models = ManualConfigurator::new(kind).exposed_models();
             assert_eq!(models.len(), 1);
             assert_eq!(models[0].id, GATEWAY_ALIAS);

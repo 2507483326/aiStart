@@ -188,16 +188,31 @@ DeepSeek Desktop 没有公开的程序化配置格式，因此这里是**按最�
 （默认位置 `%APPDATA%\DeepSeek\config.json`，可在「设置」中改成你安装版本的真实路径）。
 这一点在应用卡片与保存提示中都会明确说明。
 
+### WorkBuddy 的说明
+
+WorkBuddy 的本地自定义模型就落在**用户级**的 `%USERPROFILE%\.workbuddy\models.json`。
+实测它的 `CustomModelsJSON` 特性已开启，内置 provider 会**监听**该文件（约 1s 去抖后自动同步），
+因此这里走 `ApplyMode::DirectConfig`：`platform/workbuddy.rs` 把 aiStart 的条目**合并**进那个数组，
+其它模型与整体形状保持不变。
+
+- 条目形如
+  `{ "id": "aiStart", "name": "aiStart", "vendor": "aiStart", "url": "http://127.0.0.1:8931/v1/chat/completions", "apiKey": "workbuddy", "supportsToolCall": true, ... }`。
+  `url` 必须是**完整**地址且以 `/chat/completions` 结尾 —— WorkBuddy 的校验规则与 GUI 占位符都是这个形状，
+  带该后缀时运行时不会再自动补全。
+- **不写 `availableModels`**：WorkBuddy 一旦读到该字段就用它**替换**可用模型集合（不与内置模型合并），
+  写了会把自带模型全部隐藏。
+- 写完后**无需重启**，新建一个对话即可刷新模型选择器。企业管理员若禁用了「个人自定义模型」，该条目会被忽略。
+
 ### 「手动应用」的客户端
 
-Codex（OpenAI 的 ChatGPT 桌面版）、ZCode（智谱 GLM 官方 ADE）、WorkBuddy（腾讯 AI Agent 办公工作台）
-只能在各自 GUI 里手动添加「自定义 / OpenAI 兼容」供应商，官方未公开配置文件格式，因此这三个走
-`ApplyMode::Manual`：`ManualConfigurator` **不写任何第三方文件**，点「应用」只记录绑定并弹出
+Codex（OpenAI 的 ChatGPT 桌面版）、ZCode（智谱 GLM 官方 ADE）只能在各自 GUI 里手动添加
+「自定义 / OpenAI 兼容」供应商，官方未公开配置文件格式，因此这两个走 `ApplyMode::Manual`：
+`ManualConfigurator` **不写任何第三方文件**，点「应用」只记录绑定并弹出
 「对接说明」（接口地址 / API Key / 模型名称 / 协议格式 + 调用示例，逐项可复制），由用户照着填写。
 
 - Codex 与 Codex CLI 共用 Codex home（`%USERPROFILE%\.codex`），协议为 **Responses**（`wire_api = "responses"`），
   待实测确认桌面版读取该文件后再评估是否升级为 `DirectConfig`。
-- 三者的安装/更新目前只配了 `Manual` 兜底（打开官方下载页）；`upgrade` 里的探测锚点（进程名、注册表
+- 两者的安装/更新目前只配了 `Manual` 兜底（打开官方下载页）；`upgrade` 里的探测锚点（进程名、注册表
   `DisplayName`、安装位置）标为「待实测」，装上后按实际值回填，届时再接自动下载/静默安装。
 
 ---

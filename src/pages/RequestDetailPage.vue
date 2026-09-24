@@ -45,14 +45,36 @@ const record = computed(() => detail.value?.record ?? null);
 const payload = computed(() => detail.value?.payload ?? null);
 const sourceIcon = computed(() => (record.value ? sourceAppIcon(record.value.sourceApp) : null));
 
-const requestView = computed(() =>
-  parseRequest(payload.value?.inboundRequest ?? null, record.value?.inboundProtocol ?? ""),
-);
-const upstreamRequestView = computed(() =>
-  parseRequest(payload.value?.upstreamRequest ?? null, record.value?.upstreamProtocol ?? ""),
-);
 const responseView = computed(() =>
   parseResponse(payload.value?.upstreamResponse ?? null, record.value?.upstreamProtocol ?? ""),
+);
+
+/** 只展示一份请求：优先上游报文（提示词注入后的实际请求），旧记录没有时退回入站报文。 */
+const requestRaw = computed(() => {
+  const value = payload.value;
+  if (!value) return { text: null, truncated: false, protocol: "", upstream: false };
+  if (value.upstreamRequest) {
+    return {
+      text: value.upstreamRequest,
+      truncated: value.upstreamRequestTruncated,
+      protocol: record.value?.upstreamProtocol ?? "",
+      upstream: true,
+    };
+  }
+  return {
+    text: value.inboundRequest,
+    truncated: value.requestTruncated,
+    protocol: record.value?.inboundProtocol ?? "",
+    upstream: false,
+  };
+});
+
+const requestView = computed(() => parseRequest(requestRaw.value.text, requestRaw.value.protocol));
+
+const requestDescription = computed(() =>
+  requestRaw.value.upstream
+    ? "提示词注入后，实际发往上游的请求"
+    : "客户端发来的原始请求（本次未记录上游报文）",
 );
 
 const responseDescription = computed(() => {
@@ -212,9 +234,9 @@ function goBack(): void {
             <ToolDefinitions :tools="requestView.tools" />
           </CollapsibleCard>
 
-          <CollapsibleCard title="入站请求" description="客户端发来的原始请求">
+          <CollapsibleCard title="上游请求" :description="requestDescription">
             <template #action>
-              <Badge v-if="payload.requestTruncated" variant="outline">已截断</Badge>
+              <Badge v-if="requestRaw.truncated" variant="outline">已截断</Badge>
             </template>
 
             <template v-if="requestView">
@@ -233,43 +255,9 @@ function goBack(): void {
             </template>
             <RawPayload
               v-else
-              :raw="payload.inboundRequest"
+              :raw="requestRaw.text"
               label="原始请求（无法解析）"
-              :truncated="payload.requestTruncated"
-            />
-          </CollapsibleCard>
-
-          <CollapsibleCard
-            v-if="payload.upstreamRequest"
-            title="上游请求"
-            description="提示词注入后，实际发往上游的请求"
-          >
-            <template #action>
-              <Badge v-if="payload.upstreamRequestTruncated" variant="outline">已截断</Badge>
-            </template>
-
-            <template v-if="upstreamRequestView">
-              <PayloadCard
-                v-if="upstreamRequestView.system"
-                label="system"
-                :label-class="systemLabelClass"
-                :text="upstreamRequestView.system"
-              >
-                <pre
-                  class="text-xs leading-relaxed break-words whitespace-pre-wrap"
-                  >{{ upstreamRequestView.system }}</pre
-                >
-              </PayloadCard>
-              <MessageList
-                v-if="upstreamRequestView.messages.length"
-                :messages="upstreamRequestView.messages"
-              />
-            </template>
-            <RawPayload
-              v-else
-              :raw="payload.upstreamRequest"
-              label="原始请求（无法解析）"
-              :truncated="payload.upstreamRequestTruncated"
+              :truncated="requestRaw.truncated"
             />
           </CollapsibleCard>
 
@@ -306,20 +294,14 @@ function goBack(): void {
             </CardHeader>
             <CardContent class="space-y-2">
               <RawPayload
-                :raw="payload.inboundRequest"
-                label="入站请求原文"
-                :truncated="payload.requestTruncated"
-              />
-              <RawPayload
-                v-if="payload.upstreamRequest"
-                :raw="payload.upstreamRequest"
-                label="上游请求原文"
-                :truncated="payload.upstreamRequestTruncated"
+                :raw="requestRaw.text"
+                label="请求原文"
+                :truncated="requestRaw.truncated"
               />
               <RawPayload
                 v-if="payload.upstreamResponse"
                 :raw="payload.upstreamResponse"
-                label="上游响应原文"
+                label="响应原文"
                 :truncated="payload.responseTruncated"
               />
               <p v-else class="text-xs text-muted-foreground">

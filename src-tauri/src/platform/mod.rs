@@ -3,6 +3,8 @@ pub mod dsh;
 
 pub mod manual;
 
+pub mod workbuddy;
+
 #[cfg(windows)]
 pub mod windows;
 
@@ -91,18 +93,16 @@ pub fn configurator_for(kind: AppKind) -> Box<dyn AppConfigurator> {
     match kind {
         AppKind::ClaudeDesktop => Box::new(windows::ClaudeDesktopConfigurator),
         AppKind::DeepseekDesktop => Box::new(windows::DeepseekDesktopConfigurator),
-        AppKind::Codex | AppKind::ZCode | AppKind::WorkBuddy => {
-            Box::new(manual::ManualConfigurator::new(kind))
-        }
+        AppKind::WorkBuddy => Box::new(workbuddy::WorkBuddyConfigurator),
+        AppKind::Codex | AppKind::ZCode => Box::new(manual::ManualConfigurator::new(kind)),
     }
 }
 
 #[cfg(not(windows))]
 pub fn configurator_for(kind: AppKind) -> Box<dyn AppConfigurator> {
     match kind {
-        AppKind::Codex | AppKind::ZCode | AppKind::WorkBuddy => {
-            Box::new(manual::ManualConfigurator::new(kind))
-        }
+        AppKind::WorkBuddy => Box::new(workbuddy::WorkBuddyConfigurator),
+        AppKind::Codex | AppKind::ZCode => Box::new(manual::ManualConfigurator::new(kind)),
         _ => Box::new(fallback::UnsupportedConfigurator::new(kind)),
     }
 }
