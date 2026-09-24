@@ -26,6 +26,7 @@ pub fn run() {
             settings::init(&config_dir)?;
             filters::load()?;
             gateway::hydrate();
+            gateway::attach(app.handle().clone());
 
             if settings::snapshot().active_model().is_some() {
                 let _ = gateway::start();

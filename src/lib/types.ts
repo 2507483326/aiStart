@@ -188,8 +188,11 @@ export interface TestResult {
   outputTokens: number;
 }
 
+export type GatewayState = "stopped" | "starting" | "running" | "stopping";
+
 export interface GatewayStatus {
   running: boolean;
+  state: GatewayState;
   port: number;
   baseUrl: string;
   token: string;

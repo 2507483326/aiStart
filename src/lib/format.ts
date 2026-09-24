@@ -1,4 +1,4 @@
-import type { AppKind, ApplyMode, ModelFormat } from "@/lib/types";
+import type { AppKind, ApplyMode, GatewayState, ModelFormat } from "@/lib/types";
 
 export function formatNumber(value: number): string {
   return new Intl.NumberFormat("zh-CN").format(value);
@@ -92,6 +92,13 @@ export const applyModeLabels: Record<ApplyMode, string> = {
   gateway: "网关接管",
   "direct-config": "写入配置",
   manual: "手动应用",
+};
+
+export const gatewayStateLabels: Record<GatewayState, string> = {
+  stopped: "已停止",
+  starting: "启动中",
+  running: "运行中",
+  stopping: "停止中",
 };
 
 export const sourceAppLabels: Record<AppKind, string> = {

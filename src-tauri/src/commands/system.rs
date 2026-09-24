@@ -57,8 +57,8 @@ pub fn get_settings() -> SettingsView {
 }
 
 #[tauri::command]
-pub fn update_settings(input: SettingsInput) -> AppResult<SettingsView> {
-    let was_running = gateway::status().running;
+pub async fn update_settings(input: SettingsInput) -> AppResult<SettingsView> {
+    let was_running = gateway::state() == gateway::GatewayState::Running;
     let port_changed = input
         .gateway_port
         .map(|port| port != settings::snapshot().gateway_port)
@@ -77,7 +77,7 @@ pub fn update_settings(input: SettingsInput) -> AppResult<SettingsView> {
     })?;
 
     if was_running && port_changed {
-        gateway::restart()?;
+        gateway::restart_async().await?;
     }
 
     Ok(view())

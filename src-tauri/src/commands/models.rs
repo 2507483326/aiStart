@@ -92,7 +92,7 @@ pub fn delete_model(id: i64) -> AppResult<Vec<ModelConfig>> {
 }
 
 #[tauri::command]
-pub fn activate_model(id: i64) -> AppResult<gateway::GatewayStatus> {
+pub async fn activate_model(id: i64) -> AppResult<gateway::GatewayStatus> {
     let exists = settings::snapshot().models.iter().any(|model| model.id == id);
     if !exists {
         return Err(AppError::NotFound(format!("模型 {id} 不存在")));
@@ -109,8 +109,9 @@ pub fn activate_model(id: i64) -> AppResult<gateway::GatewayStatus> {
         None,
     );
 
-    if gateway::status().running {
-        gateway::restart()
+    // 换模型要重启网关让新的上游生效；重启是阻塞操作，走 async 免得卡 UI。
+    if gateway::state() == gateway::GatewayState::Running {
+        gateway::restart_async().await
     } else {
         Ok(gateway::status())
     }

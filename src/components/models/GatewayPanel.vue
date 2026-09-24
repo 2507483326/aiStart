@@ -9,12 +9,35 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useGateway } from "@/composables/useGateway";
-import { cacheHitRate, formatCompact, formatNumber, formatPercent } from "@/lib/format";
+import {
+  cacheHitRate,
+  formatCompact,
+  formatNumber,
+  formatPercent,
+  gatewayStateLabels,
+} from "@/lib/format";
 import { usageApi } from "@/lib/ipc";
 import { notifySuccess } from "@/lib/notify";
 import type { UsageSummary } from "@/lib/types";
 
-const { status, running, loading, restart } = useGateway();
+const { status, running, busy, phase, transitioning, restart } = useGateway();
+
+// 按钮忙碌 = 重启请求在途，或后端正处于启动/停止的过渡态。
+const working = computed(() => busy.value || transitioning.value);
+
+const phaseView = computed(() => {
+  const state = phase.value;
+  return {
+    label: gatewayStateLabels[state],
+    variant:
+      state === "running"
+        ? ("default" as const)
+        : state === "stopped"
+          ? ("outline" as const)
+          : ("secondary" as const),
+    spinning: state === "starting" || state === "stopping",
+  };
+});
 
 const baseUrl = computed(() => status.value?.baseUrl ?? "http://127.0.0.1:8931");
 
@@ -73,20 +96,24 @@ onMounted(loadToday);
             variant="outline"
             size="sm"
             class="gap-1.5"
-            :disabled="loading"
+            :disabled="working"
             @click="handleRestart"
           >
             <MorphIconBox
-              :icon="loading ? LoaderCircle : RefreshCw"
+              :icon="working ? LoaderCircle : RefreshCw"
               :size="14"
-              :class="loading ? 'animate-spin' : ''"
+              :class="working ? 'animate-spin' : ''"
             />
-            重启网关
+            {{ working ? "重启中" : "重启网关" }}
           </Button>
         </div>
-        <Badge :variant="running ? 'default' : 'outline'" class="gap-1.5">
-          <MorphIconBox :icon="Activity" :size="12" />
-          {{ running ? "运行中" : "已停止" }}
+        <Badge :variant="phaseView.variant" class="gap-1.5">
+          <MorphIconBox
+            :icon="phaseView.spinning ? LoaderCircle : Activity"
+            :size="12"
+            :class="phaseView.spinning ? 'animate-spin' : ''"
+          />
+          {{ phaseView.label }}
         </Badge>
       </div>
     </CardHeader>

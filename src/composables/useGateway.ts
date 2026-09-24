@@ -8,5 +8,6 @@ export function useGateway() {
     ...storeToRefs(store),
     refresh: store.refresh,
     restart: store.restart,
+    ensureListener: store.ensureListener,
   };
 }

@@ -8,6 +8,7 @@ import {
   BrainCircuit,
   Funnel,
   LayoutDashboard,
+  LoaderCircle,
   Settings2,
   Sparkles,
 } from "lucide";
@@ -20,10 +21,23 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useGateway } from "@/composables/useGateway";
 import { useSettings } from "@/composables/useSettings";
+import { gatewayStateLabels } from "@/lib/format";
 
 const route = useRoute();
 const gateway = useGateway();
 const { info } = useSettings();
+
+const gatewayLabel = computed(() => gatewayStateLabels[gateway.phase.value]);
+const gatewayVariant = computed(() =>
+  gateway.running.value ? "default" : gateway.transitioning.value ? "secondary" : "outline",
+);
+const gatewayTone = computed(() =>
+  gateway.running.value
+    ? "text-emerald-500"
+    : gateway.transitioning.value
+      ? "text-amber-500"
+      : "text-muted-foreground",
+);
 
 const title = computed(() => (route.meta.title as string) ?? "AI Start");
 const subtitle = computed(() => (route.meta.subtitle as string) ?? "");
@@ -68,15 +82,17 @@ const activeIcon = computed(
         <div class="rounded-lg border bg-card px-3 py-2.5 transition-colors duration-200 hover:border-foreground/20">
           <div class="flex items-center justify-between">
             <span class="flex items-center gap-1.5 text-xs font-medium">
-              <MorphIconBox
-                :icon="Activity"
-                :size="13"
-                :class="gateway.running.value ? 'text-emerald-500' : 'text-muted-foreground'"
-              />
+              <MorphIconBox :icon="Activity" :size="13" :class="gatewayTone" />
               本地网关
             </span>
-            <Badge :variant="gateway.running.value ? 'default' : 'outline'">
-              {{ gateway.running.value ? "运行中" : "已停止" }}
+            <Badge :variant="gatewayVariant" class="gap-1">
+              <MorphIconBox
+                v-if="gateway.transitioning.value"
+                :icon="LoaderCircle"
+                :size="11"
+                class="animate-spin"
+              />
+              {{ gatewayLabel }}
             </Badge>
           </div>
           <p class="mt-1.5 truncate font-mono text-[11px] text-muted-foreground">
