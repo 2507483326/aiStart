@@ -13,5 +13,6 @@ export function useApps() {
     update: store.update,
     apply: store.apply,
     clear: store.clear,
+    downloadUrl: store.downloadUrl,
   };
 }

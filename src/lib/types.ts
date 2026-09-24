@@ -197,7 +197,6 @@ export interface GatewayStatus {
   state: GatewayState;
   port: number;
   baseUrl: string;
-  token: string;
   requests: number;
   errors: number;
   failovers: number;
@@ -208,12 +207,11 @@ export interface GatewayStatus {
   autoFailover: boolean;
   activeModelName: string | null;
   activeModelFormat: ModelFormat | null;
+  activeModelId: number | null;
 }
 
 export interface SettingsView {
   gatewayPort: number;
-  gatewayToken: string;
-  deepseekConfigPath: string;
   autoFailover: boolean;
   activeModelId: number | null;
   applied: Record<string, number>;
@@ -221,7 +219,6 @@ export interface SettingsView {
 
 export interface SettingsInput {
   gatewayPort?: number;
-  deepseekConfigPath?: string;
   autoFailover?: boolean;
 }
 
@@ -231,6 +228,7 @@ export interface AppInfo {
   platform: string;
   arch: string;
   configDir: string;
+  downloadDir: string;
 }
 
 export interface DownloadProgress {

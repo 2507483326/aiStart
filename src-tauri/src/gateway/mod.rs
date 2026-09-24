@@ -12,8 +12,6 @@ use tokio::sync::oneshot;
 use crate::error::{AppError, AppResult};
 use crate::events;
 
-pub const GATEWAY_TOKEN: &str = "aiStart";
-
 /// 收到停止信号后留给在途请求的收尾时间；超过就直接结束服务，确保监听端口一定被释放。
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
@@ -212,7 +210,6 @@ pub struct GatewayStatus {
     pub state: GatewayState,
     pub port: u16,
     pub base_url: String,
-    pub token: String,
     pub requests: u64,
     pub errors: u64,
     pub failovers: u64,
@@ -223,6 +220,7 @@ pub struct GatewayStatus {
     pub auto_failover: bool,
     pub active_model_name: Option<String>,
     pub active_model_format: Option<String>,
+    pub active_model_id: Option<i64>,
 }
 
 pub fn base_url(port: u16) -> String {
@@ -247,7 +245,6 @@ pub fn status() -> GatewayStatus {
         state,
         port,
         base_url: base_url(port),
-        token: GATEWAY_TOKEN.to_string(),
         requests,
         errors,
         failovers,
@@ -258,6 +255,7 @@ pub fn status() -> GatewayStatus {
         auto_failover: settings.auto_failover,
         active_model_name: active.map(|model| model.name.clone()),
         active_model_format: active.map(|model| model.format.as_str().to_string()),
+        active_model_id: active.map(|model| model.id),
     }
 }
 

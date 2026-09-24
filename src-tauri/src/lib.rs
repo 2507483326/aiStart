@@ -42,6 +42,8 @@ pub fn run() {
             commands::apps::update_app,
             commands::apps::app_apply_mode_label,
             commands::apps::check_app_updates,
+            commands::apps::open_download_dir,
+            commands::apps::installer_url,
             commands::models::list_model_formats,
             commands::models::list_models,
             commands::models::save_model,

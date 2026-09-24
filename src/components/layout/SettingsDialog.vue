@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, watch } from "vue";
-import { Copy, FolderCog } from "lucide";
+import { Copy, FolderCog, FolderDown, FolderOpen } from "lucide";
 
 import MorphIconBox from "@/components/common/MorphIconBox.vue";
 import { Button } from "@/components/ui/button";
@@ -16,19 +16,18 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useSettings } from "@/composables/useSettings";
+import { openDownloadDir } from "@/lib/open";
 import { notifySuccess } from "@/lib/notify";
 
 const { settings, info, update } = useSettings();
 
 const open = ref(false);
 const port = ref<string>("");
-const deepseekPath = ref<string>("");
 const saving = ref(false);
 
 watch(open, (value) => {
   if (!value || !settings.value) return;
   port.value = String(settings.value.gatewayPort);
-  deepseekPath.value = settings.value.deepseekConfigPath;
 });
 
 async function save() {
@@ -39,17 +38,18 @@ async function save() {
   }
   saving.value = true;
   try {
-    await update({ gatewayPort: parsed, deepseekConfigPath: deepseekPath.value });
+    await update({ gatewayPort: parsed });
     open.value = false;
   } finally {
     saving.value = false;
   }
 }
 
-async function copyToken() {
-  if (!settings.value) return;
-  await navigator.clipboard.writeText(settings.value.gatewayToken);
-  notifySuccess("网关 API Key 已复制");
+async function copyDownloadDir() {
+  const dir = info.value?.downloadDir;
+  if (!dir) return;
+  await navigator.clipboard.writeText(dir);
+  notifySuccess("下载地址已复制");
 }
 </script>
 
@@ -62,7 +62,7 @@ async function copyToken() {
       <DialogHeader>
         <DialogTitle>设置</DialogTitle>
         <DialogDescription>
-          本地网关与目标应用的接入位置。修改端口会自动重启网关。
+          本地网关端口。修改端口会自动重启网关。
         </DialogDescription>
       </DialogHeader>
 
@@ -75,46 +75,30 @@ async function copyToken() {
           </p>
         </div>
 
-        <div class="space-y-2">
-          <Label for="gateway-token">通用 API Key（手动调用示例）</Label>
-          <div class="flex gap-2">
-            <Input
-              id="gateway-token"
-              :model-value="settings?.gatewayToken ?? ''"
-              readonly
-              class="font-mono text-xs"
-            />
-            <Button variant="outline" size="icon" @click="copyToken">
-              <MorphIconBox :icon="Copy" :size="15" />
-            </Button>
-          </div>
-          <p class="text-xs text-muted-foreground">
-            网关只校验 Key 非空，并按 Key 匹配来源应用。应用接入时会自动写入各自的专属 Key；此处仅为手动调用示例。
-          </p>
-        </div>
-
-        <div class="space-y-2">
-          <Label for="deepseek-path">DeepSeek Desktop 配置路径</Label>
-          <div class="flex gap-2">
-            <Input
-              id="deepseek-path"
-              v-model="deepseekPath"
-              class="font-mono text-xs"
-              placeholder="%USERPROFILE%\.dsh\settings.yaml"
-            />
-          </div>
-          <p class="text-xs text-muted-foreground">
-            应用时会把 aiStart 作为一个 provider 合并进该文件，并把默认模型指向它；
-            同目录下的 .credentials.yaml 会写入网关 Key。文件里其他内容保持不变。
-          </p>
-        </div>
-
         <div class="rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
           <p class="flex items-center gap-1.5">
             <MorphIconBox :icon="FolderCog" :size="13" />
             应用数据目录
           </p>
           <p class="mt-1 break-all font-mono">{{ info?.configDir }}</p>
+        </div>
+
+        <div class="rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+          <p class="flex items-center gap-1.5">
+            <MorphIconBox :icon="FolderDown" :size="13" />
+            下载文件夹
+          </p>
+          <p class="mt-1 break-all font-mono">{{ info?.downloadDir }}</p>
+          <div class="mt-2 flex gap-2">
+            <Button variant="outline" class="gap-1.5" @click="openDownloadDir">
+              <MorphIconBox :icon="FolderOpen" :size="14" />
+              打开下载文件夹
+            </Button>
+            <Button variant="outline" class="gap-1.5" @click="copyDownloadDir">
+              <MorphIconBox :icon="Copy" :size="14" />
+              复制下载地址
+            </Button>
+          </div>
         </div>
       </div>
 

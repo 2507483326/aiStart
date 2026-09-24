@@ -7,6 +7,7 @@ import {
   Copy,
   Download,
   ExternalLink,
+  FolderOpen,
   LoaderCircle,
   Plug,
   Route,
@@ -32,7 +33,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useApps } from "@/composables/useApps";
 import { notifySuccess } from "@/lib/notify";
-import { openUrl } from "@/lib/open";
+import { openDownloadDir, openUrl } from "@/lib/open";
 import type { AppKind, ToolApp } from "@/lib/types";
 
 const props = defineProps<{
@@ -40,7 +41,7 @@ const props = defineProps<{
   activeModelId: number | null;
 }>();
 
-const { busyKind, download, apply, clear, install, update } = useApps();
+const { pending, download, apply, clear, install, update, downloadUrl } = useApps();
 
 const APP_ICONS: Record<AppKind, string> = {
   "claude-desktop": "/app-icons/claude-desktop.svg",
@@ -50,7 +51,15 @@ const APP_ICONS: Record<AppKind, string> = {
   workbuddy: "/app-icons/workbuddy.svg",
 };
 
-const busy = computed(() => busyKind.value === props.app.kind);
+const pendingAction = computed(() =>
+  pending.value?.kind === props.app.kind ? pending.value.action : null,
+);
+// 整卡禁用（有任一操作在跑），但转圈只画在真正被点击的那个按钮上
+const busy = computed(() => pendingAction.value !== null);
+const applying = computed(() => pendingAction.value === "apply");
+const installing = computed(
+  () => pendingAction.value === "install" || pendingAction.value === "update",
+);
 const guideOpen = ref(false);
 const installIcon = computed(() => (props.app.installed ? ArrowUpToLine : Download));
 const applyIcon = computed(() =>
@@ -92,6 +101,18 @@ async function doApply() {
 async function copyApiKey() {
   await navigator.clipboard.writeText(props.app.apiKey);
   notifySuccess("API Key 已复制");
+}
+
+async function copyDownloadUrl() {
+  const url = await downloadUrl(props.app.kind);
+  if (!url) return;
+  await navigator.clipboard.writeText(url);
+  notifySuccess("下载地址已复制");
+}
+
+// 打开菜单时静默预取直链，点「复制下载地址」就不用再等联网解析。
+function onMenuOpen(value: boolean) {
+  if (value) void downloadUrl(props.app.kind, true);
 }
 </script>
 
@@ -172,9 +193,9 @@ async function copyApiKey() {
         @click="doApply"
       >
         <MorphIconBox
-          :icon="busy ? LoaderCircle : applyIcon"
+          :icon="applying ? LoaderCircle : applyIcon"
           :size="15"
-          :class="busy ? 'animate-spin' : ''"
+          :class="applying ? 'animate-spin' : ''"
         />
         应用
       </Button>
@@ -187,11 +208,15 @@ async function copyApiKey() {
         :disabled="busy"
         @click="app.installed ? update(app.kind) : install(app.kind)"
       >
-        <MorphIconBox :icon="installIcon" :size="15" />
+        <MorphIconBox
+          :icon="installing ? LoaderCircle : installIcon"
+          :size="15"
+          :class="installing ? 'animate-spin' : ''"
+        />
         {{ app.installed ? "升级" : "安装" }}
       </Button>
 
-      <DropdownMenu>
+      <DropdownMenu @update:open="onMenuOpen">
         <DropdownMenuTrigger as-child>
           <Button variant="outline" size="icon-xs" class="ml-auto">
             <MorphIconBox :icon="Route" :size="15" />
@@ -208,6 +233,14 @@ async function copyApiKey() {
           <DropdownMenuItem @select="openUrl(app.downloadPage)">
             <MorphIconBox :icon="ExternalLink" :size="14" />
             打开官方下载页
+          </DropdownMenuItem>
+          <DropdownMenuItem @select="openDownloadDir">
+            <MorphIconBox :icon="FolderOpen" :size="14" />
+            打开下载文件夹
+          </DropdownMenuItem>
+          <DropdownMenuItem @select="copyDownloadUrl">
+            <MorphIconBox :icon="Copy" :size="14" />
+            复制下载地址
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>

@@ -15,6 +15,7 @@ use tower_http::cors::CorsLayer;
 use crate::domain::canonical::CanonicalRequest;
 use crate::domain::model::{ModelConfig, ModelFormat};
 use crate::error::AppError;
+use crate::events;
 use crate::providers::{
     http_client, provider_for, ResponseAssembler, SseEvent, StreamState, WireState,
 };
@@ -444,6 +445,26 @@ async fn handle(
             Ok((response, payload)) => {
                 if index > 0 {
                     stats.record_failover(&primary, &candidate.name);
+                    // 切换成功后把接手方记为当前模型：模型列表的「使用中」随之移动，
+                    // 后续请求也直接以它为首选，不必每次都先撞一遍已失败的主模型。
+                    match crate::settings::mutate(|settings| {
+                        settings.active_model_id = Some(candidate.id);
+                    }) {
+                        Ok(()) => {
+                            events::log(
+                                "system",
+                                Some("网关"),
+                                "model.failover",
+                                Some("model"),
+                                Some(&candidate.id.to_string()),
+                                Some(json!({ "from": &primary, "to": &candidate.name })),
+                            );
+                            super::publish();
+                        }
+                        Err(error) => {
+                            stats.record_error(&format!("自动切换后更新当前模型失败: {error}"));
+                        }
+                    }
                     failover_used = true;
                 }
                 chosen = Some((candidate.clone(), response, payload));

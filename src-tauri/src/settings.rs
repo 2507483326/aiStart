@@ -14,7 +14,6 @@ pub struct Settings {
     pub models: Vec<ModelConfig>,
     pub active_model_id: Option<i64>,
     pub gateway_port: u16,
-    pub deepseek_config_path: Option<String>,
     pub auto_failover: bool,
     /// app_kind -> model_id
     pub applied: BTreeMap<String, i64>,
@@ -32,7 +31,6 @@ impl Default for Settings {
             models: Vec::new(),
             active_model_id: None,
             gateway_port: default_port(),
-            deepseek_config_path: None,
             auto_failover: false,
             applied: BTreeMap::new(),
             app_tokens: BTreeMap::new(),
@@ -167,9 +165,6 @@ fn load() -> AppResult<Settings> {
                         settings.gateway_port = port;
                     }
                 }
-                "deepseek_config_path" => {
-                    settings.deepseek_config_path = (!value.trim().is_empty()).then_some(value);
-                }
                 "auto_failover" => settings.auto_failover = value.trim() == "1",
                 _ => {}
             }
@@ -297,10 +292,6 @@ fn setting_pairs(settings: &Settings) -> Vec<(&'static str, String)> {
         ),
         ("gateway_port", settings.gateway_port.to_string()),
         (
-            "deepseek_config_path",
-            settings.deepseek_config_path.clone().unwrap_or_default(),
-        ),
-        (
             "auto_failover",
             if settings.auto_failover { "1" } else { "0" }.to_string(),
         ),
@@ -370,14 +361,8 @@ pub fn mutate<T>(f: impl FnOnce(&mut Settings) -> T) -> AppResult<T> {
     Ok(value)
 }
 
+/// DeepSeek Desktop 的配置文件路径固定为 `~/.dsh/settings.yaml`。
 pub fn deepseek_config_path() -> String {
-    let settings = snapshot();
-    if let Some(path) = settings
-        .deepseek_config_path
-        .filter(|path| !path.trim().is_empty())
-    {
-        return crate::platform::expand_env(&path);
-    }
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     home.join(".dsh")
         .join("settings.yaml")

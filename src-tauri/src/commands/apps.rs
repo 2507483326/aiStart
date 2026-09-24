@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use futures_util::future::join_all;
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -248,17 +250,45 @@ pub fn clear_app_model(kind: AppKind) -> AppResult<()> {
     Ok(())
 }
 
+/// 安装包下载目录（`<app_cache_dir>/installers`）。
+///
+/// 真实落盘位置与设置里的「打开下载文件夹」共用这一个函数，避免两处各算一次而漂移。
+pub(crate) fn installer_dir(app: &AppHandle) -> AppResult<PathBuf> {
+    app.path()
+        .app_cache_dir()
+        .map(|dir| dir.join("installers"))
+        .map_err(|error| AppError::Message(format!("无法定位缓存目录: {error}")))
+}
+
+/// 在资源管理器里打开下载文件夹。
+#[tauri::command]
+pub fn open_download_dir(app: AppHandle) -> AppResult<()> {
+    let directory = installer_dir(&app)?;
+    // 还没下载过任何安装包时目录并不存在：先建出来，否则打开会失败。
+    std::fs::create_dir_all(&directory)?;
+    app.opener()
+        .open_path(directory.to_string_lossy().to_string(), None::<&str>)
+        .map_err(|error| AppError::Message(format!("打开下载文件夹失败: {error}")))
+}
+
+/// 解析「这次会从哪个地址下载安装包」，供卡片菜单的「复制下载地址」使用。
+///
+/// 走的是与安装完全相同的候选源解析（同样的镜像校验与兜底），只是不下载，
+/// 也不因「已是最新」短路——用户要的就是直链本身。
+#[tauri::command]
+pub async fn installer_url(kind: AppKind) -> AppResult<String> {
+    let descriptor = catalog::builtin_app(kind);
+    let asset = install::sources::resolve_asset(kind, &descriptor.upgrade).await?;
+    Ok(asset.url)
+}
+
 async fn download_installer(
     app: &AppHandle,
     kind: AppKind,
     action: &str,
     url: &str,
 ) -> AppResult<String> {
-    let directory = app
-        .path()
-        .app_cache_dir()
-        .map_err(|error| AppError::Message(format!("无法定位缓存目录: {error}")))?
-        .join("installers");
+    let directory = installer_dir(app)?;
     std::fs::create_dir_all(&directory)?;
 
     let file_name = url

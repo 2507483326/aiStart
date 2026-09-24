@@ -72,6 +72,27 @@ pub async fn resolve(kind: AppKind, spec: &UpgradeSpec) -> AppResult<ResolveOutc
         }
     }
 
+    Ok(ResolveOutcome::Ready(
+        resolve_from_sources(kind, spec, probed.as_ref()).await?,
+    ))
+}
+
+/// 只解析「这次从哪个地址拿安装包」，**不做「已是最新」短路**。
+///
+/// 供「复制下载地址」使用：即使当前已经是最新，用户也应当能拿到直链，因此这里
+/// 一律走候选源解析、不返回 `UpToDate`。与 `resolve` 共用同一套校验（含镜像兜底）。
+pub async fn resolve_asset(kind: AppKind, spec: &UpgradeSpec) -> AppResult<ReleaseAsset> {
+    let installed = installed_version(kind);
+    let probed = updates::latest_version(kind, installed.as_deref()).await;
+    resolve_from_sources(kind, spec, probed.as_ref()).await
+}
+
+/// 候选源解析主体：按 `sources` 顺序尝试权威源，通过自洽校验后可选地改用镜像加速。
+async fn resolve_from_sources(
+    kind: AppKind,
+    spec: &UpgradeSpec,
+    probed: Option<&FoundVersion>,
+) -> AppResult<ReleaseAsset> {
     let mirror = spec
         .sources
         .iter()
@@ -87,7 +108,7 @@ pub async fn resolve(kind: AppKind, spec: &UpgradeSpec) -> AppResult<ResolveOutc
             continue;
         }
 
-        let asset = match resolve_authoritative(source, probed.as_ref(), spec).await {
+        let asset = match resolve_authoritative(source, probed, spec).await {
             Ok(asset) => asset,
             Err(error) => {
                 problems.push(format!("{}（{error}）", source_label(source)));
@@ -99,17 +120,14 @@ pub async fn resolve(kind: AppKind, spec: &UpgradeSpec) -> AppResult<ResolveOutc
         // （官方优先），而下载源可能是某个同步延迟的镜像仓库。此时**不能采用**——
         // 否则会「升级」到比当前更旧的版本。
         if is_stale_authoritative(
-            probed.as_ref().map(|found| found.version.as_str()),
+            probed.map(|found| found.version.as_str()),
             asset.version.as_deref(),
         ) {
             let detail = format!(
                 "{} 的版本 {} 落后于探测到的最新版 {}",
                 source_label(source),
                 asset.version.as_deref().unwrap_or("未知"),
-                probed
-                    .as_ref()
-                    .map(|f| f.version.as_str())
-                    .unwrap_or("未知"),
+                probed.map(|f| f.version.as_str()).unwrap_or("未知"),
             );
             record_stale(kind, &detail);
             problems.push(detail);
@@ -120,7 +138,7 @@ pub async fn resolve(kind: AppKind, spec: &UpgradeSpec) -> AppResult<ResolveOutc
             Some(mirror) => prefer_mirror(kind, asset, mirror).await,
             None => asset,
         };
-        return Ok(ResolveOutcome::Ready(asset));
+        return Ok(asset);
     }
 
     // 没有任何权威源可用 → 硬失败。绝不「只剩镜像就放行」：那等于装一个

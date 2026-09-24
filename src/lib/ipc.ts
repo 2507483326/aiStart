@@ -31,6 +31,7 @@ export const appApi = {
   clear: (kind: AppKind) => invoke<void>("clear_app_model", { kind }),
   install: (kind: AppKind) => invoke<InstallReport>("install_app", { kind }),
   update: (kind: AppKind) => invoke<InstallReport>("update_app", { kind }),
+  installerUrl: (kind: AppKind) => invoke<string>("installer_url", { kind }),
   checkUpdates: () => invoke<AppUpdate[]>("check_app_updates"),
 };
 
@@ -63,6 +64,7 @@ export const systemApi = {
   updateSettings: (input: SettingsInput) =>
     invoke<SettingsView>("update_settings", { input }),
   info: () => invoke<AppInfo>("app_info"),
+  openDownloadDir: () => invoke<void>("open_download_dir"),
 };
 
 export const eventApi = {

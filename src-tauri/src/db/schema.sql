@@ -131,7 +131,7 @@ CREATE INDEX IF NOT EXISTS idx_app_version_records_action ON app_version_records
 -- ---------------------------------------------------------------------
 -- 5. app_settings —— 应用设置（键值对；DB 即唯一存储，取代 settings.json 的标量字段）
 --    合法键：active_model_id（生效模型 ID）/ gateway_port（本地网关端口）
---            / deepseek_config_path（DeepSeek 配置路径，空=用默认）/ auto_failover（1/0）
+--            / auto_failover（1/0）
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS app_settings (
   key            TEXT PRIMARY KEY,             -- 设置键（行即主键，key 例外同 schema_meta）

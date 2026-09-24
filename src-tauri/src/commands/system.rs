@@ -11,8 +11,6 @@ use crate::settings;
 #[serde(rename_all = "camelCase")]
 pub struct SettingsView {
     pub gateway_port: u16,
-    pub gateway_token: String,
-    pub deepseek_config_path: String,
     pub auto_failover: bool,
     pub active_model_id: Option<i64>,
     pub applied: BTreeMap<String, i64>,
@@ -23,8 +21,6 @@ pub struct SettingsView {
 pub struct SettingsInput {
     #[serde(default)]
     pub gateway_port: Option<u16>,
-    #[serde(default)]
-    pub deepseek_config_path: Option<String>,
     #[serde(default)]
     pub auto_failover: Option<bool>,
 }
@@ -37,14 +33,13 @@ pub struct AppInfo {
     pub platform: String,
     pub arch: String,
     pub config_dir: String,
+    pub download_dir: String,
 }
 
 fn view() -> SettingsView {
     let snapshot = settings::snapshot();
     SettingsView {
         gateway_port: snapshot.gateway_port,
-        gateway_token: gateway::GATEWAY_TOKEN.to_string(),
-        deepseek_config_path: settings::deepseek_config_path(),
         auto_failover: snapshot.auto_failover,
         active_model_id: snapshot.active_model_id,
         applied: snapshot.applied,
@@ -68,9 +63,6 @@ pub async fn update_settings(input: SettingsInput) -> AppResult<SettingsView> {
         if let Some(port) = input.gateway_port {
             store.gateway_port = port;
         }
-        if let Some(path) = &input.deepseek_config_path {
-            store.deepseek_config_path = Some(path.clone());
-        }
         if let Some(enabled) = input.auto_failover {
             store.auto_failover = enabled;
         }
@@ -90,6 +82,9 @@ pub fn app_info(app: AppHandle) -> AppInfo {
         .app_config_dir()
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_default();
+    let download_dir = super::apps::installer_dir(&app)
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_default();
 
     AppInfo {
         name: "AI Start".into(),
@@ -97,5 +92,6 @@ pub fn app_info(app: AppHandle) -> AppInfo {
         platform: std::env::consts::OS.into(),
         arch: std::env::consts::ARCH.into(),
         config_dir,
+        download_dir,
     }
 }
