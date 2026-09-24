@@ -2,11 +2,12 @@
 
 管理开发者工具的桌面工具箱：**一键安装、一键更新、一键把任意模型接入桌面客户端**。
 
-目前有左侧边栏的四个页面：
+目前有左侧边栏的五个页面：
 
 - **面板** — 本地网关的运行状态、调用统计、自动切换情况，以及应用/模型总览
 - **应用** — Claude Desktop、DeepSeek Desktop，负责安装 / 更新 / 模型接入
 - **模型** — 统一管理三种上游协议的模型，并支持自动切换
+- **过滤器** — 在请求转发前按规则改写请求（注入系统提示词 / 覆盖参数 / 文本替换）
 - **统计** — Token 消耗贡献图与每一次请求的明细
 
 技术栈：Tauri 2 + Vue 3 + vue-router + Tailwind CSS v4 + shadcn-vue + morphicons。
@@ -22,10 +23,12 @@
 | `POST /v1/messages` | Anthropic Messages |
 | `POST /v1/chat/completions` | OpenAI Chat Completions |
 | `POST /v1/responses` | OpenAI Responses |
-| `GET /v1/models` | 兼容两种列表格式 |
+| `GET /v1/models` | 返回网关对外暴露的全部 Claude 路由 |
 
-- **API Key 固定为 `aiStart`**，模型名也固定为 `aiStart`（可在 `gateway/mod.rs` 的常量中修改）。
+- **API Key 固定为 `aiStart`**；对外暴露一组 `claude-*` 路由（见 `gateway/mod.rs` 的 `MODEL_ROLES`）。
   `x-api-key` 与 `Authorization: Bearer` 两种携带方式都接受。
+- 模型名**不能**是不透明别名：Claude Desktop 会丢弃非 Anthropic 形态的名字，模型菜单会变空。
+  上游真实模型由网关在转发时替换，用户看到的名字来自 `inferenceModels` 的 `labelOverride`。
 - 错误响应会跟随入站协议：Anthropic 返回 `{"type":"error","error":{...}}`，
   OpenAI 返回 `{"error":{...}}`。
 
@@ -123,6 +126,21 @@ message_start → content_block_start → content_block_delta* → content_block
 请求本身的形状错误（400/422）不会触发切换 —— 那种错误换模型也一样会失败，
 只会掩盖真正的问题。
 
+## 请求过滤器
+
+「过滤器」页面用于在网关把请求转发给上游**之前**按规则改写请求内容。每条过滤器一个动作，
+只有启用的参与执行，按列表顺序（即创建顺序）依次叠加：
+
+| 规则类型 | 作用 |
+| --- | --- |
+| 注入系统提示词 | 在 `system` 上追加 / 前置，或整体替换 |
+| 覆盖请求参数 | 覆盖 `temperature` / `max_tokens` / `top_p` / `stop_sequences`（只覆盖填写项） |
+| 文本查找替换 | 对 `system` 与 `messages` 的文本做字面量替换，可限定作用范围 |
+
+实现要点：改写作用在**规范请求**（Anthropic 形态）上，因此三种入站协议统一生效；
+注入点在 `gateway/server.rs::handle` 的 `decode_request` 之后、自动切换循环之外，
+保证一次请求只套用一次。文本替换只触及文本字段，不会改动 `tool_use.input` 等结构化字段。
+
 ## 用量统计
 
 每次经由网关的调用都会追加一条记录到 `<配置目录>/usage.jsonl`（超过 20000 条自动裁剪到 10000 条），
@@ -145,21 +163,26 @@ src-tauri/src/platform/
 
 ### Claude Desktop 的接入方式
 
-写入**用户级**注册表策略（无需管理员权限）：
+写入 Claude Desktop 的**用户级配置目录**（与应用内「Configure Third-Party Inference」同一位置，无需管理员权限）：
 
 ```
-HKEY_CURRENT_USER\SOFTWARE\Policies\Claude
-  inferenceProvider            = gateway
-  inferenceGatewayBaseUrl      = http://127.0.0.1:<port>
-  inferenceGatewayApiKey       = aiStart
-  inferenceGatewayAuthScheme   = bearer
-  inferenceModels              = [{"name":"aiStart","labelOverride":"..."}]
-  modelDiscoveryEnabled        = false
-  disableDeploymentModeChooser = true
+%LOCALAPPDATA%\Claude-3p\configLibrary\
+├─ _meta.json                                 # appliedId 指向本应用的 profile
+└─ 00000000-0000-4000-8000-000000008931.json  # 具体配置
+     inferenceProvider            = gateway
+     inferenceGatewayBaseUrl      = http://127.0.0.1:<port>
+     inferenceGatewayApiKey       = aiStart
+     inferenceGatewayAuthScheme   = bearer
+     inferenceModels              = [{"name":"claude-sonnet-5","labelOverride":"aiStart · Sonnet"}, ...]
+     modelDiscoveryEnabled        = false
+     disableDeploymentModeChooser = true
 ```
+
+应用时还会清除自己早期写在 `HKCU\SOFTWARE\Policies\Claude` 的托管策略 —— 托管级优先于用户级文件，
+留着会把新写的配置整个盖掉。
 
 注意：Claude Desktop 只在**启动时**读取配置，且**机器级**（`HKLM\SOFTWARE\Policies\Claude`）策略存在时
-会完全忽略用户级配置。所以应用完成后需要完全退出并重新打开 Claude Desktop。
+会完全忽略用户级配置与用户级文件。所以应用完成后需要完全退出并重新打开 Claude Desktop。
 
 ### DeepSeek Desktop 的说明
 
@@ -185,23 +208,25 @@ DeepSeek Desktop 没有公开的程序化配置格式，因此这里是**按最�
 
 ```
 ├── src/                          # 前端
-│   ├── pages/                    # 页面：Dashboard / Apps / Models / Stats
+│   ├── pages/                    # 页面：Dashboard / Apps / Models / Filters / Stats
 │   ├── components/
 │   │   ├── apps/                 # 应用卡片等
 │   │   ├── models/               # 模型行 / 表单 / 网关面板
+│   │   ├── filters/              # 过滤器卡片 / 表单
 │   │   ├── stats/                # 贡献图
 │   │   ├── layout/               # AppShell / SidebarNav / SettingsDialog
 │   │   ├── common/               # 通用：MorphIconBox / EmptyState / ConfirmDialog ...
 │   │   └── ui/                   # shadcn-vue 组件
-│   ├── composables/              # useApps / useModels / useGateway / useUsage / useSettings
+│   ├── composables/              # useApps / useModels / useFilters / useGateway / useUsage / useSettings
 │   ├── lib/                      # ipc（invoke 封装）/ types / format / notify / open
 │   └── router/
 └── src-tauri/src/                # 后端
-    ├── domain/                   # 领域模型 + 规范请求 + 内置目录
+    ├── domain/                   # 领域模型 + 规范请求 + 内置目录 + 过滤器规则
     ├── providers/                # 三种协议的双向翻译（decode/encode 请求、响应、事件流）
     ├── platform/                 # 客户端配置适配层
-    ├── gateway/                  # 本地网关（axum + SSE + 用量记录）
+    ├── gateway/                  # 本地网关（axum + SSE + 用量记录 + 请求过滤器）
     ├── commands/                 # Tauri 命令
+    ├── filters.rs                # 请求过滤器：持久化 + 规则套用
     ├── usage.rs                  # 用量记录与聚合
     └── settings.rs               # 配置持久化
 ```

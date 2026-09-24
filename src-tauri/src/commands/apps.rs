@@ -1,15 +1,18 @@
+use futures_util::future::join_all;
 use futures_util::StreamExt;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 use tokio::io::AsyncWriteExt;
 
-use crate::domain::app::{AppKind, ApplyMode, ApplyReport, InstallReport, ToolApp};
+use crate::domain::app::{AppKind, AppUpdate, ApplyMode, ApplyReport, InstallReport, ToolApp};
 use crate::domain::catalog;
 use crate::error::{AppError, AppResult};
+use crate::events;
 use crate::gateway;
-use crate::platform::{self, ApplyContext, DetectResult};
+use crate::platform::{self, ApplyContext, DetectResult, ModelChoice};
 use crate::settings;
+use crate::updates;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -22,7 +25,11 @@ struct DownloadProgress {
     percent: Option<f64>,
 }
 
-fn build_app_view(kind: AppKind, applied: Option<&crate::domain::model::ModelConfig>) -> ToolApp {
+fn build_app_view(
+    kind: AppKind,
+    applied: Option<&crate::domain::model::ModelConfig>,
+    known: Option<&updates::CheckSnapshot>,
+) -> ToolApp {
     let configurator = platform::configurator_for(kind);
     let descriptor = configurator.descriptor();
     let detect = configurator.detect().unwrap_or_else(|_| DetectResult::missing());
@@ -33,6 +40,7 @@ fn build_app_view(kind: AppKind, applied: Option<&crate::domain::model::ModelCon
         name: descriptor.name,
         publisher: descriptor.publisher,
         description: descriptor.description,
+        homepage: descriptor.homepage,
         download_page: descriptor.download_page,
         requires_gateway: descriptor.requires_gateway,
         apply_mode: descriptor.apply_mode,
@@ -40,9 +48,9 @@ fn build_app_view(kind: AppKind, applied: Option<&crate::domain::model::ModelCon
         installed: detect.installed,
         version: detect.version,
         install_location: detect.location,
-        latest_version: descriptor.latest_version,
-        update_available: false,
-        applied_model_id: applied.map(|model| model.id.clone()),
+        latest_version: known.and_then(|snapshot| snapshot.latest_version.clone()),
+        update_available: known.map(|snapshot| snapshot.update_available).unwrap_or(false),
+        applied_model_id: applied.map(|model| model.id),
         applied_model_name: applied.map(|model| model.name.clone()),
     }
 }
@@ -50,17 +58,65 @@ fn build_app_view(kind: AppKind, applied: Option<&crate::domain::model::ModelCon
 #[tauri::command]
 pub fn list_apps() -> AppResult<Vec<ToolApp>> {
     let settings = settings::snapshot();
+    let known = updates::latest_checks();
     Ok(AppKind::ALL
         .iter()
-        .map(|kind| build_app_view(*kind, settings.applied_model(*kind)))
+        .map(|kind| build_app_view(*kind, settings.applied_model(*kind), known.get(kind)))
         .collect())
 }
 
 #[tauri::command]
-pub fn apply_model(kind: AppKind, model_id: Option<String>) -> AppResult<ApplyReport> {
+pub async fn check_app_updates() -> AppResult<Vec<AppUpdate>> {
+    let latest = join_all(
+        AppKind::ALL
+            .iter()
+            .map(|kind| updates::latest_version(*kind)),
+    )
+    .await;
+
+    Ok(AppKind::ALL
+        .iter()
+        .zip(latest)
+        .map(|(kind, found)| {
+            let installed = platform::configurator_for(*kind)
+                .detect()
+                .ok()
+                .filter(|detect| detect.installed)
+                .and_then(|detect| detect.version);
+            let latest_version = found.as_ref().map(|found| found.version.clone());
+            let update_available = match (&latest_version, &installed) {
+                (Some(latest), Some(installed)) => updates::is_newer(latest, installed),
+                _ => false,
+            };
+            let status = match (&latest_version, update_available) {
+                (None, _) => "unreachable",
+                (Some(_), true) => "found",
+                (Some(_), false) => "up-to-date",
+            };
+            updates::record_check(
+                *kind,
+                installed.as_deref(),
+                latest_version.as_deref(),
+                found.as_ref().map(|found| found.source_url.as_str()),
+                update_available,
+                status,
+                None,
+            );
+
+            AppUpdate {
+                kind: *kind,
+                latest_version,
+                update_available,
+            }
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub fn apply_model(kind: AppKind, model_id: Option<i64>) -> AppResult<ApplyReport> {
     let settings = settings::snapshot();
     let model = match model_id {
-        Some(id) => crate::settings::require_model(&id)?,
+        Some(id) => crate::settings::require_model(id)?,
         None => settings
             .active_model()
             .cloned()
@@ -77,14 +133,29 @@ pub fn apply_model(kind: AppKind, model_id: Option<String>) -> AppResult<ApplyRe
         model: model.clone(),
         gateway_base_url: status.base_url.clone(),
         gateway_token: status.token.clone(),
-        model_alias: gateway::MODEL_ALIAS.to_string(),
+        model_choices: gateway::MODEL_ROLES
+            .iter()
+            .map(|role| ModelChoice {
+                id: role.id.to_string(),
+                label: role.picker_label(),
+            })
+            .collect(),
     };
 
     let report = configurator.apply(&context)?;
 
     settings::mutate(|settings| {
-        settings.applied.insert(kind.as_str().to_string(), model.id.clone());
+        settings.applied.insert(kind.as_str().to_string(), model.id);
     })?;
+
+    events::log(
+        "user",
+        None,
+        "app.applied",
+        Some("app"),
+        Some(kind.as_str()),
+        Some(serde_json::json!({ "modelId": model.id, "modelName": model.name })),
+    );
 
     Ok(report)
 }
@@ -96,6 +167,14 @@ pub fn clear_app_model(kind: AppKind) -> AppResult<()> {
     settings::mutate(|settings| {
         settings.applied.remove(kind.as_str());
     })?;
+    events::log(
+        "user",
+        None,
+        "app.cleared",
+        Some("app"),
+        Some(kind.as_str()),
+        None,
+    );
     Ok(())
 }
 
@@ -220,14 +299,62 @@ async fn run_install(app: &AppHandle, kind: AppKind, action: &str) -> AppResult<
     })
 }
 
+fn installed_version(kind: AppKind) -> Option<String> {
+    platform::configurator_for(kind)
+        .detect()
+        .ok()
+        .filter(|detect| detect.installed)
+        .and_then(|detect| detect.version)
+}
+
+fn log_install_outcome(kind: AppKind, action: &str, outcome: &AppResult<InstallReport>) {
+    let installed = installed_version(kind);
+    match outcome {
+        Ok(report) => {
+            updates::record_action(kind, action, installed.as_deref(), None, "launched", None);
+            events::log(
+                "user",
+                None,
+                &format!("app.{action}.launched"),
+                Some("app"),
+                Some(kind.as_str()),
+                Some(serde_json::json!({ "target": report.target })),
+            );
+        }
+        Err(error) => {
+            let message = error.to_string();
+            updates::record_action(
+                kind,
+                action,
+                installed.as_deref(),
+                None,
+                "failed",
+                Some(&message),
+            );
+            events::log(
+                "user",
+                None,
+                &format!("app.{action}.failed"),
+                Some("app"),
+                Some(kind.as_str()),
+                Some(serde_json::json!({ "message": message })),
+            );
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn install_app(app: AppHandle, kind: AppKind) -> AppResult<InstallReport> {
-    run_install(&app, kind, "install").await
+    let outcome = run_install(&app, kind, "install").await;
+    log_install_outcome(kind, "install", &outcome);
+    outcome
 }
 
 #[tauri::command]
 pub async fn update_app(app: AppHandle, kind: AppKind) -> AppResult<InstallReport> {
-    run_install(&app, kind, "update").await
+    let outcome = run_install(&app, kind, "update").await;
+    log_install_outcome(kind, "update", &outcome);
+    outcome
 }
 
 #[tauri::command]

@@ -101,6 +101,18 @@ impl ModelProvider for AnthropicMessagesProvider {
                 {
                     state.input_tokens = tokens;
                 }
+                if let Some(tokens) = data
+                    .pointer("/message/usage/cache_read_input_tokens")
+                    .and_then(Value::as_u64)
+                {
+                    state.cache_read_tokens = tokens;
+                }
+                if let Some(tokens) = data
+                    .pointer("/message/usage/cache_creation_input_tokens")
+                    .and_then(Value::as_u64)
+                {
+                    state.cache_write_tokens = tokens;
+                }
             }
             "message_stop" => state.finished = true,
             "error" => state.finished = true,

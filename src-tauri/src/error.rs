@@ -6,6 +6,8 @@ pub enum AppError {
     Io(#[from] std::io::Error),
     #[error("数据解析失败: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("数据库操作失败: {0}")]
+    Database(#[from] rusqlite::Error),
     #[error("网络请求失败: {0}")]
     Http(#[from] reqwest::Error),
     #[error("未找到: {0}")]

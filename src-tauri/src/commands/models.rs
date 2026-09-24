@@ -1,12 +1,19 @@
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::domain::canonical::CanonicalRequest;
 use crate::domain::model::{ModelConfig, ModelFormat, ModelInput};
 use crate::error::{AppError, AppResult};
+use crate::events;
 use crate::gateway;
 use crate::providers::{http_client, provider_for};
 use crate::settings;
+
+/// 探测类请求（拉取模型列表、连通性测试）的硬超时。共享的 http_client 只设了
+/// connect_timeout，若上游连上后不响应会永久挂起，导致前端一直转圈。
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -55,26 +62,52 @@ pub fn save_model(input: ModelInput) -> AppResult<ModelConfig> {
     if input.model.trim().is_empty() {
         return Err(AppError::InvalidConfig("上游模型 ID 不能为空".into()));
     }
-    settings::mutate(|settings| settings.upsert(input))
+    let model = settings::mutate(|settings| settings.upsert(input))?;
+    events::log(
+        "user",
+        None,
+        "model.saved",
+        Some("model"),
+        Some(&model.id.to_string()),
+        Some(json!({ "name": model.name, "format": model.format.as_str() })),
+    );
+    Ok(model)
 }
 
 #[tauri::command]
-pub fn delete_model(id: String) -> AppResult<Vec<ModelConfig>> {
-    settings::mutate(|settings| {
-        settings.remove(&id);
+pub fn delete_model(id: i64) -> AppResult<Vec<ModelConfig>> {
+    let models = settings::mutate(|settings| {
+        settings.remove(id);
         settings.models.clone()
-    })
+    })?;
+    events::log(
+        "user",
+        None,
+        "model.deleted",
+        Some("model"),
+        Some(&id.to_string()),
+        None,
+    );
+    Ok(models)
 }
 
 #[tauri::command]
-pub fn activate_model(id: String) -> AppResult<gateway::GatewayStatus> {
+pub fn activate_model(id: i64) -> AppResult<gateway::GatewayStatus> {
     let exists = settings::snapshot().models.iter().any(|model| model.id == id);
     if !exists {
         return Err(AppError::NotFound(format!("模型 {id} 不存在")));
     }
     settings::mutate(|settings| {
-        settings.active_model_id = Some(id.clone());
+        settings.active_model_id = Some(id);
     })?;
+    events::log(
+        "user",
+        None,
+        "model.activated",
+        Some("model"),
+        Some(&id.to_string()),
+        None,
+    );
 
     if gateway::status().running {
         gateway::restart()
@@ -85,7 +118,7 @@ pub fn activate_model(id: String) -> AppResult<gateway::GatewayStatus> {
 
 fn probe_config(base_url: &str, api_key: &str, format: ModelFormat) -> ModelConfig {
     ModelConfig {
-        id: "probe".into(),
+        id: 0,
         name: "probe".into(),
         format,
         base_url: base_url.to_string(),
@@ -150,7 +183,7 @@ pub async fn fetch_upstream_models(
     let config = probe_config(&base_url, &api_key, format);
     let provider = provider_for(format);
 
-    let mut builder = http_client().get(config.models_url());
+    let mut builder = http_client().get(config.models_url()).timeout(PROBE_TIMEOUT);
     for (name, value) in provider.headers(&config) {
         builder = builder.header(name, value);
     }
@@ -197,8 +230,8 @@ fn preview_from_response(response: &Value) -> Option<String> {
 }
 
 #[tauri::command]
-pub async fn test_model(id: String) -> AppResult<TestResult> {
-    let config = settings::require_model(&id)?;
+pub async fn test_model(id: i64) -> AppResult<TestResult> {
+    let config = settings::require_model(id)?;
     let provider = provider_for(config.format);
 
     let request = CanonicalRequest::parse(json!({
@@ -209,7 +242,10 @@ pub async fn test_model(id: String) -> AppResult<TestResult> {
     }))?;
 
     let payload = provider.encode_request(&config, &request)?;
-    let mut builder = http_client().post(provider.endpoint(&config)).json(&payload);
+    let mut builder = http_client()
+        .post(provider.endpoint(&config))
+        .timeout(PROBE_TIMEOUT)
+        .json(&payload);
     for (name, value) in provider.headers(&config) {
         builder = builder.header(name, value);
     }

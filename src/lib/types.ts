@@ -8,7 +8,7 @@ export type AppKind = "claude-desktop" | "deepseek-desktop";
 export type ApplyMode = "gateway" | "direct-config" | "manual";
 
 export interface ModelConfig {
-  id: string;
+  id: number;
   name: string;
   format: ModelFormat;
   baseUrl: string;
@@ -20,7 +20,7 @@ export interface ModelConfig {
 }
 
 export interface ModelInput {
-  id?: string;
+  id?: number;
   name: string;
   format: ModelFormat;
   baseUrl: string;
@@ -35,7 +35,40 @@ export interface FormatInfo {
   defaultBaseUrl: string;
 }
 
+export type PromptMode = "append" | "prepend" | "replace";
+
+export type ReplaceTarget = "system" | "messages" | "all";
+
+export type FilterRule =
+  | { kind: "system-prompt"; mode: PromptMode; text: string }
+  | {
+      kind: "request-params";
+      temperature: number | null;
+      maxTokens: number | null;
+      topP: number | null;
+      stopSequences: string[] | null;
+    }
+  | { kind: "text-replace"; find: string; replace: string; target: ReplaceTarget };
+
+export interface RequestFilter {
+  id: number;
+  name: string;
+  enabled: boolean;
+  order: number;
+  rule: FilterRule;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface FilterInput {
+  id?: number;
+  name: string;
+  enabled: boolean;
+  rule: FilterRule;
+}
+
 export interface UsageRecord {
+  id: number;
   timestamp: string;
   date: string;
   modelName: string;
@@ -44,10 +77,32 @@ export interface UsageRecord {
   upstreamProtocol: string;
   inputTokens: number;
   outputTokens: number;
+  cacheReadTokens: number | null;
+  cacheWriteTokens: number | null;
   durationMs: number;
   ok: boolean;
   failover: boolean;
   error: string | null;
+}
+
+export interface UsagePayloadDetail {
+  id: number;
+  time: string;
+  inboundRequest: string | null;
+  upstreamResponse: string | null;
+  requestTruncated: boolean;
+  responseTruncated: boolean;
+  stream: boolean;
+}
+
+export interface RequestDetail {
+  record: UsageRecord;
+  payload: UsagePayloadDetail | null;
+}
+
+export interface UsagePage {
+  total: number;
+  items: UsageRecord[];
 }
 
 export interface DailyUsage {
@@ -56,6 +111,8 @@ export interface DailyUsage {
   failed: number;
   inputTokens: number;
   outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
   totalTokens: number;
 }
 
@@ -71,6 +128,8 @@ export interface UsageSummary {
   failedRequests: number;
   inputTokens: number;
   outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
   totalTokens: number;
   todayTokens: number;
   streakDays: number;
@@ -83,6 +142,7 @@ export interface ToolApp {
   name: string;
   publisher: string;
   description: string;
+  homepage: string;
   downloadPage: string;
   requiresGateway: boolean;
   applyMode: ApplyMode;
@@ -92,13 +152,19 @@ export interface ToolApp {
   installLocation: string | null;
   latestVersion: string | null;
   updateAvailable: boolean;
-  appliedModelId: string | null;
+  appliedModelId: number | null;
   appliedModelName: string | null;
+}
+
+export interface AppUpdate {
+  kind: AppKind;
+  latestVersion: string | null;
+  updateAvailable: boolean;
 }
 
 export interface ApplyReport {
   kind: AppKind;
-  modelId: string;
+  modelId: number;
   modelName: string;
   applyMode: ApplyMode;
   target: string;
@@ -146,8 +212,8 @@ export interface SettingsView {
   gatewayToken: string;
   deepseekConfigPath: string;
   autoFailover: boolean;
-  activeModelId: string | null;
-  applied: Record<string, string>;
+  activeModelId: number | null;
+  applied: Record<string, number>;
 }
 
 export interface SettingsInput {
@@ -171,4 +237,15 @@ export interface DownloadProgress {
   received: number;
   total: number | null;
   percent: number | null;
+}
+
+export interface EventRecord {
+  id: number;
+  time: string;
+  actorKind: string;
+  actorName: string | null;
+  type: string;
+  targetKind: string | null;
+  targetId: string | null;
+  payload: string | null;
 }

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY};
+use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, KEY_WOW64_64KEY};
 use winreg::RegKey;
 
 use crate::domain::app::{AppDescriptor, AppKind, ApplyMode, ApplyReport};
@@ -10,6 +10,29 @@ use crate::error::{AppError, AppResult};
 use super::{expand_env, AppConfigurator, ApplyContext, DetectResult};
 
 const CLAUDE_POLICY_PATH: &str = r"SOFTWARE\Policies\Claude";
+
+/// Registry values this app wrote before it moved to the user-level profile.
+/// Managed policy outranks the user-level profile, so any of these left behind
+/// would shadow the file we now write.
+const LEGACY_POLICY_VALUES: &[&str] = &[
+    "inferenceProvider",
+    "inferenceGatewayBaseUrl",
+    "inferenceGatewayApiKey",
+    "inferenceGatewayAuthScheme",
+    "inferenceModels",
+    "modelDiscoveryEnabled",
+    "disableDeploymentModeChooser",
+];
+
+/// Claude Desktop's user-level (non-managed) profile directory. The in-app
+/// "Configure Third-Party Inference" window writes here too, so this stays
+/// compatible with other tools managing the same profile.
+const CLAUDE_CONFIG_LIBRARY: &str = r"%LOCALAPPDATA%\Claude-3p\configLibrary";
+
+/// Fixed profile id, so re-applying overwrites our own file instead of
+/// accumulating entries in `_meta.json`.
+const CLAUDE_PROFILE_ID: &str = "00000000-0000-4000-8000-000000008931";
+const CLAUDE_PROFILE_NAME: &str = "AI Start";
 
 const UNINSTALL_PATHS: &[&str] = &[
     r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
@@ -162,34 +185,113 @@ fn claude_binary() -> Option<String> {
         .find(|path| PathBuf::from(path).exists())
 }
 
-fn policy_key(create: bool) -> AppResult<RegKey> {
+fn policy_key() -> AppResult<RegKey> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    if create {
-        let (key, _) = hkcu.create_subkey(CLAUDE_POLICY_PATH)?;
-        Ok(key)
-    } else {
-        hkcu.open_subkey_with_flags(CLAUDE_POLICY_PATH, KEY_READ)
-            .map_err(|_| AppError::NotFound("Claude 策略注册表项不存在".into()))
-    }
-}
-
-fn read_policy(name: &str) -> Option<String> {
-    policy_key(false)
-        .ok()
-        .and_then(|key| key.get_value::<String, _>(name).ok())
-}
-
-fn write_policy(name: &str, value: &str) -> AppResult<()> {
-    let key = policy_key(true)?;
-    key.set_value(name, &value.to_string())?;
-    Ok(())
+    hkcu.open_subkey_with_flags(CLAUDE_POLICY_PATH, KEY_READ | KEY_WRITE)
+        .map_err(|_| AppError::NotFound("Claude 策略注册表项不存在".into()))
 }
 
 fn delete_policy(name: &str) -> AppResult<()> {
-    if let Ok(key) = policy_key(false) {
-        let _ = key.delete_value(name);
+    let Ok(key) = policy_key() else {
+        return Ok(());
+    };
+    match key.delete_value(name) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Managed policy outranks the user-level profile, so the values this app used
+/// to write there have to go for the profile to take effect. Failing here is
+/// fatal on purpose — a leftover policy would silently shadow the profile.
+fn clear_legacy_policy() -> AppResult<()> {
+    for name in LEGACY_POLICY_VALUES {
+        delete_policy(name)?;
     }
     Ok(())
+}
+
+fn config_library_dir() -> PathBuf {
+    PathBuf::from(expand_env(CLAUDE_CONFIG_LIBRARY))
+}
+
+fn profile_path() -> PathBuf {
+    config_library_dir().join(format!("{CLAUDE_PROFILE_ID}.json"))
+}
+
+fn meta_path() -> PathBuf {
+    config_library_dir().join("_meta.json")
+}
+
+fn read_meta() -> serde_json::Value {
+    std::fs::read_to_string(meta_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .unwrap_or_else(|| serde_json::json!({ "appliedId": null, "entries": [] }))
+}
+
+fn write_meta(meta: &serde_json::Value) -> AppResult<()> {
+    std::fs::write(meta_path(), serde_json::to_string_pretty(meta)?)?;
+    Ok(())
+}
+
+/// Registers our profile in `_meta.json` and makes it the applied one.
+fn adopt_meta() -> AppResult<()> {
+    let mut meta = read_meta();
+    if !meta.is_object() {
+        meta = serde_json::json!({ "appliedId": null, "entries": [] });
+    }
+    let object = meta.as_object_mut().expect("reset to an object above");
+    if !object
+        .get("entries")
+        .map(serde_json::Value::is_array)
+        .unwrap_or(false)
+    {
+        object.insert("entries".into(), serde_json::Value::Array(Vec::new()));
+    }
+    let entries = object
+        .get_mut("entries")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("an array was just ensured");
+    entries.retain(|entry| entry.get("id").and_then(serde_json::Value::as_str) != Some(CLAUDE_PROFILE_ID));
+    entries.push(serde_json::json!({ "id": CLAUDE_PROFILE_ID, "name": CLAUDE_PROFILE_NAME }));
+    object.insert("appliedId".into(), serde_json::json!(CLAUDE_PROFILE_ID));
+    write_meta(&meta)
+}
+
+/// Drops our profile from `_meta.json`, handing the applied slot to whatever
+/// other profile is still registered.
+fn release_meta() -> AppResult<()> {
+    if !meta_path().exists() {
+        return Ok(());
+    }
+    let mut meta = read_meta();
+    let Some(object) = meta.as_object_mut() else {
+        return Ok(());
+    };
+    if let Some(entries) = object
+        .get_mut("entries")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        entries
+            .retain(|entry| entry.get("id").and_then(serde_json::Value::as_str) != Some(CLAUDE_PROFILE_ID));
+    }
+    if object
+        .get("appliedId")
+        .and_then(serde_json::Value::as_str)
+        == Some(CLAUDE_PROFILE_ID)
+    {
+        let next = object
+            .get("entries")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|entries| entries.first())
+            .and_then(|entry| entry.get("id"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        object.insert("appliedId".into(), next);
+    }
+    write_meta(&meta)
 }
 
 pub struct ClaudeDesktopConfigurator;
@@ -222,75 +324,96 @@ impl AppConfigurator for ClaudeDesktopConfigurator {
     }
 
     fn is_configured(&self) -> AppResult<bool> {
-        Ok(read_policy("inferenceProvider").as_deref() == Some("gateway")
-            && read_policy("inferenceGatewayBaseUrl").is_some())
+        let applied = read_meta()
+            .get("appliedId")
+            .and_then(serde_json::Value::as_str)
+            == Some(CLAUDE_PROFILE_ID);
+        Ok(applied && profile_path().exists())
     }
 
     fn apply(&self, ctx: &ApplyContext) -> AppResult<ApplyReport> {
-        let mut entry = serde_json::Map::new();
-        entry.insert("name".into(), serde_json::json!(ctx.model_alias));
-        entry.insert(
-            "labelOverride".into(),
-            serde_json::json!(ctx.model.name),
+        let models = serde_json::Value::Array(
+            ctx.model_choices
+                .iter()
+                .enumerate()
+                .map(|(index, choice)| {
+                    let mut entry = serde_json::Map::new();
+                    entry.insert("name".into(), serde_json::json!(choice.id));
+                    entry.insert("labelOverride".into(), serde_json::json!(choice.label));
+                    if ctx.model.supports_1m {
+                        entry.insert("supports1m".into(), serde_json::json!(true));
+                        if index == 0 {
+                            entry.insert("prefer1m".into(), serde_json::json!(true));
+                        }
+                    }
+                    serde_json::Value::Object(entry)
+                })
+                .collect(),
         );
-        if ctx.model.supports_1m {
-            entry.insert("supports1m".into(), serde_json::json!(true));
-            entry.insert("prefer1m".into(), serde_json::json!(true));
-        }
-        let models = serde_json::Value::Array(vec![serde_json::Value::Object(entry)]);
 
-        write_policy("inferenceProvider", "gateway")?;
-        write_policy("inferenceGatewayBaseUrl", &ctx.gateway_base_url)?;
-        write_policy("inferenceGatewayApiKey", &ctx.gateway_token)?;
-        write_policy("inferenceGatewayAuthScheme", "bearer")?;
-        write_policy("inferenceModels", &models.to_string())?;
-        write_policy("modelDiscoveryEnabled", "false")?;
-        write_policy("disableDeploymentModeChooser", "true")?;
+        let profile = serde_json::json!({
+            "inferenceProvider": "gateway",
+            "inferenceGatewayBaseUrl": ctx.gateway_base_url,
+            "inferenceGatewayApiKey": ctx.gateway_token,
+            "inferenceGatewayAuthScheme": "bearer",
+            "inferenceModels": models,
+            "modelDiscoveryEnabled": false,
+            "disableDeploymentModeChooser": true,
+        });
 
+        std::fs::create_dir_all(config_library_dir())?;
+        std::fs::write(profile_path(), serde_json::to_string_pretty(&profile)?)?;
+        adopt_meta()?;
+        clear_legacy_policy()?;
+
+        let routes = ctx
+            .model_choices
+            .iter()
+            .map(|choice| choice.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         let mut steps = vec![
+            format!("写入用户级配置 {}", profile_path().display()),
             format!("通过本地网关 {} 接管推理请求", ctx.gateway_base_url),
             format!(
                 "上游模型: {} ({})",
                 ctx.model.model,
                 ctx.model.format.display_name()
             ),
-            "已关闭模型自动发现，改为使用显式模型列表".into(),
+            format!("暴露 {} 个 Claude 路由: {routes}", ctx.model_choices.len()),
         ];
         if ctx.model.supports_1m {
             steps.push("已标记支持 1M 上下文窗口，Claude 模型选择器会额外提供 1M 变体".into());
         }
+        steps.push("已清除旧的 HKCU 托管策略，避免其覆盖用户级配置".into());
         steps.push("完全退出并重新打开 Claude Desktop 后生效".into());
 
         Ok(ApplyReport {
             kind: AppKind::ClaudeDesktop,
-            model_id: ctx.model.id.clone(),
+            model_id: ctx.model.id,
             model_name: ctx.model.name.clone(),
             apply_mode: ApplyMode::Gateway,
             target: format!(
-                r"HKEY_CURRENT_USER\{CLAUDE_POLICY_PATH} → inferenceProvider=gateway, inferenceGatewayBaseUrl={}",
+                r"{} → inferenceProvider=gateway, inferenceGatewayBaseUrl={}",
+                profile_path().display(),
                 ctx.gateway_base_url
             ),
             restart_required: true,
             steps,
             note: Some(
-                "写入的是 HKCU 用户级策略，无需管理员权限，也不会覆盖机器级 HKLM 策略；若机器级策略已存在，Claude Desktop 会完全忽略本配置。"
+                "写入的是 Claude Desktop 的用户级配置目录（与应用内「Configure Third-Party Inference」同一位置），无需管理员权限，也不会覆盖其他工具写的配置。注意：托管策略优先于用户级文件 —— 若机器级 HKLM 策略存在，Claude Desktop 会完全忽略本配置。"
                     .into(),
             ),
         })
     }
 
     fn clear(&self) -> AppResult<()> {
-        for name in [
-            "inferenceProvider",
-            "inferenceGatewayBaseUrl",
-            "inferenceGatewayApiKey",
-            "inferenceGatewayAuthScheme",
-            "inferenceModels",
-            "modelDiscoveryEnabled",
-            "disableDeploymentModeChooser",
-        ] {
-            delete_policy(name)?;
+        let path = profile_path();
+        if path.exists() {
+            std::fs::remove_file(&path)?;
         }
+        release_meta()?;
+        clear_legacy_policy()?;
         Ok(())
     }
 }
@@ -309,18 +432,23 @@ impl AppConfigurator for DeepseekDesktopConfigurator {
     }
 
     fn detect(&self) -> AppResult<DetectResult> {
-        if let Some(package) = find_msix(&["deepseek"]) {
+        if let Some(package) = find_msix(&["deepseek", "dsh desktop"]) {
             return Ok(DetectResult::found(
                 package.location.unwrap_or(package.name),
                 package.version,
             ));
         }
-        match find_app(&["deepseek"]) {
+        match find_app(&["dsh desktop", "deepseek harness", "deepseek"]) {
             Some(app) => Ok(DetectResult::found(
                 app.location.unwrap_or_else(|| app.name.clone()),
                 app.version,
             )),
-            None => match existing_dir(&[r"%APPDATA%\DeepSeek", r"%LOCALAPPDATA%\DeepSeek"]) {
+            None => match existing_dir(&[
+                r"%LOCALAPPDATA%\Programs\DSH Desktop",
+                r"%APPDATA%\DSH Desktop",
+                r"%APPDATA%\DeepSeek",
+                r"%LOCALAPPDATA%\DeepSeek",
+            ]) {
                 Some(path) => Ok(DetectResult::found(path, None)),
                 None => Ok(DetectResult::missing()),
             },
@@ -338,7 +466,7 @@ impl AppConfigurator for DeepseekDesktopConfigurator {
             "openai": {
                 "baseURL": ctx.gateway_base_url,
                 "apiKey": ctx.gateway_token,
-                "model": ctx.model_alias,
+                "model": ctx.gateway_model_id(),
             },
             "upstream": {
                 "format": ctx.model.format.as_str(),
@@ -354,7 +482,7 @@ impl AppConfigurator for DeepseekDesktopConfigurator {
 
         Ok(ApplyReport {
             kind: AppKind::DeepseekDesktop,
-            model_id: ctx.model.id.clone(),
+            model_id: ctx.model.id,
             model_name: ctx.model.name.clone(),
             apply_mode: ApplyMode::DirectConfig,
             target: path.clone(),

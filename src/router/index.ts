@@ -2,7 +2,10 @@ import { createRouter, createWebHashHistory } from "vue-router";
 
 import AppsPage from "@/pages/AppsPage.vue";
 import DashboardPage from "@/pages/DashboardPage.vue";
+import FiltersPage from "@/pages/FiltersPage.vue";
 import ModelsPage from "@/pages/ModelsPage.vue";
+import RequestDetailPage from "@/pages/RequestDetailPage.vue";
+import RequestsPage from "@/pages/RequestsPage.vue";
 import StatsPage from "@/pages/StatsPage.vue";
 
 export const router = createRouter({
@@ -28,10 +31,28 @@ export const router = createRouter({
       meta: { title: "模型", subtitle: "统一管理三种协议的上游模型" },
     },
     {
+      path: "/filters",
+      name: "filters",
+      component: FiltersPage,
+      meta: { title: "过滤器", subtitle: "在请求转发前按规则改写请求内容" },
+    },
+    {
       path: "/stats",
       name: "stats",
       component: StatsPage,
       meta: { title: "统计", subtitle: "Token 消耗贡献图与每一次请求的明细" },
+    },
+    {
+      path: "/stats/requests",
+      name: "requests",
+      component: RequestsPage,
+      meta: { title: "请求明细", subtitle: "全部网关调用记录，支持分页" },
+    },
+    {
+      path: "/stats/requests/:id",
+      name: "request-detail",
+      component: RequestDetailPage,
+      meta: { title: "请求详情", subtitle: "一次网关调用的完整报文" },
     },
   ],
 });

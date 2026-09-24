@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed } from "vue";
 import {
+  CircleArrowUp,
   CircleCheck,
   Download,
   ExternalLink,
@@ -17,7 +18,6 @@ import { Button } from "@/components/ui/button";
 import {
   Card,
   CardContent,
-  CardDescription,
   CardFooter,
   CardHeader,
   CardTitle,
@@ -28,43 +28,43 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { useApps } from "@/composables/useApps";
-import { applyModeLabels } from "@/lib/format";
 import { openUrl } from "@/lib/open";
-import type { ModelConfig, ToolApp } from "@/lib/types";
+import type { AppKind, ToolApp } from "@/lib/types";
 
 const props = defineProps<{
   app: ToolApp;
-  models: ModelConfig[];
-  activeModelId: string | null;
+  activeModelId: number | null;
 }>();
 
 const { busyKind, download, apply, clear, install, update } = useApps();
 
-const selectedModelId = ref<string>("");
-
-watch(
-  () => [props.app.appliedModelId, props.activeModelId, props.models.length] as const,
-  () => {
-    if (selectedModelId.value) return;
-    selectedModelId.value =
-      props.app.appliedModelId ?? props.activeModelId ?? props.models[0]?.id ?? "";
-  },
-  { immediate: true },
-);
+const APP_ICONS: Record<AppKind, string> = {
+  "claude-desktop": "/app-icons/claude-desktop.svg",
+  "deepseek-desktop": "/app-icons/deepseek-desktop.png",
+};
 
 const busy = computed(() => busyKind.value === props.app.kind);
 const installIcon = computed(() => (props.app.installed ? RefreshCw : Download));
 const applyIcon = computed(() =>
   props.app.appliedModelId ? CircleCheck : Plug,
 );
+const icon = computed(() => APP_ICONS[props.app.kind]);
+const status = computed(() => {
+  if (props.app.updateAvailable) {
+    return { label: "新版本", variant: "default" as const, upgrade: true };
+  }
+  return props.app.installed
+    ? { label: "已安装", variant: "default" as const, upgrade: false }
+    : { label: "未安装", variant: "outline" as const, upgrade: false };
+});
+const versionText = computed(() => {
+  if (!props.app.installed) return "未安装";
+  const current = props.app.version ?? "未知";
+  return props.app.updateAvailable && props.app.latestVersion
+    ? `${current} → ${props.app.latestVersion}`
+    : current;
+});
 const progress = computed(() => {
   const current = download.value;
   if (!current || current.kind !== props.app.kind || current.phase !== "downloading") {
@@ -74,64 +74,52 @@ const progress = computed(() => {
 });
 
 async function doApply() {
-  await apply(props.app.kind, selectedModelId.value || undefined);
+  await apply(props.app.kind);
 }
 </script>
 
 <template>
-  <Card class="gap-4">
+  <Card class="gap-4 transition-all hover:border-foreground/20 hover:shadow-md">
     <CardHeader>
       <div class="flex items-start justify-between gap-4">
-        <div class="space-y-1">
-          <CardTitle class="text-base">{{ app.name }}</CardTitle>
-          <CardDescription class="text-xs">
-            {{ app.publisher }} · {{ app.description }}
-          </CardDescription>
+        <div class="flex min-w-0 items-center gap-3">
+          <img :src="icon" :alt="app.name" class="size-10 shrink-0 object-contain" />
+          <div class="min-w-0 space-y-0.5">
+            <CardTitle class="text-base">{{ app.name }}</CardTitle>
+            <p class="truncate text-xs text-muted-foreground">
+              {{ app.publisher }}
+            </p>
+          </div>
         </div>
-        <div class="flex shrink-0 flex-col items-end gap-1.5">
-          <Badge :variant="app.installed ? 'default' : 'outline'">
-            {{ app.installed ? "已安装" : "未安装" }}
-          </Badge>
-          <span v-if="app.version" class="font-mono text-[11px] text-muted-foreground">
-            v{{ app.version }}
-          </span>
-        </div>
+        <Badge
+          class="shrink-0"
+          :variant="status.variant"
+          :class="status.upgrade ? 'border-transparent bg-emerald-500 text-white' : ''"
+        >
+          <MorphIconBox v-if="status.upgrade" :icon="CircleArrowUp" :size="12" />
+          {{ status.label }}
+        </Badge>
       </div>
     </CardHeader>
 
-    <CardContent class="space-y-3 text-xs">
-      <div class="grid grid-cols-2 gap-x-6 gap-y-2">
-        <div>
-          <p class="text-muted-foreground">接入方式</p>
-          <p class="font-medium">{{ applyModeLabels[app.applyMode] }}</p>
-        </div>
-        <div>
-          <p class="text-muted-foreground">当前模型</p>
-          <p class="font-medium">
-            <template v-if="app.appliedModelName">
-              <span class="text-emerald-600 dark:text-emerald-400">
-                {{ app.appliedModelName }}
-              </span>
-            </template>
-            <template v-else>
-              <span class="text-muted-foreground">未接入</span>
-            </template>
-          </p>
-        </div>
-        <div class="col-span-2">
-          <p class="text-muted-foreground">配置位置</p>
-          <p class="break-all font-mono">{{ app.configTarget }}</p>
-        </div>
-        <div v-if="app.installLocation" class="col-span-2">
-          <p class="text-muted-foreground">安装路径</p>
-          <p class="break-all font-mono">{{ app.installLocation }}</p>
-        </div>
-      </div>
+    <CardContent class="space-y-1 font-mono text-xs">
+      <p class="truncate">
+        <span class="text-muted-foreground">版本号: </span>{{ versionText }}
+      </p>
+      <p class="truncate">
+        <span class="text-muted-foreground">官网地址: </span>
+        <button
+          type="button"
+          class="text-blue-600 underline-offset-4 hover:underline dark:text-blue-400"
+          @click="openUrl(app.homepage)"
+        >
+          {{ app.homepage }}
+        </button>
+      </p>
+    </CardContent>
 
-      <div
-        v-if="progress"
-        class="space-y-1.5 rounded-md border bg-muted/40 px-3 py-2"
-      >
+    <CardContent v-if="progress">
+      <div class="space-y-1.5 rounded-md border bg-muted/40 px-3 py-2 text-xs">
         <div class="flex items-center justify-between text-[11px]">
           <span>正在下载安装包…</span>
           <span class="tabular-nums">{{ progress.percent?.toFixed(1) ?? "—" }}%</span>
@@ -145,27 +133,11 @@ async function doApply() {
       </div>
     </CardContent>
 
-    <CardFooter class="flex-wrap gap-2">
-      <Select v-model="selectedModelId" :disabled="!models.length">
-        <SelectTrigger size="sm" class="min-w-52 flex-1">
-          <SelectValue>
-            {{
-              models.find((item) => item.id === selectedModelId)?.name ??
-              "选择要接入的模型"
-            }}
-          </SelectValue>
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem v-for="model in models" :key="model.id" :value="model.id">
-            {{ model.name }}
-          </SelectItem>
-        </SelectContent>
-      </Select>
-
+    <CardFooter class="mt-auto gap-3">
       <Button
         size="sm"
-        class="gap-2"
-        :disabled="busy || !selectedModelId"
+        class="min-w-20 gap-2"
+        :disabled="busy || !activeModelId"
         @click="doApply"
       >
         <MorphIconBox
@@ -173,23 +145,23 @@ async function doApply() {
           :size="15"
           :class="busy ? 'animate-spin' : ''"
         />
-        一键应用模型
+        应用
       </Button>
 
       <Button
         variant="outline"
         size="sm"
-        class="gap-2"
+        class="min-w-20 gap-2"
         :disabled="busy"
         @click="app.installed ? update(app.kind) : install(app.kind)"
       >
         <MorphIconBox :icon="installIcon" :size="15" />
-        {{ app.installed ? "一键更新" : "一键安装" }}
+        {{ app.installed ? "升级" : "安装" }}
       </Button>
 
       <DropdownMenu>
         <DropdownMenuTrigger as-child>
-          <Button variant="ghost" size="icon-sm">
+          <Button variant="ghost" size="icon-sm" class="ml-auto">
             <MorphIconBox :icon="Route" :size="15" />
           </Button>
         </DropdownMenuTrigger>

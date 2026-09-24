@@ -1,12 +1,13 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, onUnmounted, ref, watch } from "vue";
 import { CircleCheck, LoaderCircle, Pencil, Play, Trash2, Wifi } from "lucide";
 
 import ConfirmDialog from "@/components/common/ConfirmDialog.vue";
 import FormatBadge from "@/components/common/FormatBadge.vue";
 import MorphIconBox from "@/components/common/MorphIconBox.vue";
-import { Badge } from "@/components/ui/badge";
+import UpstreamModelSelect from "@/components/models/UpstreamModelSelect.vue";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { useModels } from "@/composables/useModels";
 import { formatLatency } from "@/lib/format";
 import { cn } from "@/lib/utils";
@@ -19,39 +20,79 @@ const props = defineProps<{
 
 const emit = defineEmits<{ edit: [model: ModelConfig] }>();
 
-const { activate, remove, test, testingId } = useModels();
+const { activate, remove, test, testingId, save, upstreamCache } = useModels();
 
 const testing = computed(() => testingId.value === props.model.id);
 const result = ref<TestResult | null>(null);
+const modelId = ref(props.model.model);
+const upstreamOptions = computed(() => upstreamCache.value[props.model.id] ?? []);
+
+watch(
+  () => props.model.model,
+  (value) => {
+    modelId.value = value;
+  },
+);
+
+let clearTimer: ReturnType<typeof setTimeout> | undefined;
 
 async function runTest() {
   result.value = null;
+  if (clearTimer) clearTimeout(clearTimer);
   const outcome = await test(props.model.id);
-  if (outcome) result.value = outcome;
+  if (!outcome) return;
+  result.value = outcome;
+  if (outcome.ok) {
+    clearTimer = setTimeout(() => {
+      result.value = null;
+    }, 5000);
+  }
+}
+
+onUnmounted(() => {
+  if (clearTimer) clearTimeout(clearTimer);
+});
+
+async function setModelId(value: string) {
+  modelId.value = value;
+  await commitModelId();
+}
+
+async function commitModelId() {
+  const next = modelId.value.trim();
+  if (!next || next === props.model.model) {
+    modelId.value = props.model.model;
+    return;
+  }
+  const saved = await save({
+    id: props.model.id,
+    name: props.model.name,
+    format: props.model.format,
+    baseUrl: props.model.baseUrl,
+    apiKey: props.model.apiKey,
+    model: next,
+    supports1m: props.model.supports1m,
+  });
+  if (!saved) modelId.value = props.model.model;
+}
+
+function blurOnEnter(event: KeyboardEvent) {
+  (event.target as HTMLInputElement).blur();
 }
 </script>
 
 <template>
   <div
-    class="flex items-center gap-4 rounded-lg border bg-card px-4 py-3 transition-colors"
-    :class="active ? 'border-emerald-500/40' : ''"
+    class="flex items-center gap-4 rounded-lg border bg-card px-4 py-3 transition-all hover:shadow-sm"
+    :class="active ? 'border-emerald-500/40' : 'hover:border-foreground/20 hover:bg-accent/30'"
   >
     <div class="min-w-0 flex-1">
       <div class="flex flex-wrap items-center gap-2">
-        <p class="truncate text-sm font-medium">{{ model.name }}</p>
-        <Badge v-if="model.supports1m" variant="outline">1M</Badge>
+        <p class="truncate text-base font-semibold">{{ model.name }}</p>
         <FormatBadge :format="model.format" />
-        <Badge
-          v-if="active"
-          variant="outline"
-          class="border-transparent bg-emerald-500/15 text-emerald-600 dark:text-emerald-400"
-        >
-          <MorphIconBox :icon="CircleCheck" :size="12" />
-          使用中
-        </Badge>
       </div>
       <p class="mt-0.5 truncate font-mono text-xs text-muted-foreground">
-        {{ model.model }} · {{ model.baseUrl }}
+        {{ model.baseUrl }}
       </p>
       <p
         v-if="result"
@@ -63,35 +104,54 @@ async function runTest() {
       </p>
     </div>
 
-    <div class="flex shrink-0 items-center gap-1.5">
-      <Button size="sm" variant="outline" class="gap-2" :disabled="testing" @click="runTest">
-        <MorphIconBox
-          :icon="testing ? LoaderCircle : Wifi"
-          :size="15"
-          :class="testing ? 'animate-spin' : ''"
-        />
-        测试
-      </Button>
-
-      <Button
+    <div class="flex shrink-0 items-center gap-1">
+      <UpstreamModelSelect
+        v-if="upstreamOptions.length"
+        :model-value="modelId"
+        :options="upstreamOptions"
         size="sm"
-        class="gap-2"
+        trigger-class="mr-1"
+        placeholder="上游模型 ID"
+        @update:model-value="setModelId"
+      />
+      <Input
+        v-else
+        v-model="modelId"
+        class="mr-1 h-6 w-56 px-2 font-mono text-xs"
+        spellcheck="false"
+        aria-label="上游模型 ID"
+        title="上游模型 ID，失焦或回车后自动保存"
+        @blur="commitModelId"
+        @keydown.enter="blurOnEnter"
+      />
+      <Button
+        size="xs"
+        class="gap-1"
         :variant="active ? 'outline' : 'default'"
         :class="
           cn(
             active &&
-              'border-emerald-500/40 bg-emerald-500/10 text-emerald-600 hover:bg-emerald-500/10 dark:text-emerald-400',
+              'border-transparent bg-emerald-500 text-white hover:bg-emerald-500 disabled:opacity-100 dark:bg-emerald-500 dark:text-white',
           )
         "
         :disabled="active"
         @click="activate(model.id)"
       >
-        <MorphIconBox :icon="active ? CircleCheck : Play" :size="15" />
+        <MorphIconBox :icon="active ? CircleCheck : Play" :size="14" />
         {{ active ? "使用中" : "启用" }}
       </Button>
 
-      <Button variant="ghost" size="icon-sm" @click="emit('edit', model)">
-        <MorphIconBox :icon="Pencil" :size="15" />
+      <Button size="xs" variant="outline" class="gap-1" :disabled="testing" @click="runTest">
+        <MorphIconBox
+          :icon="testing ? LoaderCircle : Wifi"
+          :size="14"
+          :class="testing ? 'animate-spin' : ''"
+        />
+        测试
+      </Button>
+
+      <Button variant="ghost" size="icon-xs" @click="emit('edit', model)">
+        <MorphIconBox :icon="Pencil" :size="14" />
       </Button>
       <ConfirmDialog
         title="删除模型"
@@ -101,8 +161,8 @@ async function runTest() {
         @confirm="remove(model.id)"
       >
         <template #trigger>
-          <Button variant="ghost" size="icon-sm">
-            <MorphIconBox :icon="Trash2" :size="15" class="text-destructive" />
+          <Button variant="ghost" size="icon-xs">
+            <MorphIconBox :icon="Trash2" :size="14" class="text-destructive" />
           </Button>
         </template>
       </ConfirmDialog>

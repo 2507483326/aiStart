@@ -205,4 +205,16 @@ impl CanonicalRequest {
     pub fn stream(&self) -> bool {
         self.body.stream
     }
+
+    /// 在规范 JSON 上做改写，并据此重建类型化的 body，保证两者始终一致。
+    /// 过滤器（请求转发前的改写）通过它修改请求。
+    pub fn map_raw(
+        mut self,
+        f: impl FnOnce(&mut Value) -> crate::error::AppResult<()>,
+    ) -> crate::error::AppResult<Self> {
+        f(&mut self.raw)?;
+        self.body = serde_json::from_value(self.raw.clone())
+            .map_err(|err| crate::error::AppError::InvalidConfig(format!("请求体格式非法: {err}")))?;
+        Ok(self)
+    }
 }

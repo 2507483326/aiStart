@@ -1,43 +1,74 @@
 <script setup lang="ts">
-import { onMounted } from "vue";
-import { RefreshCw } from "lucide";
+import { computed, onMounted, ref } from "vue";
+import { useRouter } from "vue-router";
+import { useIntervalFn } from "@vueuse/core";
+import { ChevronRight } from "lucide";
 
 import MorphIconBox from "@/components/common/MorphIconBox.vue";
 import StatTile from "@/components/common/StatTile.vue";
 import ContributionHeatmap from "@/components/stats/ContributionHeatmap.vue";
-import { Badge } from "@/components/ui/badge";
+import RequestTable from "@/components/stats/RequestTable.vue";
 import { Button } from "@/components/ui/button";
 import {
   Card,
+  CardAction,
   CardContent,
   CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { useUsage } from "@/composables/useUsage";
-import { formatCompact, formatDateTime, formatLatency, formatNumber } from "@/lib/format";
+import { cacheHitRate, formatCompact, formatNumber, formatPercent } from "@/lib/format";
 
-const { summary, records, loading, refresh } = useUsage();
+const router = useRouter();
+const { summary, records, refresh } = useUsage();
 
-onMounted(() => refresh(365));
+// 统计页只预览最新若干条，完整列表在「请求明细」页
+const PREVIEW_LIMIT = 50;
 
-function protocolLabel(value: string): string {
-  switch (value) {
-    case "anthropic-messages":
-      return "Messages";
-    case "openai-completions":
-      return "Completions";
-    case "openai-responses":
-      return "Responses";
-    default:
-      return value || "—";
-  }
+const YEAR_SPAN = 4;
+const currentYear = new Date().getFullYear();
+const years = Array.from({ length: YEAR_SPAN }, (_, index) => currentYear - index);
+const year = ref(currentYear);
+
+const oldestDay = new Date(currentYear - (YEAR_SPAN - 1), 0, 1).getTime();
+const rangeDays = Math.max(1, Math.floor((Date.now() - oldestDay) / 86_400_000) + 1);
+
+function selectYear(value: unknown): void {
+  year.value = Number(value);
+}
+
+// 缓存命中率 = 缓存读 / 计费输入（未命中输入 + 缓存读 + 缓存写），与 dsh 同口径。
+const cacheHit = computed(() =>
+  formatPercent(
+    cacheHitRate({
+      inputTokens: summary.value?.inputTokens ?? 0,
+      cacheReadTokens: summary.value?.cacheReadTokens ?? 0,
+      cacheWriteTokens: summary.value?.cacheWriteTokens ?? 0,
+    }),
+  ),
+);
+
+onMounted(() => refresh(rangeDays, PREVIEW_LIMIT));
+
+// 有新请求时自动刷新（组件卸载自动停止）
+useIntervalFn(() => refresh(rangeDays, PREVIEW_LIMIT), 5000);
+
+function openAll(): void {
+  router.push({ name: "requests" });
 }
 </script>
 
 <template>
   <div class="mx-auto max-w-6xl space-y-5">
-    <div class="grid grid-cols-6 gap-3">
+    <div class="grid grid-cols-4 gap-3 xl:grid-cols-7">
       <StatTile label="总请求" :value="formatNumber(summary?.totalRequests ?? 0)" />
       <StatTile
         label="失败请求"
@@ -46,6 +77,11 @@ function protocolLabel(value: string): string {
       />
       <StatTile label="输入 Token" :value="formatCompact(summary?.inputTokens ?? 0)" />
       <StatTile label="输出 Token" :value="formatCompact(summary?.outputTokens ?? 0)" />
+      <StatTile
+        label="缓存命中"
+        :value="cacheHit"
+        :tone="(summary?.cacheReadTokens ?? 0) > 0 ? 'success' : 'default'"
+      />
       <StatTile label="今日 Token" :value="formatCompact(summary?.todayTokens ?? 0)" />
       <StatTile
         label="连续活跃"
@@ -60,21 +96,23 @@ function protocolLabel(value: string): string {
           <div class="space-y-1">
             <CardTitle class="text-base">Token 贡献</CardTitle>
             <CardDescription class="text-xs">
-              最近 53 周每天的 Token 消耗量，颜色越深消耗越多。
+              {{ year }} 年每天的 Token 消耗量，颜色越深消耗越多。
             </CardDescription>
           </div>
-          <Button variant="outline" size="sm" class="gap-2" :disabled="loading" @click="refresh(365)">
-            <MorphIconBox
-              :icon="RefreshCw"
-              :size="15"
-              :class="loading ? 'animate-spin' : ''"
-            />
-            刷新
-          </Button>
+          <Select :model-value="year" @update:model-value="selectYear">
+            <SelectTrigger size="sm" class="w-[110px]">
+              <SelectValue>{{ year }} 年</SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem v-for="value in years" :key="value" :value="value">
+                {{ value }} 年
+              </SelectItem>
+            </SelectContent>
+          </Select>
         </div>
       </CardHeader>
       <CardContent>
-        <ContributionHeatmap :daily="summary?.daily ?? []" />
+        <ContributionHeatmap :daily="summary?.daily ?? []" :year="year" />
       </CardContent>
     </Card>
 
@@ -83,73 +121,23 @@ function protocolLabel(value: string): string {
         <div class="space-y-1">
           <CardTitle class="text-base">请求明细</CardTitle>
           <CardDescription class="text-xs">
-            每次经由网关的调用及其 Token 消耗，最新 300 条。
+            每次经由网关的调用及其 Token 消耗，最新 {{ PREVIEW_LIMIT }} 条。
           </CardDescription>
         </div>
+        <CardAction>
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            class="text-muted-foreground"
+            aria-label="查看全部请求明细"
+            @click="openAll"
+          >
+            <MorphIconBox :icon="ChevronRight" :size="15" />
+          </Button>
+        </CardAction>
       </CardHeader>
       <CardContent>
-        <div v-if="!records.length" class="py-10 text-center text-sm text-muted-foreground">
-          还没有请求记录。让 Claude Desktop 或任意客户端调用一次网关即可看到数据。
-        </div>
-
-        <div v-else class="overflow-x-auto">
-          <table class="w-full text-xs">
-            <thead>
-              <tr class="border-b text-left text-muted-foreground">
-                <th class="py-2 pr-3 font-medium">时间</th>
-                <th class="py-2 pr-3 font-medium">模型</th>
-                <th class="py-2 pr-3 font-medium">入站</th>
-                <th class="py-2 pr-3 font-medium">上游</th>
-                <th class="py-2 pr-3 text-right font-medium">输入</th>
-                <th class="py-2 pr-3 text-right font-medium">输出</th>
-                <th class="py-2 pr-3 text-right font-medium">合计</th>
-                <th class="py-2 pr-3 text-right font-medium">耗时</th>
-                <th class="py-2 font-medium">状态</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="record in records" :key="record.timestamp" class="border-b last:border-0">
-                <td class="py-2 pr-3 whitespace-nowrap text-muted-foreground">
-                  {{ formatDateTime(record.timestamp) }}
-                </td>
-                <td class="py-2 pr-3">
-                  <span class="font-medium">{{ record.servedBy || record.modelName || "—" }}</span>
-                  <Badge v-if="record.failover" variant="outline" class="ml-1.5 text-[10px]">
-                    自动切换
-                  </Badge>
-                </td>
-                <td class="py-2 pr-3 whitespace-nowrap text-muted-foreground">
-                  {{ protocolLabel(record.inboundProtocol) }}
-                </td>
-                <td class="py-2 pr-3 whitespace-nowrap text-muted-foreground">
-                  {{ protocolLabel(record.upstreamProtocol) }}
-                </td>
-                <td class="py-2 pr-3 text-right font-mono tabular-nums">
-                  {{ formatNumber(record.inputTokens) }}
-                </td>
-                <td class="py-2 pr-3 text-right font-mono tabular-nums">
-                  {{ formatNumber(record.outputTokens) }}
-                </td>
-                <td class="py-2 pr-3 text-right font-mono font-medium tabular-nums">
-                  {{ formatNumber(record.inputTokens + record.outputTokens) }}
-                </td>
-                <td class="py-2 pr-3 text-right font-mono tabular-nums text-muted-foreground">
-                  {{ formatLatency(record.durationMs) }}
-                </td>
-                <td class="py-2">
-                  <Badge
-                    v-if="record.ok"
-                    variant="outline"
-                    class="border-transparent bg-emerald-500/15 text-emerald-600 dark:text-emerald-400"
-                  >
-                    成功
-                  </Badge>
-                  <Badge v-else variant="destructive" :title="record.error ?? ''">失败</Badge>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
+        <RequestTable :records="records" />
       </CardContent>
     </Card>
   </div>

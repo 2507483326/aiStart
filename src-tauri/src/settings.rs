@@ -1,28 +1,23 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::{OnceLock, RwLock};
 
-use serde::{Deserialize, Serialize};
+use rusqlite::{params, Connection};
 
+use crate::db;
 use crate::domain::app::AppKind;
 use crate::domain::model::{ModelConfig, ModelFormat, ModelInput};
 use crate::error::{AppError, AppResult};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
 pub struct Settings {
-    #[serde(default)]
     pub models: Vec<ModelConfig>,
-    #[serde(default)]
-    pub active_model_id: Option<String>,
-    #[serde(default = "default_port")]
+    pub active_model_id: Option<i64>,
     pub gateway_port: u16,
-    #[serde(default)]
     pub deepseek_config_path: Option<String>,
-    #[serde(default)]
     pub auto_failover: bool,
-    #[serde(default)]
-    pub applied: BTreeMap<String, String>,
+    /// app_kind -> model_id
+    pub applied: BTreeMap<String, i64>,
 }
 
 fn default_port() -> u16 {
@@ -44,13 +39,13 @@ impl Default for Settings {
 
 impl Settings {
     pub fn active_model(&self) -> Option<&ModelConfig> {
-        let id = self.active_model_id.as_ref()?;
-        self.models.iter().find(|model| &model.id == id)
+        let id = self.active_model_id?;
+        self.models.iter().find(|model| model.id == id)
     }
 
     pub fn applied_model(&self, kind: AppKind) -> Option<&ModelConfig> {
-        let id = self.applied.get(kind.as_str())?;
-        self.models.iter().find(|model| &model.id == id)
+        let id = *self.applied.get(kind.as_str())?;
+        self.models.iter().find(|model| model.id == id)
     }
 
     pub fn candidate_models(&self) -> Vec<ModelConfig> {
@@ -62,7 +57,7 @@ impl Settings {
             return list;
         }
         for model in &self.models {
-            if self.active_model_id.as_deref() == Some(model.id.as_str()) {
+            if self.active_model_id == Some(model.id) {
                 continue;
             }
             list.push(model.clone());
@@ -70,24 +65,24 @@ impl Settings {
         list
     }
 
+    fn next_model_id(&self) -> i64 {
+        self.models.iter().map(|model| model.id).max().unwrap_or(0) + 1
+    }
+
     pub fn upsert(&mut self, input: ModelInput) -> ModelConfig {
         let now = chrono::Local::now().to_rfc3339();
         let existing = input
             .id
-            .as_ref()
-            .and_then(|id| self.models.iter().position(|model| &model.id == id));
-
-        let id = input
-            .id
-            .clone()
-            .unwrap_or_else(|| format!("mdl_{}", uuid::Uuid::new_v4().simple()));
-
+            .and_then(|id| self.models.iter().position(|model| model.id == id));
+        let id = existing
+            .map(|index| self.models[index].id)
+            .unwrap_or_else(|| self.next_model_id());
         let created_at = existing
             .map(|index| self.models[index].created_at.clone())
             .unwrap_or_else(|| now.clone());
 
         let config = ModelConfig {
-            id: id.clone(),
+            id,
             name: input.name,
             format: input.format,
             base_url: input.base_url,
@@ -110,49 +105,103 @@ impl Settings {
         config
     }
 
-    pub fn remove(&mut self, id: &str) -> bool {
+    pub fn remove(&mut self, id: i64) -> bool {
         let before = self.models.len();
         self.models.retain(|model| model.id != id);
-        if self.active_model_id.as_deref() == Some(id) {
-            self.active_model_id = self.models.first().map(|model| model.id.clone());
+        if self.active_model_id == Some(id) {
+            self.active_model_id = self.models.first().map(|model| model.id);
         }
-        self.applied.retain(|_, value| value != id);
+        self.applied.retain(|_, value| *value != id);
         self.models.len() != before
     }
 }
 
-static DIR: OnceLock<PathBuf> = OnceLock::new();
 static STORE: OnceLock<RwLock<Settings>> = OnceLock::new();
 
 fn store() -> &'static RwLock<Settings> {
     STORE.get_or_init(|| RwLock::new(Settings::default()))
 }
 
-fn settings_file() -> Option<PathBuf> {
-    DIR.get().map(|dir| dir.join("settings.json"))
-}
+pub fn init(dir: &Path) -> AppResult<()> {
+    db::init(dir)?;
 
-pub fn data_dir() -> Option<PathBuf> {
-    DIR.get().cloned()
-}
-
-pub fn init(dir: PathBuf) -> AppResult<()> {
-    std::fs::create_dir_all(&dir)?;
-    let _ = DIR.set(dir.clone());
-
-    let path = dir.join("settings.json");
-    let loaded = if path.exists() {
-        let raw = std::fs::read_to_string(&path)?;
-        serde_json::from_str::<Settings>(&raw).unwrap_or_default()
-    } else {
-        Settings::default()
-    };
-
-    let mut settings = loaded;
+    let mut settings = load()?;
     seed_default_models(&mut settings);
 
     *store().write().expect("settings lock poisoned") = settings;
     persist()
+}
+
+fn load() -> AppResult<Settings> {
+    db::with_conn(|connection| {
+        let mut settings = Settings::default();
+
+        let mut statement = connection.prepare("SELECT key, value FROM app_settings")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (key, value) = row?;
+            match key.as_str() {
+                "active_model_id" => settings.active_model_id = value.trim().parse().ok(),
+                "gateway_port" => {
+                    if let Ok(port) = value.trim().parse() {
+                        settings.gateway_port = port;
+                    }
+                }
+                "deepseek_config_path" => {
+                    settings.deepseek_config_path = (!value.trim().is_empty()).then_some(value);
+                }
+                "auto_failover" => settings.auto_failover = value.trim() == "1",
+                _ => {}
+            }
+        }
+
+        settings.models = load_models(connection)?;
+        settings.applied = load_bindings(connection)?;
+        Ok(settings)
+    })
+}
+
+fn load_models(connection: &Connection) -> AppResult<Vec<ModelConfig>> {
+    let mut statement = connection.prepare(
+        "SELECT model_id, name, format, base_url, api_key, model, supports_1m, created_time, update_time \
+         FROM models ORDER BY model_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        let format: String = row.get(2)?;
+        Ok(ModelConfig {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            format: ModelFormat::parse(&format),
+            base_url: row.get(3)?,
+            api_key: row.get(4)?,
+            model: row.get(5)?,
+            supports_1m: row.get::<_, i64>(6)? != 0,
+            created_at: db::iso_from_ms(row.get(7)?),
+            updated_at: db::iso_from_ms(row.get(8)?),
+        })
+    })?;
+
+    let mut models = Vec::new();
+    for row in rows {
+        models.push(row?);
+    }
+    Ok(models)
+}
+
+fn load_bindings(connection: &Connection) -> AppResult<BTreeMap<String, i64>> {
+    let mut statement = connection.prepare("SELECT app_kind, model_id FROM app_model_bindings")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+
+    let mut bindings = BTreeMap::new();
+    for row in rows {
+        let (app_kind, model_id) = row?;
+        bindings.insert(app_kind, model_id);
+    }
+    Ok(bindings)
 }
 
 fn seed_default_models(settings: &mut Settings) {
@@ -175,10 +224,12 @@ fn seed_default_models(settings: &mut Settings) {
         ),
     ];
 
+    let mut next_id = settings.next_model_id();
     for (name, format, base_url, model) in seeds {
-        let id = format!("mdl_{}", uuid::Uuid::new_v4().simple());
+        let id = next_id;
+        next_id += 1;
         settings.models.push(ModelConfig {
-            id: id.clone(),
+            id,
             name: name.into(),
             format,
             base_url: base_url.into(),
@@ -194,16 +245,69 @@ fn seed_default_models(settings: &mut Settings) {
     }
 }
 
+fn setting_pairs(settings: &Settings) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "active_model_id",
+            settings
+                .active_model_id
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+        ),
+        ("gateway_port", settings.gateway_port.to_string()),
+        (
+            "deepseek_config_path",
+            settings.deepseek_config_path.clone().unwrap_or_default(),
+        ),
+        (
+            "auto_failover",
+            if settings.auto_failover { "1" } else { "0" }.to_string(),
+        ),
+    ]
+}
+
 pub fn persist() -> AppResult<()> {
-    let Some(path) = settings_file() else {
-        return Ok(());
-    };
     let snapshot = store().read().expect("settings lock poisoned").clone();
-    let raw = serde_json::to_string_pretty(&snapshot)?;
-    let temp = path.with_extension("json.tmp");
-    std::fs::write(&temp, raw)?;
-    std::fs::rename(&temp, &path)?;
-    Ok(())
+    db::with_tx(|transaction| {
+        let now = db::now_ms();
+
+        for (key, value) in setting_pairs(&snapshot) {
+            transaction.execute(
+                "INSERT INTO app_settings (key, value, created_time, update_time) VALUES (?1, ?2, ?3, ?3) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, update_time = excluded.update_time",
+                params![key, value, now],
+            )?;
+        }
+
+        transaction.execute("DELETE FROM models", [])?;
+        for model in &snapshot.models {
+            transaction.execute(
+                "INSERT INTO models (model_id, name, format, base_url, api_key, model, supports_1m, created_time, update_time) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    model.id,
+                    model.name,
+                    model.format.as_str(),
+                    model.base_url,
+                    model.api_key,
+                    model.model,
+                    i64::from(model.supports_1m),
+                    db::ms_from_iso(&model.created_at).unwrap_or(now),
+                    db::ms_from_iso(&model.updated_at).unwrap_or(now),
+                ],
+            )?;
+        }
+
+        transaction.execute("DELETE FROM app_model_bindings", [])?;
+        for (app_kind, model_id) in &snapshot.applied {
+            transaction.execute(
+                "INSERT INTO app_model_bindings (app_kind, model_id, created_time, update_time) VALUES (?1, ?2, ?3, ?3)",
+                params![app_kind, model_id, now],
+            )?;
+        }
+
+        Ok(())
+    })
 }
 
 pub fn snapshot() -> Settings {
@@ -231,7 +335,7 @@ pub fn deepseek_config_path() -> String {
     crate::platform::expand_env(&default)
 }
 
-pub fn require_model(id: &str) -> AppResult<ModelConfig> {
+pub fn require_model(id: i64) -> AppResult<ModelConfig> {
     snapshot()
         .models
         .iter()

@@ -58,7 +58,6 @@ onMounted(async () => {
         v-for="app in apps"
         :key="app.kind"
         :app="app"
-        :models="models"
         :active-model-id="activeModelId"
       />
     </div>

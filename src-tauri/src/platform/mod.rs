@@ -8,11 +8,28 @@ use crate::domain::app::{AppDescriptor, AppKind, ApplyReport};
 use crate::domain::model::ModelConfig;
 use crate::error::AppResult;
 
+/// A route a client can be pointed at: the id it sends, plus the label its
+/// model picker shows.
+pub struct ModelChoice {
+    pub id: String,
+    pub label: String,
+}
+
 pub struct ApplyContext {
     pub model: ModelConfig,
     pub gateway_base_url: String,
     pub gateway_token: String,
-    pub model_alias: String,
+    pub model_choices: Vec<ModelChoice>,
+}
+
+impl ApplyContext {
+    /// Model id for clients that only take a single name.
+    pub fn gateway_model_id(&self) -> &str {
+        self.model_choices
+            .first()
+            .map(|choice| choice.id.as_str())
+            .unwrap_or_default()
+    }
 }
 
 pub struct DetectResult {

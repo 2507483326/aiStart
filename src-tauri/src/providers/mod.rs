@@ -48,6 +48,7 @@ pub struct WireState {
     pub response_id: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_read_tokens: u64,
     pub next_output_index: i64,
     pub text_block_index: Option<i64>,
     pub text_output_index: i64,
@@ -89,6 +90,9 @@ pub struct StreamState {
     pub upstream_model: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// 缓存读 / 缓存写 token（Anthropic 语义：input_tokens 不含缓存，两者单独计）。
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
     pub message_started: bool,
     pub open_block: Option<BlockKind>,
     pub next_index: i64,
@@ -105,6 +109,8 @@ impl StreamState {
             upstream_model: requested_model,
             input_tokens: 0,
             output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             message_started: false,
             open_block: None,
             next_index: 0,
@@ -131,7 +137,12 @@ impl StreamState {
                     "content": [],
                     "stop_reason": null,
                     "stop_sequence": null,
-                    "usage": { "input_tokens": self.input_tokens, "output_tokens": 0 }
+                    "usage": {
+                        "input_tokens": self.input_tokens,
+                        "output_tokens": 0,
+                        "cache_read_input_tokens": self.cache_read_tokens,
+                        "cache_creation_input_tokens": self.cache_write_tokens
+                    }
                 }
             }),
         )]
@@ -232,6 +243,164 @@ impl StreamState {
             "error",
             json!({ "type": "error", "error": { "type": kind, "message": message } }),
         )]
+    }
+}
+
+#[derive(Debug, Default)]
+struct AssembledToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// 把 canonical（Anthropic 形状）流事件拼装成 canonical message，供报文落库使用。
+/// 落库前会再经 provider 的 `encode_response` 转成上游协议的原生形状，前端按协议解析。
+#[derive(Debug, Default)]
+pub struct ResponseAssembler {
+    message_id: String,
+    model: String,
+    text: String,
+    thinking: String,
+    tool_calls: Vec<AssembledToolCall>,
+    tool_index_by_block: BTreeMap<i64, usize>,
+    stop_reason: Option<String>,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+}
+
+impl ResponseAssembler {
+    pub fn apply(&mut self, event: &SseEvent) {
+        let data = &event.data;
+        match event.event.as_str() {
+            "message_start" => {
+                if let Some(id) = data.pointer("/message/id").and_then(Value::as_str) {
+                    self.message_id = id.to_string();
+                }
+                if let Some(model) = data.pointer("/message/model").and_then(Value::as_str) {
+                    self.model = model.to_string();
+                }
+                if let Some(tokens) = data
+                    .pointer("/message/usage/input_tokens")
+                    .and_then(Value::as_u64)
+                {
+                    self.input_tokens = tokens;
+                }
+                if let Some(tokens) = data
+                    .pointer("/message/usage/cache_read_input_tokens")
+                    .and_then(Value::as_u64)
+                {
+                    self.cache_read_tokens = tokens;
+                }
+                if let Some(tokens) = data
+                    .pointer("/message/usage/cache_creation_input_tokens")
+                    .and_then(Value::as_u64)
+                {
+                    self.cache_write_tokens = tokens;
+                }
+            }
+            "content_block_start" => {
+                if data.pointer("/content_block/type").and_then(Value::as_str) == Some("tool_use")
+                {
+                    let index = data.get("index").and_then(Value::as_i64).unwrap_or(0);
+                    self.tool_calls.push(AssembledToolCall {
+                        id: data
+                            .pointer("/content_block/id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        name: data
+                            .pointer("/content_block/name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        arguments: String::new(),
+                    });
+                    self.tool_index_by_block
+                        .insert(index, self.tool_calls.len() - 1);
+                }
+            }
+            "content_block_delta" => {
+                let index = data.get("index").and_then(Value::as_i64).unwrap_or(0);
+                match data.pointer("/delta/type").and_then(Value::as_str) {
+                    Some("text_delta") => {
+                        if let Some(text) = data.pointer("/delta/text").and_then(Value::as_str) {
+                            self.text.push_str(text);
+                        }
+                    }
+                    Some("thinking_delta") => {
+                        if let Some(text) =
+                            data.pointer("/delta/thinking").and_then(Value::as_str)
+                        {
+                            self.thinking.push_str(text);
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        if let Some(partial) =
+                            data.pointer("/delta/partial_json").and_then(Value::as_str)
+                        {
+                            if let Some(&tool) = self.tool_index_by_block.get(&index) {
+                                self.tool_calls[tool].arguments.push_str(partial);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "message_delta" => {
+                if let Some(stop) = data.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                    self.stop_reason = Some(stop.to_string());
+                }
+                if let Some(tokens) = data.pointer("/usage/output_tokens").and_then(Value::as_u64) {
+                    self.output_tokens = tokens;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 拼装成 canonical（Anthropic Messages 形状）的响应消息。
+    pub fn to_value(&self) -> Value {
+        let mut content: Vec<Value> = Vec::new();
+        if !self.thinking.is_empty() {
+            content.push(json!({ "type": "thinking", "thinking": self.thinking }));
+        }
+        if !self.text.is_empty() {
+            content.push(json!({ "type": "text", "text": self.text }));
+        }
+        for tool in &self.tool_calls {
+            let input = serde_json::from_str::<Value>(&tool.arguments)
+                .unwrap_or_else(|_| Value::String(tool.arguments.clone()));
+            content.push(json!({
+                "type": "tool_use",
+                "id": tool.id,
+                "name": tool.name,
+                "input": input
+            }));
+        }
+
+        let id = if self.message_id.is_empty() {
+            format!("msg_{}", uuid::Uuid::new_v4().simple())
+        } else {
+            self.message_id.clone()
+        };
+
+        json!({
+            "id": id,
+            "type": "message",
+            "role": "assistant",
+            "model": self.model,
+            "content": content,
+            "stop_reason": self.stop_reason,
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": self.input_tokens,
+                "output_tokens": self.output_tokens,
+                "cache_read_input_tokens": self.cache_read_tokens,
+                "cache_creation_input_tokens": self.cache_write_tokens
+            }
+        })
     }
 }
 

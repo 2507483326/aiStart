@@ -6,6 +6,7 @@ import {
   BarChart3,
   Boxes,
   BrainCircuit,
+  Funnel,
   LayoutDashboard,
   Settings2,
   Sparkles,
@@ -30,7 +31,10 @@ const sectionIcons = {
   dashboard: LayoutDashboard,
   apps: Boxes,
   models: BrainCircuit,
+  filters: Funnel,
   stats: BarChart3,
+  requests: BarChart3,
+  "request-detail": BarChart3,
 };
 
 const activeIcon = computed(

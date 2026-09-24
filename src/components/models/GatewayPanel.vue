@@ -32,7 +32,7 @@ const sample = computed(
   () => `curl ${baseUrl.value}/v1/messages \\
   -H "content-type: application/json" \\
   -H "x-api-key: aiStart" \\
-  -d '{"model":"aiStart","max_tokens":64,"messages":[{"role":"user","content":"ping"}]}'`,
+  -d '{"model":"claude-sonnet-5","max_tokens":64,"messages":[{"role":"user","content":"ping"}]}'`,
 );
 
 async function copySample() {
@@ -91,15 +91,19 @@ async function copySample() {
           <div
             v-for="endpoint in endpoints"
             :key="endpoint.path"
-            class="flex items-center gap-2 rounded-md border px-2.5 py-1.5"
+            class="flex items-center gap-2 rounded-md border px-2.5 py-1.5 transition-colors hover:bg-accent/40"
           >
             <span class="font-mono text-[11px]">{{ endpoint.path }}</span>
             <span class="text-[11px] text-muted-foreground">{{ endpoint.label }}</span>
           </div>
         </div>
         <p class="text-[11px] text-muted-foreground">
-          三个端点都使用同一个 API Key：<span class="font-mono">aiStart</span>，模型名也固定为
-          <span class="font-mono">aiStart</span>。
+          三个端点都使用同一个 API Key：<span class="font-mono">aiStart</span>。模型名必须是 Claude
+          能识别的 <span class="font-mono">claude-*</span> 路由（对外提供
+          <span class="font-mono">claude-sonnet-5</span> /
+          <span class="font-mono">claude-opus-5</span> /
+          <span class="font-mono">claude-haiku-4-5</span> /
+          <span class="font-mono">claude-fable-5</span>），实际转发到的是当前启用的上游模型。
         </p>
       </div>
 

@@ -8,6 +8,15 @@ use super::{BlockKind, DeltaKind, ModelProvider, SseEvent, StreamState, WireStat
 
 pub struct OpenaiCompletionsProvider;
 
+/// 思考内容的字段名各家不同：DeepSeek 原生用 `reasoning_content`，OpenRouter 系（含部分网关上游）用 `reasoning`。
+fn reasoning_text(value: &Value) -> Option<&str> {
+    value
+        .get("reasoning_content")
+        .or_else(|| value.get("reasoning"))
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+}
+
 fn image_url_from_block(block: &ContentBlock) -> Option<String> {
     let source = block.field("source")?;
     match source.get("type").and_then(Value::as_str) {
@@ -200,11 +209,7 @@ impl ModelProvider for OpenaiCompletionsProvider {
             .and_then(Value::as_str);
 
         let mut content: Vec<Value> = Vec::new();
-        if let Some(reasoning) = message
-            .get("reasoning_content")
-            .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
-        {
+        if let Some(reasoning) = reasoning_text(&message) {
             content.push(json!({ "type": "thinking", "thinking": reasoning }));
         }
         if let Some(text) = message.get("content").and_then(Value::as_str) {
@@ -229,6 +234,23 @@ impl ModelProvider for OpenaiCompletionsProvider {
 
         let stop_reason = super::resolve_stop_reason(finish_reason);
 
+        // OpenAI 的 prompt_tokens 已包含缓存命中，canonical 采用 Anthropic 语义（input 不含缓存），
+        // 故拆成「未命中输入 + 缓存读」；两者相加等于上游 prompt_tokens，不会重复计数。
+        let usage = raw.get("usage");
+        let prompt_tokens = usage
+            .and_then(|value| value.get("prompt_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cache_read_tokens = usage
+            .and_then(|value| value.pointer("/prompt_tokens_details/cached_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let input_tokens = prompt_tokens.saturating_sub(cache_read_tokens);
+        let output_tokens = usage
+            .and_then(|value| value.get("completion_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+
         Ok(json!({
             "id": raw.get("id").and_then(Value::as_str).map(str::to_string)
                 .unwrap_or_else(|| format!("msg_{}", uuid::Uuid::new_v4().simple())),
@@ -239,8 +261,10 @@ impl ModelProvider for OpenaiCompletionsProvider {
             "stop_reason": stop_reason,
             "stop_sequence": null,
             "usage": {
-                "input_tokens": raw.pointer("/usage/prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
-                "output_tokens": raw.pointer("/usage/completion_tokens").and_then(Value::as_u64).unwrap_or(0)
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cache_read_input_tokens": cache_read_tokens,
+                "cache_creation_input_tokens": 0
             }
         }))
     }
@@ -253,9 +277,15 @@ impl ModelProvider for OpenaiCompletionsProvider {
         state: &mut StreamState,
     ) -> AppResult<Vec<SseEvent>> {
         if let Some(usage) = data.get("usage").filter(|value| !value.is_null()) {
+            let cache_read = usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
             if let Some(prompt) = usage.get("prompt_tokens").and_then(Value::as_u64) {
-                state.input_tokens = prompt;
+                // prompt_tokens 含缓存命中，canonical 只留未命中部分（与 Anthropic 同口径）。
+                state.input_tokens = prompt.saturating_sub(cache_read);
             }
+            state.cache_read_tokens = cache_read;
             if let Some(completion) = usage.get("completion_tokens").and_then(Value::as_u64) {
                 state.output_tokens = completion;
             }
@@ -268,11 +298,7 @@ impl ModelProvider for OpenaiCompletionsProvider {
         let mut events: Vec<SseEvent> = Vec::new();
 
         if let Some(delta) = choice.get("delta") {
-            if let Some(reasoning) = delta
-                .get("reasoning_content")
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-            {
+            if let Some(reasoning) = reasoning_text(delta) {
                 events.extend(state.delta(DeltaKind::Thinking, reasoning));
             }
 
@@ -537,10 +563,16 @@ impl ModelProvider for OpenaiCompletionsProvider {
             .pointer("/usage/input_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        let cache_read_tokens = canonical
+            .pointer("/usage/cache_read_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         let output_tokens = canonical
             .pointer("/usage/output_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        // 回写给 OpenAI 客户端时把缓存读并回 prompt_tokens（OpenAI 语义：prompt_tokens 含缓存）。
+        let prompt_tokens = input_tokens + cache_read_tokens;
 
         Ok(json!({
             "id": canonical.get("id").cloned()
@@ -554,9 +586,10 @@ impl ModelProvider for OpenaiCompletionsProvider {
                 "finish_reason": finish
             }],
             "usage": {
-                "prompt_tokens": input_tokens,
+                "prompt_tokens": prompt_tokens,
                 "completion_tokens": output_tokens,
-                "total_tokens": input_tokens + output_tokens
+                "total_tokens": prompt_tokens + output_tokens,
+                "prompt_tokens_details": { "cached_tokens": cache_read_tokens }
             }
         }))
     }

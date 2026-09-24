@@ -1,37 +1,12 @@
-import { computed, ref } from "vue";
+import { storeToRefs } from "pinia";
 
-import { gatewayApi } from "@/lib/ipc";
-import { attempt } from "@/lib/notify";
-import type { GatewayStatus } from "@/lib/types";
-
-const status = ref<GatewayStatus | null>(null);
-const loading = ref(false);
-
-async function refresh(): Promise<void> {
-  loading.value = true;
-  try {
-    status.value = await gatewayApi.status();
-  } finally {
-    loading.value = false;
-  }
-}
-
-async function restart(): Promise<boolean> {
-  const result = await attempt(() => gatewayApi.restart(), {
-    success: "本地网关已重启",
-    error: "重启网关失败",
-  });
-  if (!result) return false;
-  status.value = result;
-  return true;
-}
+import { useGatewayStore } from "@/stores/gateway";
 
 export function useGateway() {
+  const store = useGatewayStore();
   return {
-    status,
-    loading,
-    running: computed(() => status.value?.running ?? false),
-    refresh,
-    restart,
+    ...storeToRefs(store),
+    refresh: store.refresh,
+    restart: store.restart,
   };
 }

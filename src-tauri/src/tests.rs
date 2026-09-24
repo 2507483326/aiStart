@@ -3,12 +3,12 @@ use serde_json::json;
 use crate::commands::models::parse_model_ids;
 use crate::domain::canonical::CanonicalRequest;
 use crate::domain::model::{ModelConfig, ModelFormat};
-use crate::providers::{provider_for, SseEvent, WireState};
+use crate::providers::{provider_for, SseEvent, StreamState, WireState};
 use crate::settings::Settings;
 
 fn model(format: ModelFormat, base_url: &str) -> ModelConfig {
     ModelConfig {
-        id: "test".into(),
+        id: 1,
         name: "Test".into(),
         format,
         base_url: base_url.into(),
@@ -43,7 +43,7 @@ fn candidate_models_puts_active_first_and_only_expands_when_failover_is_on() {
     let mut settings = Settings::default();
     for name in ["A", "B", "C"] {
         settings.upsert(crate::domain::model::ModelInput {
-            id: Some(name.into()),
+            id: None,
             name: name.into(),
             format: ModelFormat::OpenaiCompletions,
             base_url: "https://example.com/v1".into(),
@@ -52,7 +52,7 @@ fn candidate_models_puts_active_first_and_only_expands_when_failover_is_on() {
             supports_1m: false,
         });
     }
-    settings.active_model_id = Some("B".into());
+    settings.active_model_id = Some(2);
 
     settings.auto_failover = false;
     let single = settings.candidate_models();
@@ -176,6 +176,97 @@ fn openai_completions_decodes_tool_calls_into_tool_use_blocks() {
     assert_eq!(decoded["content"][1]["input"]["city"], "Beijing");
     assert_eq!(decoded["stop_reason"], "tool_use");
     assert_eq!(decoded["usage"]["input_tokens"], 3);
+}
+
+#[test]
+fn openai_completions_splits_cached_prompt_tokens() {
+    let config = model(ModelFormat::OpenaiCompletions, "https://api.openai.com/v1");
+    let provider = provider_for(ModelFormat::OpenaiCompletions);
+
+    // OpenAI 的 prompt_tokens 已含缓存命中：canonical 拆成「未命中输入 + 缓存读」，两者之和不变。
+    let decoded = provider
+        .decode_response(
+            &config,
+            &json!({
+                "id": "chatcmpl-1",
+                "model": "gpt",
+                "choices": [{ "message": { "role": "assistant", "content": "ok" }, "finish_reason": "stop" }],
+                "usage": {
+                    "prompt_tokens": 1000,
+                    "completion_tokens": 20,
+                    "prompt_tokens_details": { "cached_tokens": 900 }
+                }
+            }),
+        )
+        .unwrap();
+
+    assert_eq!(decoded["usage"]["input_tokens"], 100);
+    assert_eq!(decoded["usage"]["cache_read_input_tokens"], 900);
+    assert_eq!(decoded["usage"]["output_tokens"], 20);
+
+    // 回写给 OpenAI 客户端时缓存读并回 prompt_tokens（OpenAI 语义：prompt_tokens 含缓存）
+    let encoded = provider.encode_response(&config, &decoded).unwrap();
+    assert_eq!(encoded["usage"]["prompt_tokens"], 1000);
+    assert_eq!(encoded["usage"]["prompt_tokens_details"]["cached_tokens"], 900);
+}
+
+#[test]
+fn openai_responses_splits_cached_input_tokens() {
+    let config = model(ModelFormat::OpenaiResponses, "https://api.openai.com/v1");
+    let provider = provider_for(ModelFormat::OpenaiResponses);
+
+    let decoded = provider
+        .decode_response(
+            &config,
+            &json!({
+                "id": "resp_1",
+                "model": "gpt",
+                "status": "completed",
+                "output": [],
+                "usage": {
+                    "input_tokens": 500,
+                    "output_tokens": 10,
+                    "input_tokens_details": { "cached_tokens": 400 }
+                }
+            }),
+        )
+        .unwrap();
+
+    assert_eq!(decoded["usage"]["input_tokens"], 100);
+    assert_eq!(decoded["usage"]["cache_read_input_tokens"], 400);
+    assert_eq!(decoded["usage"]["output_tokens"], 10);
+}
+
+#[test]
+fn anthropic_stream_records_cache_tokens() {
+    let config = model(ModelFormat::AnthropicMessages, "https://api.anthropic.com");
+    let provider = provider_for(ModelFormat::AnthropicMessages);
+    let mut state = StreamState::new("claude");
+
+    provider
+        .decode_stream_event(
+            &config,
+            "message_start",
+            &json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_1",
+                    "model": "claude",
+                    "usage": {
+                        "input_tokens": 50,
+                        "output_tokens": 0,
+                        "cache_read_input_tokens": 1000,
+                        "cache_creation_input_tokens": 200
+                    }
+                }
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+    assert_eq!(state.input_tokens, 50);
+    assert_eq!(state.cache_read_tokens, 1000);
+    assert_eq!(state.cache_write_tokens, 200);
 }
 
 #[test]
@@ -304,6 +395,70 @@ fn openai_completions_reencodes_canonical_stream_into_chunks() {
 }
 
 #[test]
+fn openai_completions_decodes_reasoning_field_as_thinking() {
+    let config = model(ModelFormat::OpenaiCompletions, "https://api.openai.com/v1");
+    let provider = provider_for(ModelFormat::OpenaiCompletions);
+    let mut state = StreamState::new("upstream-model");
+
+    // 上游用 `reasoning` 承载思考（OpenRouter 口径），此前只认 `reasoning_content` 会整段丢掉
+    let thinking = provider
+        .decode_stream_event(
+            &config,
+            "",
+            &json!({ "choices": [{ "index": 0, "delta": { "reasoning": "let me think" }, "finish_reason": null }] }),
+            &mut state,
+        )
+        .unwrap();
+    assert_eq!(thinking[1].data["type"], "content_block_start");
+    assert_eq!(thinking[1].data["content_block"]["type"], "thinking");
+    assert_eq!(thinking[2].data["delta"]["type"], "thinking_delta");
+    assert_eq!(thinking[2].data["delta"]["thinking"], "let me think");
+
+    // 正文到来时收尾思考块、另起文本块
+    let text = provider
+        .decode_stream_event(
+            &config,
+            "",
+            &json!({ "choices": [{ "index": 0, "delta": { "content": "pong" }, "finish_reason": "stop" }] }),
+            &mut state,
+        )
+        .unwrap();
+    let kinds: Vec<&str> = text
+        .iter()
+        .map(|event| event.data["type"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "content_block_stop",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop"
+        ]
+    );
+    assert_eq!(text[2].data["delta"]["text"], "pong");
+
+    // 非流式同样识别 `reasoning`
+    let decoded = provider
+        .decode_response(
+            &config,
+            &json!({
+                "id": "gen_1",
+                "model": "deepseek/deepseek-v4-flash",
+                "choices": [{ "index": 0, "message": { "role": "assistant", "content": "pong", "reasoning": "thinking" }, "finish_reason": "stop" }],
+                "usage": { "prompt_tokens": 10, "completion_tokens": 5 }
+            }),
+        )
+        .unwrap();
+    assert_eq!(decoded["content"][0]["type"], "thinking");
+    assert_eq!(decoded["content"][0]["thinking"], "thinking");
+    assert_eq!(decoded["content"][1]["type"], "text");
+    assert_eq!(decoded["content"][1]["text"], "pong");
+}
+
+#[test]
 fn openai_responses_reencodes_canonical_stream_into_events() {
     let events = encode_all(ModelFormat::OpenaiResponses);
     let kinds: Vec<&str> = events
@@ -418,4 +573,475 @@ fn canonical_responses_are_re_encoded_for_openai_clients() {
         .collect();
     assert_eq!(types, vec!["message", "function_call"]);
     assert_eq!(responses["status"], "completed");
+}
+
+#[test]
+fn sqlite_persistence_round_trips() {
+    use crate::domain::app::AppKind;
+    use crate::domain::model::ModelInput;
+    use crate::usage::{self, UsageRecord};
+    use crate::{events, settings, updates};
+
+    let dir = std::env::temp_dir().join(format!("ai-start-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    settings::init(&dir).expect("database should initialize");
+
+    let seeded = settings::snapshot();
+    assert_eq!(seeded.models.len(), 2);
+    assert!(seeded.active_model_id.is_some());
+
+    let saved = settings::mutate(|store| {
+        store.upsert(ModelInput {
+            id: None,
+            name: "Temp".into(),
+            format: ModelFormat::OpenaiResponses,
+            base_url: "https://example.com/v1".into(),
+            api_key: "k".into(),
+            model: "temp-model".into(),
+            supports_1m: true,
+        })
+    })
+    .expect("model should save");
+    assert_eq!(saved.id, 3);
+
+    settings::mutate(|store| {
+        store.applied.insert("claude-desktop".into(), saved.id);
+    })
+    .expect("binding should save");
+
+    let reloaded = settings::snapshot();
+    assert_eq!(reloaded.applied.get("claude-desktop"), Some(&saved.id));
+    assert_eq!(
+        reloaded
+            .applied_model(AppKind::ClaudeDesktop)
+            .map(|model| model.model.as_str()),
+        Some("temp-model")
+    );
+
+    let (timestamp, date) = usage::current_timestamp();
+    usage::record_with_payload(
+        &UsageRecord {
+            id: 0,
+            timestamp: timestamp.clone(),
+            date: date.clone(),
+            model_name: "Temp".into(),
+            served_by: "Temp".into(),
+            inbound_protocol: "anthropic-messages".into(),
+            upstream_protocol: "openai-responses".into(),
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            duration_ms: 12,
+            ok: true,
+            failover: false,
+            error: None,
+        },
+        None,
+    );
+
+    let records = usage::recent(10);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].total_tokens(), 15);
+    let summary = usage::summary(365);
+    assert_eq!(summary.total_requests, 1);
+    assert_eq!(summary.today_tokens, 15);
+
+    // 详情页按 id 单独取记录
+    assert_eq!(usage::find(records[0].id).expect("record should load").id, records[0].id);
+    assert!(usage::find(999_999).is_none());
+
+    // 列表页分页：总数 + 倒序 + 越界空页
+    let first_page = usage::page(0, 10);
+    assert_eq!(first_page.total, 1);
+    assert_eq!(first_page.items.len(), 1);
+    assert_eq!(first_page.items[0].id, records[0].id);
+    let offset_page = usage::page(10, 10);
+    assert_eq!(offset_page.total, 1);
+    assert!(offset_page.items.is_empty());
+
+    // 报文捕获：入站请求 + 上游响应可回读
+    usage::record_with_payload(
+        &UsageRecord {
+            id: 0,
+            timestamp: timestamp.clone(),
+            date: date.clone(),
+            model_name: "Temp".into(),
+            served_by: "Temp".into(),
+            inbound_protocol: "anthropic-messages".into(),
+            upstream_protocol: "openai-responses".into(),
+            input_tokens: 3,
+            output_tokens: 4,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            duration_ms: 5,
+            ok: true,
+            failover: false,
+            error: None,
+        },
+        Some(&usage::UsagePayload {
+            inbound_request: Some("{\"hello\":1}".into()),
+            upstream_response: Some("{\"ok\":true}".into()),
+            stream: false,
+        }),
+    );
+
+    let latest = usage::recent(1);
+    let detail = usage::payload_detail(latest[0].id).expect("payload should load");
+    assert_eq!(detail.inbound_request.as_deref(), Some("{\"hello\":1}"));
+    assert_eq!(detail.upstream_response.as_deref(), Some("{\"ok\":true}"));
+    assert!(!detail.stream && !detail.request_truncated && !detail.response_truncated);
+
+    // 某天首次写入时 usage_daily_total 会新建行，报文仍须挂到正确的明细行
+    // （回归：last_insert_rowid 若在 daily upsert 之后取，会被覆盖成 daily 的行号）
+    usage::record_with_payload(
+        &UsageRecord {
+            id: 0,
+            timestamp: timestamp.clone(),
+            date: "2001-01-01".into(),
+            model_name: "Temp".into(),
+            served_by: "Temp".into(),
+            inbound_protocol: "anthropic-messages".into(),
+            upstream_protocol: "openai-responses".into(),
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            duration_ms: 1,
+            ok: true,
+            failover: false,
+            error: None,
+        },
+        Some(&usage::UsagePayload {
+            inbound_request: Some("{\"day\":\"first\"}".into()),
+            upstream_response: None,
+            stream: false,
+        }),
+    );
+    let latest = usage::recent(1);
+    let detail = usage::payload_detail(latest[0].id).expect("payload should link to its own detail");
+    assert_eq!(detail.inbound_request.as_deref(), Some("{\"day\":\"first\"}"));
+
+    // 超限报文被截断并置标记
+    usage::record_with_payload(
+        &UsageRecord {
+            id: 0,
+            timestamp: timestamp.clone(),
+            date: date.clone(),
+            model_name: "Temp".into(),
+            served_by: "Temp".into(),
+            inbound_protocol: "anthropic-messages".into(),
+            upstream_protocol: "openai-responses".into(),
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            duration_ms: 1,
+            ok: true,
+            failover: false,
+            error: None,
+        },
+        Some(&usage::UsagePayload {
+            inbound_request: Some("x".repeat(300 * 1024)),
+            upstream_response: None,
+            stream: true,
+        }),
+    );
+
+    let latest = usage::recent(1);
+    let detail = usage::payload_detail(latest[0].id).expect("payload should load");
+    assert!(detail.request_truncated);
+    assert!(detail.stream);
+    assert_eq!(detail.inbound_request.as_ref().unwrap().len(), 256 * 1024);
+
+    // 报文保留只留最近 1000 条（此时共写入 3 条，再补 1001 条后应清到 1000）
+    for _ in 0..1001 {
+        usage::record_with_payload(
+            &UsageRecord {
+                id: 0,
+                timestamp: timestamp.clone(),
+                date: date.clone(),
+                model_name: "Temp".into(),
+                served_by: "Temp".into(),
+                inbound_protocol: "anthropic-messages".into(),
+                upstream_protocol: "openai-responses".into(),
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                duration_ms: 1,
+                ok: true,
+                failover: false,
+                error: None,
+            },
+            Some(&usage::UsagePayload {
+                inbound_request: Some("{}".into()),
+                upstream_response: None,
+                stream: false,
+            }),
+        );
+    }
+    let payload_count: i64 = crate::db::with_conn(|connection| {
+        Ok(connection.query_row("SELECT COUNT(*) FROM usage_payload", [], |row| row.get(0))?)
+    })
+    .expect("count should load");
+    assert_eq!(payload_count, 1000);
+
+    events::log(
+        "user",
+        None,
+        "test.event",
+        Some("app"),
+        Some("claude-desktop"),
+        None,
+    );
+    let logged = events::list(10).expect("events should load");
+    assert_eq!(logged.len(), 1);
+    assert_eq!(logged[0].event_type, "test.event");
+
+    updates::record_check(
+        AppKind::ClaudeDesktop,
+        Some("1.0.0"),
+        Some("2.0.0"),
+        Some("https://example.com/RELEASES"),
+        true,
+        "found",
+        None,
+    );
+    let checks = updates::latest_checks();
+    let snapshot = checks.get(&AppKind::ClaudeDesktop).expect("check should load");
+    assert!(snapshot.update_available);
+    assert_eq!(snapshot.latest_version.as_deref(), Some("2.0.0"));
+
+    // 过滤器：新增 → 落库 → 重新 load 后仍能读回，顺序与启用状态保持
+    crate::filters::mutate(|list| {
+        list.push(crate::domain::filter::RequestFilter {
+            id: 1,
+            name: "注入".into(),
+            enabled: true,
+            order: 0,
+            rule: crate::domain::filter::FilterRule::SystemPrompt {
+                mode: crate::domain::filter::PromptMode::Append,
+                text: "be terse".into(),
+            },
+            created_at: String::new(),
+            updated_at: String::new(),
+        });
+    })
+    .expect("filter should save");
+
+    crate::filters::load().expect("filters should load");
+    let loaded = crate::filters::snapshot();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].name, "注入");
+    assert!(loaded[0].enabled);
+    assert_eq!(loaded[0].rule.kind(), "system-prompt");
+
+    // 分页：总数一致、倒序、翻页与越界（此时明细已很多）
+    let all = usage::page(0, 100_000);
+    assert_eq!(all.total as usize, all.items.len());
+    assert!(all.total > 50, "expected many rows, got {}", all.total);
+    assert!(all.items.windows(2).all(|pair| pair[0].id > pair[1].id));
+    let second = usage::page(50, 50);
+    assert_eq!(second.items.len(), 50);
+    assert_eq!(second.items[0].id, all.items[50].id);
+    let past_end = usage::page(all.total as usize, 50);
+    assert!(past_end.items.is_empty());
+    assert_eq!(past_end.total, all.total);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn response_assembler_builds_canonical_message_then_native_shape() {
+    use crate::providers::ResponseAssembler;
+
+    let mut assembler = ResponseAssembler::default();
+    for event in canonical_events() {
+        assembler.apply(&event);
+    }
+
+    let canonical = assembler.to_value();
+    assert_eq!(canonical["id"], "msg_1");
+    assert_eq!(canonical["type"], "message");
+    assert_eq!(canonical["role"], "assistant");
+    assert_eq!(canonical["model"], "gpt-5");
+    assert_eq!(canonical["content"][0]["type"], "text");
+    assert_eq!(canonical["content"][0]["text"], "Hello");
+    assert_eq!(canonical["content"][1]["type"], "tool_use");
+    assert_eq!(canonical["content"][1]["name"], "get_weather");
+    assert_eq!(canonical["content"][1]["input"]["city"], "Beijing");
+    assert_eq!(canonical["stop_reason"], "tool_use");
+    assert_eq!(canonical["usage"]["input_tokens"], 3);
+    assert_eq!(canonical["usage"]["output_tokens"], 4);
+
+    // 落库前转成上游协议的原生形状（与非流式一致），供前端按协议解析
+    let native = provider_for(ModelFormat::OpenaiCompletions)
+        .encode_response(
+            &model(ModelFormat::OpenaiCompletions, "https://api.openai.com/v1"),
+            &canonical,
+        )
+        .unwrap();
+    assert_eq!(native["choices"][0]["message"]["content"], "Hello");
+    assert_eq!(
+        native["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+        "get_weather"
+    );
+    assert_eq!(native["usage"]["prompt_tokens"], 3);
+    assert_eq!(native["usage"]["completion_tokens"], 4);
+}
+
+// ── 请求过滤器（filters::apply）──────────────────────────────────────
+
+use crate::domain::filter::{FilterRule, PromptMode, ReplaceTarget, RequestFilter};
+use crate::filters;
+
+fn filter(enabled: bool, rule: FilterRule) -> RequestFilter {
+    RequestFilter {
+        id: 1,
+        name: "test".into(),
+        enabled,
+        order: 0,
+        rule,
+        created_at: String::new(),
+        updated_at: String::new(),
+    }
+}
+
+#[test]
+fn filter_injects_system_prompt_in_all_modes() {
+    // system 缺失 → 直接写入
+    let out = filters::apply(
+        &[filter(true, FilterRule::SystemPrompt { mode: PromptMode::Append, text: "B".into() })],
+        request(json!({ "messages": [] })),
+    )
+    .unwrap();
+    assert_eq!(out.raw()["system"], "B");
+
+    // 已有字符串 → 追加 / 前置 / 替换
+    let append = filters::apply(
+        &[filter(true, FilterRule::SystemPrompt { mode: PromptMode::Append, text: "B".into() })],
+        request(json!({ "system": "A", "messages": [] })),
+    )
+    .unwrap();
+    assert_eq!(append.raw()["system"], "A\nB");
+
+    let prepend = filters::apply(
+        &[filter(true, FilterRule::SystemPrompt { mode: PromptMode::Prepend, text: "B".into() })],
+        request(json!({ "system": "A", "messages": [] })),
+    )
+    .unwrap();
+    assert_eq!(prepend.raw()["system"], "B\nA");
+
+    let replace = filters::apply(
+        &[filter(true, FilterRule::SystemPrompt { mode: PromptMode::Replace, text: "B".into() })],
+        request(json!({ "system": "A", "messages": [] })),
+    )
+    .unwrap();
+    assert_eq!(replace.raw()["system"], "B");
+
+    // 块数组 → 追加一个 text 块
+    let blocks = filters::apply(
+        &[filter(true, FilterRule::SystemPrompt { mode: PromptMode::Append, text: "B".into() })],
+        request(json!({ "system": [{ "type": "text", "text": "A" }], "messages": [] })),
+    )
+    .unwrap();
+    assert_eq!(blocks.raw()["system"][0]["text"], "A");
+    assert_eq!(blocks.raw()["system"][1]["text"], "B");
+}
+
+#[test]
+fn filter_overrides_only_provided_params() {
+    let out = filters::apply(
+        &[filter(
+            true,
+            FilterRule::RequestParams {
+                temperature: Some(0.9),
+                max_tokens: None,
+                top_p: None,
+                stop_sequences: Some(vec!["END".into()]),
+            },
+        )],
+        request(json!({ "max_tokens": 100, "temperature": 0.1, "top_p": 0.5, "messages": [] })),
+    )
+    .unwrap();
+
+    assert_eq!(out.raw()["temperature"], 0.9);
+    assert_eq!(out.raw()["max_tokens"], 100); // 未填 → 保持原值
+    assert_eq!(out.raw()["top_p"], 0.5);
+    assert_eq!(out.raw()["stop_sequences"][0], "END");
+}
+
+#[test]
+fn filter_text_replace_touches_text_but_not_structured_fields() {
+    let out = filters::apply(
+        &[filter(
+            true,
+            FilterRule::TextReplace {
+                find: "FOO".into(),
+                replace: "BAR".into(),
+                target: ReplaceTarget::All,
+            },
+        )],
+        request(json!({
+            "system": "FOO system",
+            "messages": [
+                { "role": "user", "content": "FOO hello" },
+                { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "FOO-id", "name": "FOO-tool", "input": { "city": "FOO" } },
+                    { "type": "tool_result", "tool_use_id": "FOO-id", "content": "FOO result" }
+                ]}
+            ]
+        })),
+    )
+    .unwrap();
+
+    assert_eq!(out.raw()["system"], "BAR system");
+    assert_eq!(out.raw()["messages"][0]["content"], "BAR hello");
+    // tool_use 的结构化字段绝不被替换
+    assert_eq!(out.raw()["messages"][1]["content"][0]["id"], "FOO-id");
+    assert_eq!(out.raw()["messages"][1]["content"][0]["name"], "FOO-tool");
+    assert_eq!(out.raw()["messages"][1]["content"][0]["input"]["city"], "FOO");
+    // tool_result 的文本内容被替换，但 tool_use_id 不动
+    assert_eq!(out.raw()["messages"][1]["content"][1]["content"], "BAR result");
+    assert_eq!(out.raw()["messages"][1]["content"][1]["tool_use_id"], "FOO-id");
+
+    // target = system 时 messages 不受影响
+    let only_system = filters::apply(
+        &[filter(
+            true,
+            FilterRule::TextReplace {
+                find: "FOO".into(),
+                replace: "BAR".into(),
+                target: ReplaceTarget::System,
+            },
+        )],
+        request(json!({ "system": "FOO", "messages": [{ "role": "user", "content": "FOO" }] })),
+    )
+    .unwrap();
+    assert_eq!(only_system.raw()["system"], "BAR");
+    assert_eq!(only_system.raw()["messages"][0]["content"], "FOO");
+}
+
+#[test]
+fn filter_skips_disabled_and_stacks_in_order() {
+    // 停用的规则不生效
+    let disabled = filters::apply(
+        &[filter(false, FilterRule::SystemPrompt { mode: PromptMode::Replace, text: "X".into() })],
+        request(json!({ "system": "A", "messages": [] })),
+    )
+    .unwrap();
+    assert_eq!(disabled.raw()["system"], "A");
+
+    // 按列表顺序叠加：先追加 B，再前置 C
+    let stacked = filters::apply(
+        &[
+            filter(true, FilterRule::SystemPrompt { mode: PromptMode::Append, text: "B".into() }),
+            filter(true, FilterRule::SystemPrompt { mode: PromptMode::Prepend, text: "C".into() }),
+        ],
+        request(json!({ "system": "A", "messages": [] })),
+    )
+    .unwrap();
+    assert_eq!(stacked.raw()["system"], "C\nA\nB");
 }

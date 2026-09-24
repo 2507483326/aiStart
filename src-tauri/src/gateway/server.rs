@@ -15,10 +15,10 @@ use tower_http::cors::CorsLayer;
 use crate::domain::canonical::CanonicalRequest;
 use crate::domain::model::{ModelConfig, ModelFormat};
 use crate::error::{AppError, AppResult};
-use crate::providers::{http_client, provider_for, SseEvent, StreamState, WireState};
+use crate::providers::{http_client, provider_for, ResponseAssembler, SseEvent, StreamState, WireState};
 
 use super::sse::{encode_channel_event, parse_sse_stream};
-use super::{GatewayStats, GATEWAY_TOKEN, MODEL_ALIAS};
+use super::{GatewayStats, GATEWAY_TOKEN, MODEL_ROLES};
 
 pub fn router() -> Router {
     Router::new()
@@ -111,26 +111,35 @@ fn record_usage(
     inbound: ModelFormat,
     input_tokens: u64,
     output_tokens: u64,
+    cache_read_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
     duration_ms: u64,
     ok: bool,
     failover: bool,
     error: Option<String>,
+    payload: crate::usage::UsagePayload,
 ) {
     let (timestamp, date) = crate::usage::current_timestamp();
-    crate::usage::record(&crate::usage::UsageRecord {
-        timestamp,
-        date,
-        model_name: active_model_name.to_string(),
-        served_by: config.name.clone(),
-        inbound_protocol: inbound.as_str().to_string(),
-        upstream_protocol: config.format.as_str().to_string(),
-        input_tokens,
-        output_tokens,
-        duration_ms,
-        ok,
-        failover,
-        error,
-    });
+    crate::usage::record_with_payload(
+        &crate::usage::UsageRecord {
+            id: 0,
+            timestamp,
+            date,
+            model_name: active_model_name.to_string(),
+            served_by: config.name.clone(),
+            inbound_protocol: inbound.as_str().to_string(),
+            upstream_protocol: config.format.as_str().to_string(),
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            duration_ms,
+            ok,
+            failover,
+            error,
+        },
+        Some(&payload),
+    );
 }
 
 async fn health(State(stats): State<Arc<GatewayStats>>) -> Response {
@@ -152,14 +161,29 @@ async fn health(State(stats): State<Arc<GatewayStats>>) -> Response {
 }
 
 async fn models() -> Response {
+    let data: Vec<Value> = MODEL_ROLES
+        .iter()
+        .map(|role| {
+            json!({
+                "id": role.id,
+                "type": "model",
+                "object": "model",
+                "created": 0,
+                "display_name": role.id,
+                "owned_by": "ai-start"
+            })
+        })
+        .collect();
+    let first = MODEL_ROLES[0].id;
+    let last = MODEL_ROLES[MODEL_ROLES.len() - 1].id;
     json_response(
         StatusCode::OK,
         json!({
             "object": "list",
-            "data": [{ "id": MODEL_ALIAS, "type": "model", "object": "model", "created": 0, "display_name": MODEL_ALIAS, "owned_by": "ai-start" }],
+            "data": data,
             "has_more": false,
-            "first_id": MODEL_ALIAS,
-            "last_id": MODEL_ALIAS
+            "first_id": first,
+            "last_id": last
         }),
     )
 }
@@ -192,8 +216,9 @@ async fn route(
 ) -> Response {
     stats.requests.fetch_add(1, Ordering::Relaxed);
     let started = std::time::Instant::now();
+    let inbound_request = String::from_utf8_lossy(&body).into_owned();
 
-    match handle(inbound, stats.clone(), headers, body, started).await {
+    match handle(inbound, stats.clone(), headers, body, started, &inbound_request).await {
         Ok(response) => response,
         Err(error) => {
             stats.record_error(&error.to_string());
@@ -204,20 +229,30 @@ async fn route(
                 .map(|model| model.name.clone())
                 .unwrap_or_default();
             let (timestamp, date) = crate::usage::current_timestamp();
-            crate::usage::record(&crate::usage::UsageRecord {
-                timestamp,
-                date,
-                model_name: active_name,
-                served_by: String::new(),
-                inbound_protocol: inbound.as_str().to_string(),
-                upstream_protocol: String::new(),
-                input_tokens: 0,
-                output_tokens: 0,
-                duration_ms: started.elapsed().as_millis() as u64,
-                ok: false,
-                failover: false,
-                error: Some(message.clone()),
-            });
+            crate::usage::record_with_payload(
+                &crate::usage::UsageRecord {
+                    id: 0,
+                    timestamp,
+                    date,
+                    model_name: active_name,
+                    served_by: String::new(),
+                    inbound_protocol: inbound.as_str().to_string(),
+                    upstream_protocol: String::new(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    ok: false,
+                    failover: false,
+                    error: Some(message.clone()),
+                },
+                Some(&crate::usage::UsagePayload {
+                    inbound_request: Some(inbound_request),
+                    upstream_response: None,
+                    stream: false,
+                }),
+            );
 
             let status = match error {
                 AppError::NotFound(_) => StatusCode::NOT_FOUND,
@@ -290,6 +325,7 @@ async fn handle(
     headers: HeaderMap,
     body: Bytes,
     started: std::time::Instant,
+    inbound_request: &str,
 ) -> AppResult<Response> {
     let settings = crate::settings::snapshot();
 
@@ -306,6 +342,9 @@ async fn handle(
         .map_err(|error| AppError::InvalidConfig(format!("请求体不是合法 JSON: {error}")))?;
     let inbound_provider = provider_for(inbound);
     let request = inbound_provider.decode_request(raw)?;
+    // 过滤器：在转发前按规则改写规范请求。放在自动切换循环之外，
+    // 保证重试多个上游时规则只套用一次。
+    let request = crate::filters::apply(&crate::filters::snapshot(), request)?;
 
     let candidates = settings.candidate_models();
     if candidates.is_empty() {
@@ -357,6 +396,14 @@ async fn handle(
             .pointer("/usage/output_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        let cache_read_tokens = canonical
+            .pointer("/usage/cache_read_input_tokens")
+            .and_then(Value::as_u64)
+            .filter(|tokens| *tokens > 0);
+        let cache_write_tokens = canonical
+            .pointer("/usage/cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+            .filter(|tokens| *tokens > 0);
         stats.record_tokens(input_tokens, output_tokens);
         record_usage(
             &active_name,
@@ -364,10 +411,20 @@ async fn handle(
             inbound,
             input_tokens,
             output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
             started.elapsed().as_millis() as u64,
             true,
             failover_used,
             None,
+            crate::usage::UsagePayload {
+                inbound_request: Some(inbound_request.to_string()),
+                upstream_response: Some(
+                    serde_json::to_string_pretty(&raw_response)
+                        .unwrap_or_else(|_| raw_response.to_string()),
+                ),
+                stream: false,
+            },
         );
 
         let wire = inbound_provider.encode_response(&config, &canonical)?;
@@ -376,6 +433,8 @@ async fn handle(
 
     let mut upstream_state = StreamState::new(config.name.clone());
     let mut wire_state = WireState::default();
+    let mut assembler = ResponseAssembler::default();
+    let inbound_request_owned = inbound_request.to_string();
     let emit_initial = !upstream_provider.is_passthrough();
     let events = parse_sse_stream(upstream.bytes_stream());
 
@@ -385,6 +444,7 @@ async fn handle(
 
         if emit_initial {
             for canonical in upstream_state.begin() {
+                assembler.apply(&canonical);
                 for event in inbound_provider.encode_stream_event(&config, &canonical, &mut wire_state) {
                     yield Ok::<Bytes, std::io::Error>(Bytes::from(encode_event(&event)));
                 }
@@ -396,6 +456,7 @@ async fn handle(
                 Ok((event_name, data)) => {
                     if data.trim() == "[DONE]" {
                         for canonical in upstream_provider.decode_stream_done(&config, &mut upstream_state).unwrap_or_default() {
+                            assembler.apply(&canonical);
                             for event in inbound_provider.encode_stream_event(&config, &canonical, &mut wire_state) {
                                 yield Ok(Bytes::from(encode_event(&event)));
                             }
@@ -408,6 +469,7 @@ async fn handle(
                     match upstream_provider.decode_stream_event(&config, &event_name, &value, &mut upstream_state) {
                         Ok(canonical_events) => {
                             for canonical in canonical_events {
+                                assembler.apply(&canonical);
                                 for event in inbound_provider.encode_stream_event(&config, &canonical, &mut wire_state) {
                                     yield Ok(Bytes::from(encode_event(&event)));
                                 }
@@ -434,6 +496,7 @@ async fn handle(
         }
 
         for canonical in upstream_provider.decode_stream_done(&config, &mut upstream_state).unwrap_or_default() {
+            assembler.apply(&canonical);
             for event in inbound_provider.encode_stream_event(&config, &canonical, &mut wire_state) {
                 yield Ok(Bytes::from(encode_event(&event)));
             }
@@ -443,16 +506,46 @@ async fn handle(
         }
 
         stats.record_tokens(upstream_state.input_tokens, upstream_state.output_tokens);
+        if let Some(message) = stream_error.as_deref() {
+            stats.record_error(message);
+        }
         record_usage(
             &active_name,
             &config,
             inbound,
             upstream_state.input_tokens,
             upstream_state.output_tokens,
+            (upstream_state.cache_read_tokens > 0).then_some(upstream_state.cache_read_tokens),
+            (upstream_state.cache_write_tokens > 0).then_some(upstream_state.cache_write_tokens),
             started.elapsed().as_millis() as u64,
             stream_error.is_none(),
             failover_used,
             stream_error,
+            crate::usage::UsagePayload {
+                inbound_request: Some(inbound_request_owned),
+                upstream_response: Some({
+                    // 拼装成 canonical 后转成上游协议的原生形状再落库，前端按协议解析（与非流式一致）
+                    let mut canonical = assembler.to_value();
+                    // 输入/缓存 token 只在流末尾的 usage 事件里出现，message_start 时还没有，
+                    // 用流状态的最终值补齐，否则落库报文会显示输入 0。
+                    if let Some(usage) = canonical.get_mut("usage").and_then(Value::as_object_mut) {
+                        usage.insert("input_tokens".into(), json!(upstream_state.input_tokens));
+                        usage.insert(
+                            "cache_read_input_tokens".into(),
+                            json!(upstream_state.cache_read_tokens),
+                        );
+                        usage.insert(
+                            "cache_creation_input_tokens".into(),
+                            json!(upstream_state.cache_write_tokens),
+                        );
+                    }
+                    let native = upstream_provider
+                        .encode_response(&config, &canonical)
+                        .unwrap_or(canonical);
+                    serde_json::to_string_pretty(&native).unwrap_or_else(|_| "{}".to_string())
+                }),
+                stream: true,
+            },
         );
     };
 

@@ -16,6 +16,13 @@ impl AppKind {
             AppKind::DeepseekDesktop => "deepseek-desktop",
         }
     }
+
+    pub fn parse(value: &str) -> Option<AppKind> {
+        AppKind::ALL
+            .iter()
+            .copied()
+            .find(|kind| kind.as_str() == value)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,13 +40,22 @@ pub struct AppDescriptor {
     pub name: String,
     pub publisher: String,
     pub description: String,
+    pub homepage: String,
     pub download_page: String,
     pub requires_gateway: bool,
     pub apply_mode: ApplyMode,
     pub config_target: String,
     pub installer_url: Option<String>,
     pub installer_sha256: Option<String>,
+    pub latest_version_urls: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppUpdate {
+    pub kind: AppKind,
     pub latest_version: Option<String>,
+    pub update_available: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +65,7 @@ pub struct ToolApp {
     pub name: String,
     pub publisher: String,
     pub description: String,
+    pub homepage: String,
     pub download_page: String,
     pub requires_gateway: bool,
     pub apply_mode: ApplyMode,
@@ -58,7 +75,7 @@ pub struct ToolApp {
     pub install_location: Option<String>,
     pub latest_version: Option<String>,
     pub update_available: bool,
-    pub applied_model_id: Option<String>,
+    pub applied_model_id: Option<i64>,
     pub applied_model_name: Option<String>,
 }
 
@@ -66,7 +83,7 @@ pub struct ToolApp {
 #[serde(rename_all = "camelCase")]
 pub struct ApplyReport {
     pub kind: AppKind,
-    pub model_id: String,
+    pub model_id: i64,
     pub model_name: String,
     pub apply_mode: ApplyMode,
     pub target: String,

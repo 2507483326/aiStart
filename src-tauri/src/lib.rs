@@ -1,10 +1,14 @@
 mod commands;
+mod db;
 mod domain;
 mod error;
+mod events;
+mod filters;
 mod gateway;
 mod platform;
 mod providers;
 mod settings;
+mod updates;
 mod usage;
 
 #[cfg(test)]
@@ -18,7 +22,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let config_dir = app.path().app_config_dir()?;
-            settings::init(config_dir)?;
+            settings::init(&config_dir)?;
+            filters::load()?;
+            gateway::hydrate();
 
             if settings::snapshot().active_model().is_some() {
                 let _ = gateway::start();
@@ -33,6 +39,7 @@ pub fn run() {
             commands::apps::install_app,
             commands::apps::update_app,
             commands::apps::app_apply_mode_label,
+            commands::apps::check_app_updates,
             commands::models::list_model_formats,
             commands::models::list_models,
             commands::models::save_model,
@@ -40,13 +47,20 @@ pub fn run() {
             commands::models::activate_model,
             commands::models::test_model,
             commands::models::fetch_upstream_models,
+            commands::filters::list_filters,
+            commands::filters::save_filter,
+            commands::filters::set_filter_enabled,
+            commands::filters::delete_filter,
             commands::gateway::gateway_status,
             commands::gateway::restart_gateway,
             commands::system::get_settings,
             commands::system::update_settings,
             commands::system::app_info,
+            commands::events::list_events,
             commands::usage::usage_summary,
             commands::usage::usage_records,
+            commands::usage::usage_page,
+            commands::usage::usage_detail,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

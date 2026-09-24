@@ -57,7 +57,7 @@ onMounted(async () => {
             <div
               v-for="app in apps"
               :key="app.kind"
-              class="flex items-center justify-between gap-3"
+              class="-mx-2 flex items-center justify-between gap-3 rounded-md px-2 py-1.5 transition-colors hover:bg-accent/40"
             >
               <div class="flex min-w-0 items-center gap-2.5">
                 <MorphIconBox :icon="Boxes" :size="16" class="text-muted-foreground" />
@@ -104,7 +104,7 @@ onMounted(async () => {
           <div v-if="models.length" class="space-y-2.5">
             <template v-for="(model, index) in models" :key="model.id">
               <Separator v-if="index > 0" />
-              <div class="flex items-center justify-between gap-3">
+              <div class="-mx-2 flex items-center justify-between gap-3 rounded-md px-2 py-1.5 transition-colors hover:bg-accent/40">
                 <div class="flex min-w-0 items-center gap-2.5">
                   <MorphIconBox
                     :icon="BrainCircuit"

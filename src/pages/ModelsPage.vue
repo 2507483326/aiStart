@@ -14,7 +14,7 @@ import { useModels } from "@/composables/useModels";
 import { useSettings } from "@/composables/useSettings";
 import type { ModelConfig } from "@/lib/types";
 
-const { models, activeModelId, loading, refresh, loadMeta } = useModels();
+const { models, activeModelId, loading, refresh, loadMeta, prefetchUpstream } = useModels();
 const gateway = useGateway();
 const { settings, update } = useSettings();
 
@@ -39,8 +39,25 @@ function openEdit(model: ModelConfig) {
   dialogOpen.value = true;
 }
 
+async function reload() {
+  try {
+    await refresh();
+  } finally {
+    prefetchUpstream();
+  }
+}
+
+async function handleSaved() {
+  try {
+    await gateway.refresh();
+  } finally {
+    prefetchUpstream();
+  }
+}
+
 onMounted(async () => {
-  await Promise.all([refresh(), loadMeta(), gateway.refresh()]);
+  await Promise.allSettled([refresh(), loadMeta(), gateway.refresh()]);
+  prefetchUpstream();
 });
 </script>
 
@@ -72,7 +89,7 @@ onMounted(async () => {
           />
         </label>
 
-        <Button variant="outline" size="sm" class="gap-2" :disabled="loading" @click="refresh">
+        <Button variant="outline" size="sm" class="gap-2" :disabled="loading" @click="reload">
           <MorphIconBox
             :icon="RefreshCw"
             :size="15"
@@ -114,6 +131,6 @@ onMounted(async () => {
       />
     </div>
 
-    <ModelFormDialog v-model:open="dialogOpen" :model="editing" @saved="gateway.refresh" />
+    <ModelFormDialog v-model:open="dialogOpen" :model="editing" @saved="handleSaved" />
   </div>
 </template>

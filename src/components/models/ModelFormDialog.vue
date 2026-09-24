@@ -1,22 +1,11 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-import { ChevronDown, Search } from "@lucide/vue";
 import { LoaderCircle, RefreshCw } from "lucide";
-import { ComboboxInput } from "reka-ui";
 
 import MorphIconBox from "@/components/common/MorphIconBox.vue";
+import UpstreamModelSelect from "@/components/models/UpstreamModelSelect.vue";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
-import {
-  Combobox,
-  ComboboxAnchor,
-  ComboboxEmpty,
-  ComboboxItem,
-  ComboboxItemIndicator,
-  ComboboxList,
-  ComboboxTrigger,
-  ComboboxViewport,
-} from "@/components/ui/combobox";
 import {
   Dialog,
   DialogContent,
@@ -44,7 +33,7 @@ const open = defineModel<boolean>("open", { required: true });
 const props = defineProps<{ model: ModelConfig | null }>();
 const emit = defineEmits<{ saved: [] }>();
 
-const { formats, save, fetchUpstream } = useModels();
+const { formats, save, fetchUpstream, fetchUpstreamQuiet, upstreamCache } = useModels();
 
 const name = ref("");
 const format = ref<ModelFormat>("openai-completions");
@@ -53,8 +42,6 @@ const apiKey = ref("");
 const model = ref("");
 const supports1m = ref(false);
 const upstreamModels = ref<string[]>([]);
-const searchTerm = ref("");
-const comboOpen = ref(false);
 const saving = ref(false);
 const fetching = ref(false);
 
@@ -71,14 +58,33 @@ function reset() {
   apiKey.value = source?.apiKey ?? "";
   model.value = source?.model ?? "";
   supports1m.value = source?.supports1m ?? false;
-  searchTerm.value = source?.model ?? "";
-  upstreamModels.value = [];
-  comboOpen.value = false;
+  // 编辑时直接用进入模型页预取到的上游列表，拉到过就展示成选择框
+  upstreamModels.value = source ? (upstreamCache.value[source.id] ?? []) : [];
 }
 
 watch(open, (value) => {
-  if (value) reset();
+  if (value) {
+    reset();
+    loadUpstreamQuiet();
+  }
 });
+
+// 编辑时若没有预取到上游列表，打开弹窗后静默补拉一次，拉到就切成选择框
+async function loadUpstreamQuiet() {
+  const source = props.model;
+  if (!source || upstreamModels.value.length || fetching.value) return;
+  fetching.value = true;
+  try {
+    const list = await fetchUpstreamQuiet(source.baseUrl, source.apiKey, source.format);
+    const unchanged =
+      baseUrl.value === source.baseUrl &&
+      apiKey.value === source.apiKey &&
+      format.value === source.format;
+    if (unchanged && list.length) upstreamModels.value = list;
+  } finally {
+    fetching.value = false;
+  }
+}
 
 function changeFormat(value: unknown) {
   const next = value as ModelFormat;
@@ -87,18 +93,6 @@ function changeFormat(value: unknown) {
   if (info) baseUrl.value = info.defaultBaseUrl;
   upstreamModels.value = [];
   format.value = next;
-}
-
-function onSearch(value: unknown) {
-  searchTerm.value = String(value ?? "");
-}
-
-function commitTypedModel() {
-  const typed = searchTerm.value.trim();
-  if (!typed) return;
-  if (!upstreamModels.value.includes(typed)) {
-    model.value = typed;
-  }
 }
 
 async function loadUpstreamModels() {
@@ -113,17 +107,14 @@ async function loadUpstreamModels() {
     upstreamModels.value = list;
     if (!model.value && list.length) {
       model.value = list[0];
-      searchTerm.value = list[0];
     }
     notifySuccess(`获取到 ${list.length} 个模型`);
-    comboOpen.value = true;
   } finally {
     fetching.value = false;
   }
 }
 
 async function submit() {
-  commitTypedModel();
   const input: ModelInput = {
     id: props.model?.id,
     name: name.value.trim(),
@@ -222,45 +213,21 @@ async function submit() {
             </Button>
           </div>
 
-          <Combobox
+          <!-- 未获取到模型列表前只给一个普通输入框，拉到列表后才变成可搜索的下拉框 -->
+          <Input
+            v-if="!upstreamModels.length"
+            id="model-upstream"
             v-model="model"
-            :open="comboOpen"
-            :reset-search-term-on-blur="false"
-            @update:open="comboOpen = $event"
-          >
-            <ComboboxAnchor as-child>
-              <div class="relative">
-                <Search
-                  class="pointer-events-none absolute top-1/2 left-3 size-3.5 -translate-y-1/2 opacity-50"
-                />
-                <ComboboxInput
-                  id="model-upstream"
-                  :display-value="(value: unknown) => String(value ?? '')"
-                  placeholder="deepseek-chat，或点右侧箭头从列表选择"
-                  class="h-9 w-full rounded-md border bg-transparent pr-9 pl-8 font-mono text-xs shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-                  @update:model-value="onSearch"
-                  @focus="comboOpen = true"
-                  @blur="commitTypedModel"
-                />
-                <ComboboxTrigger
-                  class="absolute top-1/2 right-2 -translate-y-1/2 rounded-sm p-1 text-muted-foreground hover:text-foreground"
-                  aria-label="展开模型列表"
-                >
-                  <ChevronDown class="size-4 opacity-60" />
-                </ComboboxTrigger>
-              </div>
-            </ComboboxAnchor>
+            class="font-mono text-xs"
+            placeholder="deepseek-chat"
+          />
 
-            <ComboboxList class="w-(--reka-combobox-trigger-width)">
-              <ComboboxEmpty>没有匹配的模型，先点「获取模型列表」</ComboboxEmpty>
-              <ComboboxViewport class="max-h-72 overflow-y-auto p-1">
-                <ComboboxItem v-for="id in upstreamModels" :key="id" :value="id">
-                  {{ id }}
-                  <ComboboxItemIndicator />
-                </ComboboxItem>
-              </ComboboxViewport>
-            </ComboboxList>
-          </Combobox>
+          <UpstreamModelSelect
+            v-else
+            id="model-upstream"
+            v-model="model"
+            :options="upstreamModels"
+          />
 
           <label class="flex cursor-pointer items-center gap-2 pt-1 text-xs text-muted-foreground">
             <Checkbox v-model="supports1m" />

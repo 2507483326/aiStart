@@ -14,8 +14,8 @@ pub struct SettingsView {
     pub gateway_token: String,
     pub deepseek_config_path: String,
     pub auto_failover: bool,
-    pub active_model_id: Option<String>,
-    pub applied: BTreeMap<String, String>,
+    pub active_model_id: Option<i64>,
+    pub applied: BTreeMap<String, i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

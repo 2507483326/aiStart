@@ -200,6 +200,21 @@ impl ModelProvider for OpenaiResponsesProvider {
             _ => "end_turn",
         };
 
+        // input_tokens 含缓存命中；canonical 采用 Anthropic 语义，拆成「未命中输入 + 缓存读」。
+        let usage = raw.get("usage");
+        let reported_input = usage
+            .and_then(|value| value.get("input_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cache_read_tokens = usage
+            .and_then(|value| value.pointer("/input_tokens_details/cached_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let output_tokens = usage
+            .and_then(|value| value.get("output_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+
         Ok(json!({
             "id": raw.get("id").and_then(Value::as_str).map(str::to_string)
                 .unwrap_or_else(|| format!("msg_{}", uuid::Uuid::new_v4().simple())),
@@ -210,8 +225,10 @@ impl ModelProvider for OpenaiResponsesProvider {
             "stop_reason": stop_reason,
             "stop_sequence": null,
             "usage": {
-                "input_tokens": raw.pointer("/usage/input_tokens").and_then(Value::as_u64).unwrap_or(0),
-                "output_tokens": raw.pointer("/usage/output_tokens").and_then(Value::as_u64).unwrap_or(0)
+                "input_tokens": reported_input.saturating_sub(cache_read_tokens),
+                "output_tokens": output_tokens,
+                "cache_read_input_tokens": cache_read_tokens,
+                "cache_creation_input_tokens": 0
             }
         }))
     }
@@ -281,9 +298,15 @@ impl ModelProvider for OpenaiResponsesProvider {
                 let has_tools = !state.tool_calls.is_empty();
                 let incomplete = name == "response.incomplete";
                 if let Some(usage) = data.pointer("/response/usage") {
+                    let cache_read = usage
+                        .pointer("/input_tokens_details/cached_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
                     if let Some(input) = usage.get("input_tokens").and_then(Value::as_u64) {
-                        state.input_tokens = input;
+                        // input_tokens 含缓存命中，canonical 只留未命中部分。
+                        state.input_tokens = input.saturating_sub(cache_read);
                     }
+                    state.cache_read_tokens = cache_read;
                     if let Some(output) = usage.get("output_tokens").and_then(Value::as_u64) {
                         state.output_tokens = output;
                     }
@@ -511,10 +534,16 @@ impl ModelProvider for OpenaiResponsesProvider {
             .pointer("/usage/input_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        let cache_read_tokens = canonical
+            .pointer("/usage/cache_read_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         let output_tokens = canonical
             .pointer("/usage/output_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        // 回写给 Responses 客户端时 input_tokens 含缓存命中（把缓存读并回）。
+        let reported_input = input_tokens + cache_read_tokens;
 
         Ok(json!({
             "id": format!("resp_{}", uuid::Uuid::new_v4().simple()),
@@ -524,9 +553,10 @@ impl ModelProvider for OpenaiResponsesProvider {
             "model": cfg.model,
             "output": output,
             "usage": {
-                "input_tokens": input_tokens,
+                "input_tokens": reported_input,
                 "output_tokens": output_tokens,
-                "total_tokens": input_tokens + output_tokens
+                "total_tokens": reported_input + output_tokens,
+                "input_tokens_details": { "cached_tokens": cache_read_tokens }
             }
         }))
     }
@@ -551,10 +581,16 @@ impl ModelProvider for OpenaiResponsesProvider {
                     .and_then(Value::as_str)
                     .map(|id| format!("resp_{}", id.trim_start_matches("msg_")))
                     .unwrap_or_else(|| format!("resp_{}", uuid::Uuid::new_v4().simple()));
-                state.input_tokens = data
+                state.cache_read_tokens = data
+                    .pointer("/message/usage/cache_read_input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let input_tokens = data
                     .pointer("/message/usage/input_tokens")
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
+                // 回写给 Responses 客户端时 input_tokens 含缓存命中，故并回。
+                state.input_tokens = input_tokens + state.cache_read_tokens;
                 vec![responses_event(
                     "response.created",
                     json!({ "response": response_stub(state) }),
@@ -716,7 +752,8 @@ impl ModelProvider for OpenaiResponsesProvider {
                     "usage": {
                         "input_tokens": state.input_tokens,
                         "output_tokens": state.output_tokens,
-                        "total_tokens": state.input_tokens + state.output_tokens
+                        "total_tokens": state.input_tokens + state.output_tokens,
+                        "input_tokens_details": { "cached_tokens": state.cache_read_tokens }
                     }
                 }
             }),

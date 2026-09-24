@@ -10,6 +10,26 @@ export function formatCompact(value: number): string {
   return `${(value / 1_000_000).toFixed(2)}M`;
 }
 
+export interface CacheTokens {
+  inputTokens: number;
+  cacheReadTokens?: number | null;
+  cacheWriteTokens?: number | null;
+}
+
+/**
+ * 缓存命中率（口径对齐 dsh）：缓存读 / 计费输入（未命中输入 + 缓存读 + 缓存写）。
+ * 无计费输入时返回 null，界面应显「—」而不是 0%。
+ */
+export function cacheHitRate(value: CacheTokens): number | null {
+  const cacheRead = value.cacheReadTokens ?? 0;
+  const billed = value.inputTokens + cacheRead + (value.cacheWriteTokens ?? 0);
+  return billed > 0 ? cacheRead / billed : null;
+}
+
+export function formatPercent(rate: number | null): string {
+  return rate === null ? "—" : `${Math.round(rate * 100)}%`;
+}
+
 export function formatDateTime(value: string): string {
   if (!value) return "—";
   const date = new Date(value);
@@ -26,6 +46,28 @@ export function formatDateTime(value: string): string {
 export function formatLatency(ms: number): string {
   if (ms < 1000) return `${ms} ms`;
   return `${(ms / 1000).toFixed(2)} s`;
+}
+
+export function prettyJson(text: string | null): string {
+  if (!text) return "";
+  try {
+    return JSON.stringify(JSON.parse(text), null, 2);
+  } catch {
+    return text;
+  }
+}
+
+export function protocolLabel(value: string): string {
+  switch (value) {
+    case "anthropic-messages":
+      return "Messages";
+    case "openai-completions":
+      return "Completions";
+    case "openai-responses":
+      return "Responses";
+    default:
+      return value || "—";
+  }
 }
 
 export function maskSecret(value: string): string {

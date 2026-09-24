@@ -7,22 +7,17 @@ import type { ModelFormat } from "@/lib/types";
 
 const props = defineProps<{ format: ModelFormat; full?: boolean }>();
 
-const variant = computed(() => {
-  switch (props.format) {
-    case "anthropic-messages":
-      return "default" as const;
-    case "openai-completions":
-      return "secondary" as const;
-    default:
-      return "outline" as const;
-  }
-});
-
 const label = computed(() =>
   props.full ? formatLabels[props.format] : formatShortLabels[props.format],
 );
 </script>
 
 <template>
-  <Badge :variant="variant" :title="formatLabels[format]">{{ label }}</Badge>
+  <Badge
+    variant="outline"
+    class="px-1.5 py-0 text-[10px] font-normal leading-4 text-muted-foreground"
+    :title="formatLabels[format]"
+  >
+    {{ label }}
+  </Badge>
 </template>

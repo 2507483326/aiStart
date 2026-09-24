@@ -8,9 +8,52 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::error::{AppError, AppResult};
+use crate::events;
 
 pub const GATEWAY_TOKEN: &str = "aiStart";
-pub const MODEL_ALIAS: &str = "aiStart";
+
+/// Brand shown in the Claude Desktop model picker.
+pub const MODEL_LABEL_PREFIX: &str = "aiStart";
+
+/// One route the gateway advertises and Claude Desktop accepts.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelRole {
+    /// Advertised on `/v1/models` and written into `inferenceModels[].name`.
+    /// Claude Desktop drops any entry whose name is not recognisably an
+    /// Anthropic model route, so this has to stay Claude-shaped rather than an
+    /// opaque alias.
+    pub id: &'static str,
+    /// Appended to [`MODEL_LABEL_PREFIX`] to build the picker's `labelOverride`.
+    pub suffix: &'static str,
+}
+
+impl ModelRole {
+    pub fn picker_label(&self) -> String {
+        format!("{MODEL_LABEL_PREFIX} · {}", self.suffix)
+    }
+}
+
+/// One route per tier, so bare aliases (e.g. `sonnet` in Code sessions) resolve.
+/// The first entry is Claude's default model. The real upstream model is
+/// substituted on the way out, so the picker label comes from `labelOverride`.
+pub const MODEL_ROLES: [ModelRole; 4] = [
+    ModelRole {
+        id: "claude-sonnet-5",
+        suffix: "Sonnet",
+    },
+    ModelRole {
+        id: "claude-opus-5",
+        suffix: "Opus",
+    },
+    ModelRole {
+        id: "claude-haiku-4-5",
+        suffix: "Haiku",
+    },
+    ModelRole {
+        id: "claude-fable-5",
+        suffix: "Fable",
+    },
+];
 
 #[derive(Debug, Default)]
 pub struct GatewayStats {
@@ -66,6 +109,18 @@ static STATS: OnceLock<Arc<GatewayStats>> = OnceLock::new();
 
 pub fn stats() -> Arc<GatewayStats> {
     STATS.get_or_init(|| Arc::new(GatewayStats::default())).clone()
+}
+
+/// 用数据库中的全量累计值初始化计数器，使面板数据跨重启保留。
+/// 启动时调用一次即可；此后进程内的自增会继续叠加历史值。
+pub fn hydrate() {
+    let totals = crate::usage::totals();
+    let stats = stats();
+    stats.requests.store(totals.requests, Ordering::Relaxed);
+    stats.errors.store(totals.failed, Ordering::Relaxed);
+    stats.input_tokens.store(totals.input_tokens, Ordering::Relaxed);
+    stats.output_tokens.store(totals.output_tokens, Ordering::Relaxed);
+    stats.failovers.store(totals.failovers, Ordering::Relaxed);
 }
 
 struct RunningGateway {
@@ -192,6 +247,15 @@ pub fn start() -> AppResult<GatewayStatus> {
     });
     drop(guard);
 
+    events::log(
+        "system",
+        Some("网关"),
+        "gateway.started",
+        Some("gateway"),
+        Some(&port.to_string()),
+        None,
+    );
+
     Ok(status())
 }
 
@@ -201,7 +265,16 @@ pub fn stop() -> AppResult<GatewayStatus> {
         guard.take()
     };
     if let Some(gateway) = taken {
+        let port = gateway.port;
         let _ = gateway.shutdown.send(());
+        events::log(
+            "system",
+            Some("网关"),
+            "gateway.stopped",
+            Some("gateway"),
+            Some(&port.to_string()),
+            None,
+        );
     }
     Ok(status())
 }

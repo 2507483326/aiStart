@@ -40,12 +40,20 @@ impl ModelFormat {
             ModelFormat::OpenaiResponses => "https://api.openai.com/v1",
         }
     }
+
+    pub fn parse(value: &str) -> ModelFormat {
+        match value {
+            "anthropic-messages" => ModelFormat::AnthropicMessages,
+            "openai-responses" => ModelFormat::OpenaiResponses,
+            _ => ModelFormat::OpenaiCompletions,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelConfig {
-    pub id: String,
+    pub id: i64,
     pub name: String,
     pub format: ModelFormat,
     pub base_url: String,
@@ -89,7 +97,7 @@ impl ModelConfig {
 #[serde(rename_all = "camelCase")]
 pub struct ModelInput {
     #[serde(default)]
-    pub id: Option<String>,
+    pub id: Option<i64>,
     pub name: String,
     pub format: ModelFormat,
     pub base_url: String,

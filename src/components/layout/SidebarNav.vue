@@ -1,7 +1,6 @@
 <script setup lang="ts">
-import { computed } from "vue";
 import { useRoute } from "vue-router";
-import { BarChart3, Boxes, BrainCircuit, LayoutDashboard } from "@lucide/vue";
+import { BarChart3, Boxes, BrainCircuit, Funnel, LayoutDashboard } from "@lucide/vue";
 
 import { cn } from "@/lib/utils";
 
@@ -11,10 +10,14 @@ const items = [
   { name: "dashboard", label: "面板", to: "/dashboard", icon: LayoutDashboard },
   { name: "apps", label: "应用", to: "/apps", icon: Boxes },
   { name: "models", label: "模型", to: "/models", icon: BrainCircuit },
+  { name: "filters", label: "过滤器", to: "/filters", icon: Funnel },
   { name: "stats", label: "统计", to: "/stats", icon: BarChart3 },
 ];
 
-const activeName = computed(() => String(route.name ?? ""));
+// 按路径前缀匹配，让 /stats/requests/:id 这类子页面仍高亮所属区块
+function isActive(to: string): boolean {
+  return route.path === to || route.path.startsWith(`${to}/`);
+}
 </script>
 
 <template>
@@ -25,13 +28,17 @@ const activeName = computed(() => String(route.name ?? ""));
       :to="item.to"
       :class="
         cn(
-          'flex items-center gap-2.5 rounded-md px-3 py-2 text-sm font-medium transition-colors',
-          activeName === item.name
+          'relative flex cursor-pointer items-center gap-2.5 rounded-md px-3 py-2 text-sm font-medium transition-colors',
+          isActive(item.to)
             ? 'bg-sidebar-accent text-sidebar-accent-foreground'
             : 'text-muted-foreground hover:bg-sidebar-accent/50 hover:text-foreground',
         )
       "
     >
+      <span
+        v-if="isActive(item.to)"
+        class="absolute top-1/2 left-0 h-4 w-0.5 -translate-y-1/2 rounded-full bg-primary"
+      />
       <component :is="item.icon" class="size-4 shrink-0" />
       <span>{{ item.label }}</span>
     </RouterLink>
