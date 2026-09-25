@@ -128,6 +128,7 @@ fn record_usage(
     output_tokens: u64,
     cache_read_tokens: Option<u64>,
     cache_write_tokens: Option<u64>,
+    reasoning_tokens: Option<u64>,
     duration_ms: u64,
     ok: bool,
     failover: bool,
@@ -151,6 +152,7 @@ fn record_usage(
             output_tokens,
             cache_read_tokens,
             cache_write_tokens,
+            reasoning_tokens,
             duration_ms,
             ok,
             failover,
@@ -285,6 +287,7 @@ async fn route(
                     output_tokens: 0,
                     cache_read_tokens: None,
                     cache_write_tokens: None,
+                    reasoning_tokens: None,
                     duration_ms: started.elapsed().as_millis() as u64,
                     ok: false,
                     failover: false,
@@ -414,6 +417,8 @@ async fn handle(
         .map_err(|error| AppError::InvalidConfig(format!("请求体不是合法 JSON: {error}")))?;
     let inbound_provider = provider_for(inbound);
     let request = inbound_provider.decode_request(raw)?;
+    // 规范级校验：无法保真转换的请求直接拒掉，别转一半。
+    request.validate()?;
     // 过滤器：在转发前按规则改写规范请求。放在自动切换循环之外，
     // 保证重试多个上游时规则只套用一次。
     let request = crate::filters::apply(&crate::filters::snapshot(), request)?;
@@ -517,6 +522,10 @@ async fn handle(
             .pointer("/usage/cache_creation_input_tokens")
             .and_then(Value::as_u64)
             .filter(|tokens| *tokens > 0);
+        let reasoning_tokens = canonical
+            .pointer("/usage/output_tokens_details/thinking_tokens")
+            .and_then(Value::as_u64)
+            .filter(|tokens| *tokens > 0);
         stats.record_tokens(input_tokens, output_tokens);
         record_usage(
             &primary,
@@ -527,6 +536,7 @@ async fn handle(
             output_tokens,
             cache_read_tokens,
             cache_write_tokens,
+            reasoning_tokens,
             started.elapsed().as_millis() as u64,
             true,
             failover_used,
@@ -547,7 +557,11 @@ async fn handle(
     }
 
     let mut upstream_state = StreamState::new(config.name.clone());
-    let mut wire_state = WireState::default();
+    // include_usage（OpenAI 入站的 stream_options）决定出站流末尾要不要补 usage 分片。
+    let mut wire_state = WireState {
+        include_usage: request.body().canonical.include_usage,
+        ..WireState::default()
+    };
     let mut assembler = ResponseAssembler::default();
     let inbound_request_owned = inbound_request.to_string();
     let emit_initial = !upstream_provider.is_passthrough();
@@ -570,6 +584,8 @@ async fn handle(
             match item {
                 Ok((event_name, data)) => {
                     if data.trim() == "[DONE]" {
+                        // [DONE] 是上游真正的结束信号，记下来（没有它的流算被截断）。
+                        upstream_state.upstream_ended = true;
                         for canonical in upstream_provider.decode_stream_done(&config, &mut upstream_state).unwrap_or_default() {
                             assembler.apply(&canonical);
                             for event in inbound_provider.encode_stream_event(&config, &canonical, &mut wire_state) {
@@ -616,12 +632,22 @@ async fn handle(
                 yield Ok(Bytes::from(encode_event(&event)));
             }
         }
+        // usage 只在流的末尾事件里出现，message_start 时还没有；出站前按流状态的最终值补齐，
+        // 否则 include_usage 的客户端会收到一份输入 token 为 0 的 usage 分片。
+        wire_state.input_tokens = upstream_state.input_tokens;
+        wire_state.output_tokens = upstream_state.output_tokens;
+        wire_state.cache_read_tokens = upstream_state.cache_read_tokens;
+        wire_state.reasoning_tokens = upstream_state.reasoning_tokens;
         for event in inbound_provider.encode_stream_done(&config, &mut wire_state) {
             yield Ok(Bytes::from(encode_event(&event)));
         }
 
+        // 形态判定：上游「只给了思考没给正文」或「没发结束事件就断了」以前都被记成成功，
+        // 明细里看不出异常。线上报文保持不变，只把这条记录标成失败并写清原因。
+        let verdict = upstream_state.verdict(stream_error.clone());
+        let (ok, error) = verdict.outcome();
         stats.record_tokens(upstream_state.input_tokens, upstream_state.output_tokens);
-        if let Some(message) = stream_error.as_deref() {
+        if let Some(message) = error.as_deref() {
             stats.record_error(message);
         }
         record_usage(
@@ -633,10 +659,11 @@ async fn handle(
             upstream_state.output_tokens,
             (upstream_state.cache_read_tokens > 0).then_some(upstream_state.cache_read_tokens),
             (upstream_state.cache_write_tokens > 0).then_some(upstream_state.cache_write_tokens),
+            (upstream_state.reasoning_tokens > 0).then_some(upstream_state.reasoning_tokens),
             started.elapsed().as_millis() as u64,
-            stream_error.is_none(),
+            ok,
             failover_used,
-            stream_error,
+            error,
             crate::usage::UsagePayload {
                 inbound_request: Some(inbound_request_owned),
                 upstream_request: Some(upstream_request_text),
@@ -654,6 +681,10 @@ async fn handle(
                         usage.insert(
                             "cache_creation_input_tokens".into(),
                             json!(upstream_state.cache_write_tokens),
+                        );
+                        usage.insert(
+                            "output_tokens_details".into(),
+                            json!({ "thinking_tokens": upstream_state.reasoning_tokens }),
                         );
                     }
                     let native = upstream_provider

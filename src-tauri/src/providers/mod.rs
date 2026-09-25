@@ -1,6 +1,8 @@
 pub mod anthropic_messages;
+pub mod normalizer;
 pub mod openai_completions;
 pub mod openai_responses;
+pub mod wire;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
@@ -10,6 +12,8 @@ use serde_json::{json, Value};
 use crate::domain::canonical::CanonicalRequest;
 use crate::domain::model::{ModelConfig, ModelFormat};
 use crate::error::AppResult;
+
+use normalizer::{BlockNormalizer, StreamVerdict};
 
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 
@@ -51,6 +55,9 @@ pub struct WireState {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
+    pub reasoning_tokens: u64,
+    /// 已经看到的规范 stop_reason（Responses 出站要据此决定 completed / incomplete）。
+    pub stop_reason: Option<String>,
     pub next_output_index: i64,
     pub text_block_index: Option<i64>,
     pub text_output_index: i64,
@@ -62,30 +69,6 @@ pub struct WireState {
     pub tool_args: BTreeMap<i64, String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlockKind {
-    Text,
-    Thinking,
-    ToolUse,
-}
-
-impl BlockKind {
-    fn start_block(&self) -> Value {
-        match self {
-            BlockKind::Text => json!({ "type": "text", "text": "" }),
-            BlockKind::Thinking => json!({ "type": "thinking", "thinking": "" }),
-            BlockKind::ToolUse => json!({ "type": "tool_use", "id": "", "name": "", "input": {} }),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeltaKind {
-    Text,
-    Thinking,
-    Json,
-}
-
 #[derive(Debug)]
 pub struct StreamState {
     pub message_id: String,
@@ -95,12 +78,21 @@ pub struct StreamState {
     /// 缓存读 / 缓存写 token（Anthropic 语义：input_tokens 不含缓存，两者单独计）。
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    /// 思考 token：completions 的 `completion_tokens_details.reasoning_tokens`、
+    /// Responses 的 `output_tokens_details.reasoning_tokens`、Anthropic 的 `output_tokens_details.thinking_tokens`。
+    pub reasoning_tokens: u64,
     pub message_started: bool,
-    pub open_block: Option<BlockKind>,
-    pub next_index: i64,
     pub stop_reason: Option<String>,
     pub finished: bool,
+    /// 上游有没有发过真正的结束信号（`finish_reason` / `message_stop` / `[DONE]`）。
+    /// 用来区分「上游正常收尾」和「连接断了」——后者以前会被静默补成 end_turn。
+    pub upstream_ended: bool,
+    /// 上游在流里报的错误（Anthropic 的 `error` 事件、OpenAI 的 `{"error":..}` 分片等）。
+    /// 这类流以前会被记成成功，因为错误是作为事件转发出去、不进 `stream_error`。
+    pub upstream_error: Option<String>,
+    /// 已经见过的上游工具序号（解码侧用它判断「这是某个工具的第一个分片」）。
     pub tool_calls: BTreeSet<i64>,
+    blocks: BlockNormalizer,
 }
 
 impl StreamState {
@@ -113,12 +105,14 @@ impl StreamState {
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            reasoning_tokens: 0,
             message_started: false,
-            open_block: None,
-            next_index: 0,
             stop_reason: None,
             finished: false,
+            upstream_ended: false,
+            upstream_error: None,
             tool_calls: BTreeSet::new(),
+            blocks: BlockNormalizer::default(),
         }
     }
 
@@ -150,70 +144,27 @@ impl StreamState {
         )]
     }
 
-    pub fn close_block(&mut self) -> Option<SseEvent> {
-        self.open_block.take().map(|_| {
-            let index = self.next_index - 1;
-            SseEvent::new(
-                "content_block_stop",
-                json!({ "type": "content_block_stop", "index": index }),
-            )
-        })
-    }
-
-    pub fn open_tool(&mut self, tool_id: &str, name: &str) -> Vec<SseEvent> {
+    pub fn text_delta(&mut self, payload: &str) -> Vec<SseEvent> {
         let mut events = self.begin();
-        if let Some(event) = self.close_block() {
-            events.push(event);
-        }
-        self.open_block = Some(BlockKind::ToolUse);
-        let index = self.next_index;
-        self.next_index += 1;
-        events.push(SseEvent::new(
-            "content_block_start",
-            json!({
-                "type": "content_block_start",
-                "index": index,
-                "content_block": { "type": "tool_use", "id": tool_id, "name": name, "input": {} }
-            }),
-        ));
+        events.extend(self.blocks.text(payload));
         events
     }
 
-    pub fn delta(&mut self, kind: DeltaKind, payload: &str) -> Vec<SseEvent> {
-        if payload.is_empty() {
-            return Vec::new();
-        }
+    pub fn thinking_delta(&mut self, payload: &str) -> Vec<SseEvent> {
         let mut events = self.begin();
-        if self.open_block.is_none() {
-            let block = match kind {
-                DeltaKind::Thinking => BlockKind::Thinking,
-                _ => BlockKind::Text,
-            };
-            if let Some(event) = self.close_block() {
-                events.push(event);
-            }
-            self.open_block = Some(block);
-            let index = self.next_index;
-            self.next_index += 1;
-            events.push(SseEvent::new(
-                "content_block_start",
-                json!({
-                    "type": "content_block_start",
-                    "index": index,
-                    "content_block": block.start_block()
-                }),
-            ));
-        }
-        let index = self.next_index - 1;
-        let delta = match kind {
-            DeltaKind::Text => json!({ "type": "text_delta", "text": payload }),
-            DeltaKind::Thinking => json!({ "type": "thinking_delta", "thinking": payload }),
-            DeltaKind::Json => json!({ "type": "input_json_delta", "partial_json": payload }),
-        };
-        events.push(SseEvent::new(
-            "content_block_delta",
-            json!({ "type": "content_block_delta", "index": index, "delta": delta }),
-        ));
+        events.extend(self.blocks.thinking(payload));
+        events
+    }
+
+    /// 声明一个工具调用（块在第一个参数分片或流结束时才开）。
+    pub fn tool_start(&mut self, upstream_index: i64, id: &str, name: &str) -> Vec<SseEvent> {
+        self.blocks.tool_start(upstream_index, id, name);
+        self.begin()
+    }
+
+    pub fn tool_args(&mut self, upstream_index: i64, partial: &str) -> Vec<SseEvent> {
+        let mut events = self.begin();
+        events.extend(self.blocks.tool_args(upstream_index, partial));
         events
     }
 
@@ -224,15 +175,21 @@ impl StreamState {
         self.finished = true;
         self.stop_reason = Some(stop_reason.to_string());
         let mut events = self.begin();
-        if let Some(event) = self.close_block() {
-            events.push(event);
-        }
+        events.extend(self.blocks.close());
         events.push(SseEvent::new(
             "message_delta",
             json!({
                 "type": "message_delta",
                 "delta": { "stop_reason": stop_reason, "stop_sequence": null },
-                "usage": { "output_tokens": self.output_tokens }
+                // Anthropic 文档口径：message_delta 的 usage 是累计值，且带 input / 缓存字段。
+                // 上游同一条消息里还没报过的值写 null（类型允许 null），不把「未知」写成 0。
+                "usage": {
+                    "input_tokens": reported(self.input_tokens),
+                    "output_tokens": self.output_tokens,
+                    "cache_read_input_tokens": reported(self.cache_read_tokens),
+                    "cache_creation_input_tokens": reported(self.cache_write_tokens),
+                    "output_tokens_details": { "thinking_tokens": reported(self.reasoning_tokens) }
+                }
             }),
         ));
         events.push(SseEvent::new(
@@ -248,6 +205,35 @@ impl StreamState {
             "error",
             json!({ "type": "error", "error": { "type": kind, "message": message } }),
         )]
+    }
+
+    /// 流结束后的形态判定，决定这条明细算不算成功（`server.rs` 只负责上报）。
+    pub fn verdict(&self, error: Option<String>) -> StreamVerdict {
+        if let Some(message) = error {
+            return StreamVerdict::UpstreamError(message);
+        }
+        if let Some(message) = &self.upstream_error {
+            return StreamVerdict::UpstreamError(message.clone());
+        }
+        if !self.upstream_ended {
+            return StreamVerdict::Truncated;
+        }
+        if self.blocks.text_chars() == 0
+            && self.blocks.tool_count() == 0
+            && self.blocks.thinking_chars() > 0
+        {
+            return StreamVerdict::EmptyReasoningOnly;
+        }
+        StreamVerdict::Ok
+    }
+}
+
+/// 0 视为「上游还没报」→ null（Anthropic 的 usage 字段允许 null）。
+fn reported(tokens: u64) -> Value {
+    if tokens == 0 {
+        Value::Null
+    } else {
+        json!(tokens)
     }
 }
 
@@ -487,14 +473,4 @@ pub fn http_client() -> &'static reqwest::Client {
             .build()
             .expect("failed to build reqwest client")
     })
-}
-
-pub fn resolve_stop_reason(value: Option<&str>) -> String {
-    match value {
-        Some("tool_calls") | Some("function_call") => "tool_use",
-        Some("length") | Some("max_tokens") | Some("max_output_tokens") => "max_tokens",
-        Some("stop") | Some("end_turn") | Some("completed") | None => "end_turn",
-        Some(other) => other,
-    }
-    .to_string()
 }

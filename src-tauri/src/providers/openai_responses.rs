@@ -1,11 +1,12 @@
 use serde_json::{json, Map, Value};
 
 use crate::domain::canonical::{blocks_to_text, content_to_text, CanonicalRequest, ContentBlock};
-use crate::domain::model::ModelConfig;
+use crate::domain::model::{ModelConfig, ModelFormat};
 use crate::error::{AppError, AppResult};
 
 use super::openai_completions::{data_url_to_source, parse_arguments};
-use super::{DeltaKind, ModelProvider, SseEvent, StreamState, WireState};
+use super::wire::{self, Fill};
+use super::{ModelProvider, SseEvent, StreamState, WireState};
 
 pub struct OpenaiResponsesProvider;
 
@@ -63,6 +64,115 @@ fn encode_tools(tools: &[crate::domain::canonical::ToolDef]) -> Value {
             })
             .collect(),
     )
+}
+
+/// 取（必要时新建）一个对象子字段，供 `text` / `reasoning` 这类嵌套参数使用。
+fn object_field<'a>(payload: &'a mut Map<String, Value>, key: &str) -> &'a mut Map<String, Value> {
+    let entry = payload
+        .entry(key.to_string())
+        .or_insert_with(|| json!({}));
+    if !entry.is_object() {
+        *entry = json!({});
+    }
+    entry.as_object_mut().expect("刚被规范成对象")
+}
+
+/// reasoning 项的思考文本：优先 `summary[].text`（摘要），没有再退到 `content[].text`（完整思考）。
+fn reasoning_text(item: &Value) -> String {
+    let collect = |key: &str| -> String {
+        item.get(key)
+            .and_then(Value::as_array)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
+    };
+    let summary = collect("summary");
+    if summary.is_empty() {
+        collect("content")
+    } else {
+        summary
+    }
+}
+
+/// 规范的 `tool_choice`（Chat Completions 口径）→ Responses 写法：
+/// `auto` / `none` / `required` 同名，`{type:function,function:{name}}` 摊平成 `{type:function,name}`。
+fn tool_choice(choice: &Value) -> Option<Value> {
+    match choice {
+        Value::String(kind) => Some(Value::String(kind.clone())),
+        Value::Object(object) => match object.get("type").and_then(Value::as_str) {
+            Some("function") => Some(json!({
+                "type": "function",
+                "name": object
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            })),
+            Some("tool") => Some(json!({
+                "type": "function",
+                "name": object.get("name").and_then(Value::as_str).unwrap_or_default()
+            })),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Responses 的 `tool_choice` → 规范（Chat Completions 口径）。
+fn canonical_tool_choice(choice: &Value) -> Option<Value> {
+    match choice {
+        Value::String(kind) => Some(Value::String(kind.clone())),
+        Value::Object(object) => match object.get("type").and_then(Value::as_str) {
+            Some("function") => Some(json!({
+                "type": "function",
+                "function": {
+                    "name": object.get("name").and_then(Value::as_str).unwrap_or_default()
+                }
+            })),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// 规范的 `response_format` → Responses 的 `text.format`：
+/// Responses 把 `json_schema` 的嵌套层摊平（`{type, name, schema, strict}`），`text` / `json_object` 同名。
+fn text_format(value: &Value) -> Option<Value> {
+    match value.get("type").and_then(Value::as_str)? {
+        "json_schema" => {
+            let schema = value.get("json_schema")?;
+            let mut format = Map::new();
+            format.insert("type".into(), Value::String("json_schema".into()));
+            for key in ["name", "description", "schema", "strict"] {
+                if let Some(field) = schema.get(key) {
+                    format.insert(key.to_string(), field.clone());
+                }
+            }
+            Some(Value::Object(format))
+        }
+        kind => Some(json!({ "type": kind })),
+    }
+}
+
+/// Responses 的 `text.format` → 规范（Chat Completions 口径）。
+fn canonical_format(value: &Value) -> Option<Value> {
+    match value.get("type").and_then(Value::as_str)? {
+        "json_schema" => {
+            let mut schema = Map::new();
+            for key in ["name", "description", "schema", "strict"] {
+                if let Some(field) = value.get(key) {
+                    schema.insert(key.to_string(), field.clone());
+                }
+            }
+            Some(json!({ "type": "json_schema", "json_schema": Value::Object(schema) }))
+        }
+        kind => Some(json!({ "type": kind })),
+    }
 }
 
 impl ModelProvider for OpenaiResponsesProvider {
@@ -123,7 +233,6 @@ impl ModelProvider for OpenaiResponsesProvider {
         let mut payload = Map::new();
         payload.insert("model".into(), Value::String(cfg.model.clone()));
         payload.insert("input".into(), Value::Array(input));
-        payload.insert("stream".into(), Value::Bool(body.stream));
         payload.insert(
             "max_output_tokens".into(),
             json!(body
@@ -137,14 +246,31 @@ impl ModelProvider for OpenaiResponsesProvider {
                 payload.insert("instructions".into(), Value::String(text));
             }
         }
-        if let Some(top_p) = body.top_p {
-            payload.insert("top_p".into(), json!(top_p));
-        }
         if let Some(tools) = &body.tools {
             if !tools.is_empty() {
                 payload.insert("tools".into(), encode_tools(tools));
             }
         }
+        if let Some(choice) = body.tool_choice.as_ref().and_then(tool_choice) {
+            payload.insert("tool_choice".into(), choice);
+        }
+        // Responses 把输出格式与思考档位分别装在 text / reasoning 两个对象里。
+        if let Some(format) = body.response_format.as_ref().and_then(text_format) {
+            object_field(&mut payload, "text").insert("format".into(), format);
+        }
+        if let Some(effort) = &body.reasoning_effort {
+            object_field(&mut payload, "reasoning").insert("effort".into(), Value::String(effort.clone()));
+        }
+
+        // 其余标量字段按协议表落地（同名写入 / 变形 / 显式丢弃）。
+        let canonical = serde_json::to_value(body)
+            .map_err(|error| AppError::Message(format!("规范请求序列化失败: {error}")))?;
+        wire::apply_common_fields(
+            &mut payload,
+            &canonical,
+            wire::profile(ModelFormat::OpenaiResponses),
+            Fill::Overwrite,
+        );
 
         Ok(Value::Object(payload))
     }
@@ -157,15 +283,10 @@ impl ModelProvider for OpenaiResponsesProvider {
             for item in output {
                 match item.get("type").and_then(Value::as_str) {
                     Some("reasoning") => {
-                        if let Some(summaries) = item.get("summary").and_then(Value::as_array) {
-                            let text = summaries
-                                .iter()
-                                .filter_map(|summary| summary.get("text").and_then(Value::as_str))
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            if !text.is_empty() {
-                                content.push(json!({ "type": "thinking", "thinking": text }));
-                            }
+                        // 思考文本可能落在 summary[].text（摘要）或 content[].text（完整思考）里。
+                        let text = reasoning_text(item);
+                        if !text.is_empty() {
+                            content.push(json!({ "type": "thinking", "thinking": text }));
                         }
                     }
                     Some("message") => {
@@ -197,11 +318,7 @@ impl ModelProvider for OpenaiResponsesProvider {
         }
 
         let has_tools = content.iter().any(|block| block["type"] == "tool_use");
-        let stop_reason = match status {
-            Some("incomplete") => "max_tokens",
-            _ if has_tools => "tool_use",
-            _ => "end_turn",
-        };
+        let stop_reason = wire::stop_reason_from_response(status, has_tools);
 
         // input_tokens 含缓存命中；canonical 采用 Anthropic 语义，拆成「未命中输入 + 缓存读」。
         let usage = raw.get("usage");
@@ -215,6 +332,10 @@ impl ModelProvider for OpenaiResponsesProvider {
             .unwrap_or(0);
         let output_tokens = usage
             .and_then(|value| value.get("output_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let reasoning_tokens = usage
+            .and_then(|value| value.pointer("/output_tokens_details/reasoning_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or(0);
 
@@ -231,7 +352,8 @@ impl ModelProvider for OpenaiResponsesProvider {
                 "input_tokens": reported_input.saturating_sub(cache_read_tokens),
                 "output_tokens": output_tokens,
                 "cache_read_input_tokens": cache_read_tokens,
-                "cache_creation_input_tokens": 0
+                "cache_creation_input_tokens": 0,
+                "output_tokens_details": { "thinking_tokens": reasoning_tokens }
             }
         }))
     }
@@ -262,21 +384,28 @@ impl ModelProvider for OpenaiResponsesProvider {
             }
             "response.output_text.delta" => {
                 if let Some(delta) = data.get("delta").and_then(Value::as_str) {
-                    events.extend(state.delta(DeltaKind::Text, delta));
+                    events.extend(state.text_delta(delta));
+                }
+            }
+            // 拒答内容按正文转发，否则客户端只看到空白。
+            "response.refusal.delta" => {
+                if let Some(delta) = data.get("delta").and_then(Value::as_str) {
+                    events.extend(state.text_delta(delta));
                 }
             }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                 if let Some(delta) = data.get("delta").and_then(Value::as_str) {
-                    events.extend(state.delta(DeltaKind::Thinking, delta));
+                    events.extend(state.thinking_delta(delta));
                 }
             }
             "response.output_item.added" => {
                 if let Some(item) = data.get("item") {
                     if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                        // 并行工具调用：上游用 output_index 区分，规范里同样按它排序（工具表内的序号）。
                         let index = data
                             .get("output_index")
                             .and_then(Value::as_i64)
-                            .unwrap_or(state.next_index);
+                            .unwrap_or(0);
                         let call_id = item
                             .get("call_id")
                             .and_then(Value::as_str)
@@ -288,13 +417,17 @@ impl ModelProvider for OpenaiResponsesProvider {
                             .unwrap_or_default()
                             .to_string();
                         state.tool_calls.insert(index);
-                        events.extend(state.open_tool(&call_id, &call_name));
+                        events.extend(state.tool_start(index, &call_id, &call_name));
                     }
                 }
             }
             "response.function_call_arguments.delta" => {
                 if let Some(delta) = data.get("delta").and_then(Value::as_str) {
-                    events.extend(state.delta(DeltaKind::Json, delta));
+                    let index = data
+                        .get("output_index")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
+                    events.extend(state.tool_args(index, delta));
                 }
             }
             "response.completed" | "response.incomplete" => {
@@ -313,7 +446,14 @@ impl ModelProvider for OpenaiResponsesProvider {
                     if let Some(output) = usage.get("output_tokens").and_then(Value::as_u64) {
                         state.output_tokens = output;
                     }
+                    if let Some(reasoning) = usage
+                        .pointer("/output_tokens_details/reasoning_tokens")
+                        .and_then(Value::as_u64)
+                    {
+                        state.reasoning_tokens = reasoning;
+                    }
                 }
+                state.upstream_ended = true;
                 let stop_reason = if incomplete {
                     "max_tokens"
                 } else if has_tools {
@@ -329,6 +469,8 @@ impl ModelProvider for OpenaiResponsesProvider {
                     .or_else(|| data.pointer("/error/message"))
                     .and_then(Value::as_str)
                     .unwrap_or("上游返回错误");
+                state.upstream_ended = true;
+                state.upstream_error = Some(message.to_string());
                 events.extend(state.error("api_error", message));
             }
             _ => {}
@@ -451,10 +593,36 @@ impl ModelProvider for OpenaiResponsesProvider {
         if let Some(max) = object.get("max_output_tokens").and_then(Value::as_u64) {
             canonical.insert("max_tokens".into(), json!(max));
         }
-        for key in ["temperature", "top_p", "stream"] {
+        for key in [
+            "temperature",
+            "top_p",
+            "stream",
+            "store",
+            "metadata",
+            "parallel_tool_calls",
+            "service_tier",
+        ] {
             if let Some(value) = object.get(key) {
                 canonical.insert(key.into(), value.clone());
             }
+        }
+        // 嵌套字段抬成规范字段：reasoning.effort、text.format、tool_choice。
+        if let Some(effort) = object
+            .get("reasoning")
+            .and_then(|value| value.get("effort"))
+            .cloned()
+        {
+            canonical.insert("reasoning_effort".into(), effort);
+        }
+        if let Some(format) = object
+            .get("text")
+            .and_then(|value| value.get("format"))
+            .and_then(canonical_format)
+        {
+            canonical.insert("response_format".into(), format);
+        }
+        if let Some(choice) = object.get("tool_choice").and_then(canonical_tool_choice) {
+            canonical.insert("tool_choice".into(), choice);
         }
         if let Some(tools) = object.get("tools").and_then(Value::as_array) {
             let converted: Vec<Value> = tools
@@ -738,6 +906,11 @@ impl ModelProvider for OpenaiResponsesProvider {
                 if let Some(output) = data.pointer("/usage/output_tokens").and_then(Value::as_u64) {
                     state.output_tokens = output;
                 }
+                // 记下规范 stop_reason：结束事件据此决定 completed / incomplete。
+                state.stop_reason = data
+                    .pointer("/delta/stop_reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 Vec::new()
             }
             "error" => vec![canonical.clone()],
@@ -751,23 +924,34 @@ impl ModelProvider for OpenaiResponsesProvider {
         }
         state.done_sent = true;
         let mut events = close_text_item(state);
+        // 截断类收尾（max_tokens）按 Responses 口径发 response.incomplete，
+        // 否则客户端无法区分「正常答完」和「被上限截断」。
+        let (status, incomplete_reason) = wire::response_status(state.stop_reason.as_deref());
+        let incomplete = status == "incomplete";
+        let mut response = json!({
+            "id": state.response_id,
+            "object": "response",
+            "status": status,
+            "model": state.model,
+            "output": [],
+            "usage": {
+                "input_tokens": state.input_tokens,
+                "output_tokens": state.output_tokens,
+                "total_tokens": state.input_tokens + state.output_tokens,
+                "input_tokens_details": { "cached_tokens": state.cache_read_tokens },
+                "output_tokens_details": { "reasoning_tokens": state.reasoning_tokens }
+            }
+        });
+        if let Some(reason) = incomplete_reason {
+            response["incomplete_details"] = json!({ "reason": reason });
+        }
         events.push(responses_event(
-            "response.completed",
-            json!({
-                "response": {
-                    "id": state.response_id,
-                    "object": "response",
-                    "status": "completed",
-                    "model": state.model,
-                    "output": [],
-                    "usage": {
-                        "input_tokens": state.input_tokens,
-                        "output_tokens": state.output_tokens,
-                        "total_tokens": state.input_tokens + state.output_tokens,
-                        "input_tokens_details": { "cached_tokens": state.cache_read_tokens }
-                    }
-                }
-            }),
+            if incomplete {
+                "response.incomplete"
+            } else {
+                "response.completed"
+            },
+            json!({ "response": response }),
         ));
         events
     }

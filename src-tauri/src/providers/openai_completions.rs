@@ -1,20 +1,63 @@
 use serde_json::{json, Map, Value};
 
-use crate::domain::canonical::{blocks_to_text, content_to_text, CanonicalRequest, ContentBlock};
-use crate::domain::model::ModelConfig;
+use crate::domain::canonical::{
+    blocks_to_text, content_to_text, CanonicalRequest, ContentBlock, MaxTokensField,
+};
+use crate::domain::model::{ModelConfig, ModelFormat};
 use crate::error::{AppError, AppResult};
 
-use super::{BlockKind, DeltaKind, ModelProvider, SseEvent, StreamState, WireState};
+use super::wire::{self, Fill};
+use super::{ModelProvider, SseEvent, StreamState, WireState};
 
 pub struct OpenaiCompletionsProvider;
 
-/// 思考内容的字段名各家不同：DeepSeek 原生用 `reasoning_content`，OpenRouter 系（含部分网关上游）用 `reasoning`。
+/// 上游承载思考的字段按协议表依次尝试（DeepSeek 原生用 `reasoning_content`，OpenRouter 系用 `reasoning`）。
 fn reasoning_text(value: &Value) -> Option<&str> {
-    value
-        .get("reasoning_content")
-        .or_else(|| value.get("reasoning"))
-        .and_then(Value::as_str)
+    wire::profile(ModelFormat::OpenaiCompletions)
+        .reasoning_fields
+        .iter()
+        .find_map(|field| value.get(*field).and_then(Value::as_str))
         .filter(|text| !text.is_empty())
+}
+
+/// 结构化思考（OpenRouter 系还会给 `reasoning_details[]`）：只有前面那些字符串字段都没有时才兜底，
+/// 免得同一段思考被算两遍。
+fn reasoning_details_text(value: &Value) -> Option<String> {
+    let items = value.get("reasoning_details")?.as_array()?;
+    let text: String = items
+        .iter()
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .collect();
+    (!text.is_empty()).then_some(text)
+}
+
+/// 只取思考：字符串字段优先，结构化字段兜底。
+fn thinking_text(value: &Value) -> Option<String> {
+    reasoning_text(value)
+        .map(str::to_string)
+        .or_else(|| reasoning_details_text(value))
+}
+
+/// 用量口径：OpenAI 的 `prompt_tokens` 含缓存命中，规范采用 Anthropic 语义（input 不含缓存），
+/// 所以拆成「未命中输入 + 缓存读」；思考 token 单独记，不计入 output。
+fn apply_usage(state: &mut StreamState, usage: &Value) {
+    let cache_read = usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if let Some(prompt) = usage.get("prompt_tokens").and_then(Value::as_u64) {
+        state.input_tokens = prompt.saturating_sub(cache_read);
+    }
+    state.cache_read_tokens = cache_read;
+    if let Some(completion) = usage.get("completion_tokens").and_then(Value::as_u64) {
+        state.output_tokens = completion;
+    }
+    if let Some(reasoning) = usage
+        .pointer("/completion_tokens_details/reasoning_tokens")
+        .and_then(Value::as_u64)
+    {
+        state.reasoning_tokens = reasoning;
+    }
 }
 
 fn image_url_from_block(block: &ContentBlock) -> Option<String> {
@@ -175,20 +218,17 @@ impl ModelProvider for OpenaiCompletionsProvider {
         let mut payload = Map::new();
         payload.insert("model".into(), Value::String(cfg.model.clone()));
         payload.insert("messages".into(), Value::Array(messages));
-        payload.insert(
-            "max_tokens".into(),
-            json!(body
-                .max_tokens
-                .unwrap_or(crate::domain::model::DEFAULT_MAX_TOKENS)),
-        );
-        payload.insert("stream".into(), Value::Bool(body.stream));
+        // 输出上限：客户端原本用 max_completion_tokens 就原样回它——OpenAI 的 max_tokens 已弃用，
+        // 且与 o 系列不兼容（上游会直接报错）。
+        let max_tokens = body
+            .max_tokens
+            .unwrap_or(crate::domain::model::DEFAULT_MAX_TOKENS);
+        let max_tokens_field = match body.canonical.max_tokens_field {
+            Some(MaxTokensField::MaxCompletionTokens) => "max_completion_tokens",
+            _ => "max_tokens",
+        };
+        payload.insert(max_tokens_field.into(), json!(max_tokens));
 
-        if let Some(top_p) = body.top_p {
-            payload.insert("top_p".into(), json!(top_p));
-        }
-        if let Some(stop) = &body.stop_sequences {
-            payload.insert("stop".into(), json!(stop));
-        }
         if let Some(tools) = &body.tools {
             if !tools.is_empty() {
                 payload.insert("tools".into(), encode_tools(tools));
@@ -198,6 +238,21 @@ impl ModelProvider for OpenaiCompletionsProvider {
             if let Some(encoded) = encode_tool_choice(choice) {
                 payload.insert("tool_choice".into(), encoded);
             }
+        }
+
+        // 其余标量字段按协议表落地（同名写入 / 改名写入 / 显式丢弃）。
+        let canonical = serde_json::to_value(body)
+            .map_err(|error| AppError::Message(format!("规范请求序列化失败: {error}")))?;
+        wire::apply_common_fields(
+            &mut payload,
+            &canonical,
+            wire::profile(ModelFormat::OpenaiCompletions),
+            Fill::Overwrite,
+        );
+
+        // 上游只有收到 include_usage 才会在流末尾上报 usage（OpenAI 官方接口如此），否则本地与客户端都拿不到。
+        if body.stream && body.canonical.include_usage {
+            payload.insert("stream_options".into(), json!({ "include_usage": true }));
         }
 
         Ok(Value::Object(payload))
@@ -213,12 +268,18 @@ impl ModelProvider for OpenaiCompletionsProvider {
             .and_then(Value::as_str);
 
         let mut content: Vec<Value> = Vec::new();
-        if let Some(reasoning) = reasoning_text(&message) {
+        if let Some(reasoning) = thinking_text(&message) {
             content.push(json!({ "type": "thinking", "thinking": reasoning }));
         }
         if let Some(text) = message.get("content").and_then(Value::as_str) {
             if !text.is_empty() {
                 content.push(json!({ "type": "text", "text": text }));
+            }
+        }
+        // 拒答内容按正文给出：规范里没有 refusal 块，丢掉会让客户端只看到一片空白。
+        if let Some(refusal) = message.get("refusal").and_then(Value::as_str) {
+            if !refusal.is_empty() {
+                content.push(json!({ "type": "text", "text": refusal }));
             }
         }
         if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
@@ -236,22 +297,28 @@ impl ModelProvider for OpenaiCompletionsProvider {
             }
         }
 
-        let stop_reason = super::resolve_stop_reason(finish_reason);
-
-        // OpenAI 的 prompt_tokens 已包含缓存命中，canonical 采用 Anthropic 语义（input 不含缓存），
-        // 故拆成「未命中输入 + 缓存读」；两者相加等于上游 prompt_tokens，不会重复计数。
+        let stop_reason = wire::stop_reason_from_finish_reason(finish_reason);
         let usage = raw.get("usage");
-        let prompt_tokens = usage
+        let input_tokens = usage
             .and_then(|value| value.get("prompt_tokens"))
             .and_then(Value::as_u64)
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .saturating_sub(
+                usage
+                    .and_then(|value| value.pointer("/prompt_tokens_details/cached_tokens"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            );
         let cache_read_tokens = usage
             .and_then(|value| value.pointer("/prompt_tokens_details/cached_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        let input_tokens = prompt_tokens.saturating_sub(cache_read_tokens);
         let output_tokens = usage
             .and_then(|value| value.get("completion_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let reasoning_tokens = usage
+            .and_then(|value| value.pointer("/completion_tokens_details/reasoning_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or(0);
 
@@ -268,7 +335,8 @@ impl ModelProvider for OpenaiCompletionsProvider {
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "cache_read_input_tokens": cache_read_tokens,
-                "cache_creation_input_tokens": 0
+                "cache_creation_input_tokens": 0,
+                "output_tokens_details": { "thinking_tokens": reasoning_tokens }
             }
         }))
     }
@@ -281,18 +349,18 @@ impl ModelProvider for OpenaiCompletionsProvider {
         state: &mut StreamState,
     ) -> AppResult<Vec<SseEvent>> {
         if let Some(usage) = data.get("usage").filter(|value| !value.is_null()) {
-            let cache_read = usage
-                .pointer("/prompt_tokens_details/cached_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            if let Some(prompt) = usage.get("prompt_tokens").and_then(Value::as_u64) {
-                // prompt_tokens 含缓存命中，canonical 只留未命中部分（与 Anthropic 同口径）。
-                state.input_tokens = prompt.saturating_sub(cache_read);
-            }
-            state.cache_read_tokens = cache_read;
-            if let Some(completion) = usage.get("completion_tokens").and_then(Value::as_u64) {
-                state.output_tokens = completion;
-            }
+            apply_usage(state, usage);
+        }
+
+        // OpenAI 系的流内错误是「没有 choices、只有一个 error 对象」的分片：
+        // 以前会被当成空分片丢掉，客户端什么都看不到、明细还记成成功。
+        if let Some(error) = data.get("error") {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("上游返回错误");
+            state.upstream_error = Some(message.to_string());
+            return Ok(state.error("api_error", message));
         }
 
         let Some(choice) = data.pointer("/choices/0") else {
@@ -302,8 +370,8 @@ impl ModelProvider for OpenaiCompletionsProvider {
         let mut events: Vec<SseEvent> = Vec::new();
 
         if let Some(delta) = choice.get("delta") {
-            if let Some(reasoning) = reasoning_text(delta) {
-                events.extend(state.delta(DeltaKind::Thinking, reasoning));
+            if let Some(reasoning) = thinking_text(delta) {
+                events.extend(state.thinking_delta(&reasoning));
             }
 
             if let Some(text) = delta
@@ -311,13 +379,17 @@ impl ModelProvider for OpenaiCompletionsProvider {
                 .and_then(Value::as_str)
                 .filter(|text| !text.is_empty())
             {
-                if state.open_block == Some(BlockKind::Thinking) {
-                    if let Some(event) = state.close_block() {
-                        events.push(event);
-                    }
-                }
-                events.extend(state.delta(DeltaKind::Text, text));
+                events.extend(state.text_delta(text));
                 state.output_tokens += 1;
+            }
+
+            // 拒答（content_filter 场景）按正文转发，否则客户端只看到一段空白。
+            if let Some(refusal) = delta
+                .get("refusal")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+            {
+                events.extend(state.text_delta(refusal));
             }
 
             if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
@@ -335,7 +407,7 @@ impl ModelProvider for OpenaiCompletionsProvider {
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .to_string();
-                        events.extend(state.open_tool(&id, &name));
+                        events.extend(state.tool_start(index, &id, &name));
                     }
 
                     if let Some(partial) = call
@@ -343,14 +415,15 @@ impl ModelProvider for OpenaiCompletionsProvider {
                         .and_then(Value::as_str)
                         .filter(|text| !text.is_empty())
                     {
-                        events.extend(state.delta(DeltaKind::Json, partial));
+                        events.extend(state.tool_args(index, partial));
                     }
                 }
             }
         }
 
         if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
-            let stop_reason = super::resolve_stop_reason(Some(reason));
+            state.upstream_ended = true;
+            let stop_reason = wire::stop_reason_from_finish_reason(Some(reason));
             events.extend(state.finish(&stop_reason));
         }
 
@@ -482,13 +555,44 @@ impl ModelProvider for OpenaiCompletionsProvider {
         for key in ["max_tokens", "max_completion_tokens"] {
             if let Some(value) = object.get(key).and_then(Value::as_u64) {
                 canonical.insert("max_tokens".into(), json!(value));
+                // 记住客户端用的是哪个字段：二者语义不同（max_completion_tokens 才兼容 o 系列），
+                // 上游编码时按原字段回写。
+                if key == "max_completion_tokens" {
+                    canonical.insert(
+                        "_canonical".into(),
+                        json!({ "max_tokens_field": "max_completion_tokens" }),
+                    );
+                }
                 break;
             }
         }
-        for key in ["temperature", "top_p", "stream"] {
+        for key in [
+            "temperature",
+            "top_p",
+            "stream",
+            "store",
+            "metadata",
+            "response_format",
+            "parallel_tool_calls",
+            "reasoning_effort",
+            "service_tier",
+            "n",
+        ] {
             if let Some(value) = object.get(key) {
                 canonical.insert(key.into(), value.clone());
             }
+        }
+        // stream_options.include_usage 决定流式响应末尾是否要带 usage 事件，需要透传到上游与本端出站。
+        if object
+            .get("stream_options")
+            .and_then(|options| options.get("include_usage"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let canonical_only = canonical
+                .entry("_canonical".to_string())
+                .or_insert_with(|| json!({}));
+            canonical_only["include_usage"] = Value::Bool(true);
         }
         match object.get("stop") {
             Some(Value::String(text)) => {
@@ -573,7 +677,7 @@ impl ModelProvider for OpenaiCompletionsProvider {
             message.insert("tool_calls".into(), Value::Array(tool_calls));
         }
 
-        let finish = map_finish_reason(canonical.get("stop_reason").and_then(Value::as_str));
+        let finish = wire::finish_reason(canonical.get("stop_reason").and_then(Value::as_str));
         let input_tokens = canonical
             .pointer("/usage/input_tokens")
             .and_then(Value::as_u64)
@@ -584,6 +688,10 @@ impl ModelProvider for OpenaiCompletionsProvider {
             .unwrap_or(0);
         let output_tokens = canonical
             .pointer("/usage/output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let reasoning_tokens = canonical
+            .pointer("/usage/output_tokens_details/thinking_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0);
         // 回写给 OpenAI 客户端时把缓存读并回 prompt_tokens（OpenAI 语义：prompt_tokens 含缓存）。
@@ -604,7 +712,8 @@ impl ModelProvider for OpenaiCompletionsProvider {
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": output_tokens,
                 "total_tokens": prompt_tokens + output_tokens,
-                "prompt_tokens_details": { "cached_tokens": cache_read_tokens }
+                "prompt_tokens_details": { "cached_tokens": cache_read_tokens },
+                "completion_tokens_details": { "reasoning_tokens": reasoning_tokens }
             }
         }))
     }
@@ -695,7 +804,9 @@ impl ModelProvider for OpenaiCompletionsProvider {
             }
             "message_delta" => {
                 let reason = data.pointer("/delta/stop_reason").and_then(Value::as_str);
-                vec![chunk(state, json!({}), Some(map_finish_reason(reason)))]
+                // 记下规范 stop_reason：流末尾的 usage 分片与落库都按它取口径。
+                state.stop_reason = reason.map(str::to_string);
+                vec![chunk(state, json!({}), Some(wire::finish_reason(reason)))]
             }
             "error" => vec![canonical.clone()],
             _ => Vec::new(),
@@ -707,7 +818,13 @@ impl ModelProvider for OpenaiCompletionsProvider {
             return Vec::new();
         }
         state.done_sent = true;
-        vec![SseEvent::raw("[DONE]")]
+        let mut events = Vec::new();
+        // 客户端声明了 stream_options.include_usage：按 OpenAI 约定在 [DONE] 之前补一个只带 usage 的分片。
+        if state.include_usage {
+            events.push(usage_chunk(state));
+        }
+        events.push(SseEvent::raw("[DONE]"));
+        events
     }
 }
 
@@ -728,28 +845,45 @@ pub(crate) fn data_url_to_source(url: &str) -> Option<Value> {
     Some(json!({ "type": "base64", "media_type": media_type, "data": data }))
 }
 
-fn map_finish_reason(reason: Option<&str>) -> &'static str {
-    match reason {
-        Some("tool_use") => "tool_calls",
-        Some("max_tokens") => "length",
-        _ => "stop",
-    }
-}
-
 fn chunk(state: &WireState, delta: Value, finish_reason: Option<&str>) -> SseEvent {
-    let id = if state.response_id.is_empty() {
-        format!("chatcmpl-{}", uuid::Uuid::new_v4().simple())
-    } else {
-        state.response_id.clone()
-    };
     SseEvent::new(
         "",
         json!({
-            "id": id,
+            "id": chunk_id(state),
             "object": "chat.completion.chunk",
             "created": chrono::Utc::now().timestamp(),
             "model": state.model,
             "choices": [{ "index": 0, "delta": delta, "finish_reason": finish_reason }]
         }),
     )
+}
+
+/// 流末尾的 usage 分片：choices 为空数组，只带整次调用的 token 统计（OpenAI 口径，prompt_tokens 含缓存命中）。
+fn usage_chunk(state: &WireState) -> SseEvent {
+    let prompt_tokens = state.input_tokens + state.cache_read_tokens;
+    SseEvent::new(
+        "",
+        json!({
+            "id": chunk_id(state),
+            "object": "chat.completion.chunk",
+            "created": chrono::Utc::now().timestamp(),
+            "model": state.model,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": state.output_tokens,
+                "total_tokens": prompt_tokens + state.output_tokens,
+                "prompt_tokens_details": { "cached_tokens": state.cache_read_tokens },
+                "completion_tokens_details": { "reasoning_tokens": state.reasoning_tokens }
+            }
+        }),
+    )
+}
+
+fn chunk_id(state: &WireState) -> String {
+    if state.response_id.is_empty() {
+        format!("chatcmpl-{}", uuid::Uuid::new_v4().simple())
+    } else {
+        state.response_id.clone()
+    }
 }

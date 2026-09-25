@@ -31,6 +31,9 @@ pub struct UsageRecord {
     pub cache_read_tokens: Option<u64>,
     #[serde(default)]
     pub cache_write_tokens: Option<u64>,
+    /// 思考 token（不计入 total_tokens）；上游未上报为 None。
+    #[serde(default)]
+    pub reasoning_tokens: Option<u64>,
     pub duration_ms: u64,
     pub ok: bool,
     pub failover: bool,
@@ -130,7 +133,7 @@ pub struct UsageSummary {
 
 const SELECT_COLUMNS: &str = "usage_detail_id, day, event_time, model_name, served_by, inbound_protocol, \
      upstream_protocol, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, duration_ms, ok, failover, error, source_app, \
-     upstream_url, upstream_model";
+     upstream_url, upstream_model, reasoning_tokens";
 
 fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRecord> {
     let event_time: i64 = row.get(2)?;
@@ -148,6 +151,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRecord> {
         output_tokens: row.get::<_, i64>(8)? as u64,
         cache_read_tokens: row.get::<_, Option<i64>>(9)?.map(|value| value as u64),
         cache_write_tokens: row.get::<_, Option<i64>>(10)?.map(|value| value as u64),
+        reasoning_tokens: row.get::<_, Option<i64>>(18)?.map(|value| value as u64),
         duration_ms: row.get::<_, i64>(11)? as u64,
         ok: ok != 0,
         failover: failover != 0,
@@ -183,9 +187,9 @@ pub fn record_with_payload(entry: &UsageRecord, payload: Option<&UsagePayload>) 
     let _ = db::with_tx(|transaction| {
         transaction.execute(
             "INSERT INTO usage_detail (day, event_time, model_name, served_by, inbound_protocol, upstream_protocol, \
-             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens, duration_ms, ok, failover, error, source_app, \
-             upstream_url, upstream_model, created_time, update_time) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?19)",
+             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens, \
+             duration_ms, ok, failover, error, source_app, upstream_url, upstream_model, created_time, update_time) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?20)",
             params![
                 entry.date,
                 event_time,
@@ -197,6 +201,7 @@ pub fn record_with_payload(entry: &UsageRecord, payload: Option<&UsagePayload>) 
                 entry.output_tokens as i64,
                 entry.cache_read_tokens.map(|value| value as i64),
                 entry.cache_write_tokens.map(|value| value as i64),
+                entry.reasoning_tokens.map(|value| value as i64),
                 total,
                 entry.duration_ms as i64,
                 i64::from(entry.ok),

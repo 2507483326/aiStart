@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::error::{AppError, AppResult};
+
 pub type JsonMap = Map<String, Value>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,10 +184,56 @@ pub struct RequestBody {
     pub stop_sequences: Option<Vec<String>>,
     #[serde(default)]
     pub stream: bool,
+    /// Anthropic 专有：核采样候选集大小（另两个协议没有对应参数）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<f64>,
+    /// 是否让上游留存这次请求（OpenAI / Responses 同名；Anthropic 无此参数）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<bool>,
+    /// 结构化元数据：OpenAI / Responses 是任意字符串映射，Anthropic 只接受 `user_id`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
+    /// 输出格式，统一按 OpenAI Chat Completions 的形状表达
+    /// （`{type:"text"|"json_object"|"json_schema", json_schema:{name,schema,strict,description}}`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<Value>,
+    /// 是否允许并行工具调用：OpenAI / Responses 同名，Anthropic 要取反写进 `tool_choice.disable_parallel_tool_use`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    /// 思考档位：completions 是 `reasoning_effort`，Responses 是 `reasoning.effort`，
+    /// Anthropic 是 `output_config.effort`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// 处理档位（completions / Responses / Anthropic 都有同名参数，取值集合略有差异）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    /// 一次请求生成几个候选。网关只承载单候选，> 1 由 `validate()` 挡掉（见下）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n: Option<u32>,
+    /// 只在规范内部存在的字段（任何线上协议都没有的键），统一收进 `_canonical`：
+    /// 透传前整体删掉这一层，以后新增同类字段也不会漏到上游。
+    #[serde(default, rename = "_canonical")]
+    pub canonical: CanonicalOnly,
+}
+
+/// 规范内部字段（不属于任何线上协议）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CanonicalOnly {
     /// 客户端是否要求流式响应末尾附带 usage（OpenAI 的 `stream_options.include_usage`）。
-    /// 由 OpenAI completions 入站解析；上游编码时据此带上 `stream_options`，出站时据此补最终 usage 事件。
     #[serde(default)]
     pub include_usage: bool,
+    /// 客户端原本用哪个字段表达输出上限。OpenAI 的 `max_tokens` 已弃用且与 o 系列不兼容，
+    /// 而 `max_completion_tokens` 才是现行字段；上游编码时按客户端的用法回同一个字段名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens_field: Option<MaxTokensField>,
+}
+
+/// 输出上限在 OpenAI Chat Completions 请求里的字段名。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaxTokensField {
+    MaxTokens,
+    MaxCompletionTokens,
 }
 
 #[derive(Debug, Clone)]
@@ -212,6 +260,17 @@ impl CanonicalRequest {
 
     pub fn stream(&self) -> bool {
         self.body.stream
+    }
+
+    /// 规范级校验：无法保真转换的请求直接拒绝，避免「只转了一半」的静默行为。
+    /// 目前只有多候选：网关与规范形状都只承载一条 assistant 消息。
+    pub fn validate(&self) -> AppResult<()> {
+        if self.body.n.is_some_and(|count| count > 1) {
+            return Err(AppError::InvalidConfig(
+                "一次请求多个候选（n > 1）无法保真转发，请把 n 设为 1 或去掉该字段".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// 在规范 JSON 上做改写，并据此重建类型化的 body，保证两者始终一致。

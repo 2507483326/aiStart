@@ -1,9 +1,12 @@
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::commands::models::parse_model_ids;
-use crate::domain::canonical::CanonicalRequest;
+use crate::domain::canonical::{
+    CanonicalOnly, CanonicalRequest, MaxTokensField, RequestBody, SystemPrompt,
+};
 use crate::domain::model::{ModelConfig, ModelFormat};
-use crate::providers::{provider_for, SseEvent, StreamState, WireState};
+use crate::providers::normalizer::{BlockNormalizer, StreamVerdict};
+use crate::providers::{provider_for, wire, SseEvent, StreamState, WireState};
 use crate::settings::Settings;
 
 fn model(format: ModelFormat, base_url: &str) -> ModelConfig {
@@ -555,6 +558,493 @@ fn openai_completions_decodes_reasoning_field_as_thinking() {
 }
 
 #[test]
+fn openai_inbound_forwards_usage_opt_in_and_temperature() {
+    let provider = provider_for(ModelFormat::OpenaiCompletions);
+    let config = model(ModelFormat::OpenaiCompletions, "https://api.openai.com/v1");
+
+    let opted_in = provider
+        .decode_request(json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": true,
+            "temperature": 0.3,
+            "stream_options": { "include_usage": true }
+        }))
+        .unwrap();
+    assert!(opted_in.body().canonical.include_usage);
+    assert_eq!(opted_in.body().temperature, Some(0.3));
+
+    let encoded = provider.encode_request(&config, &opted_in).unwrap();
+    assert_eq!(encoded["temperature"], 0.3);
+    assert_eq!(encoded["stream_options"]["include_usage"], true);
+
+    // 客户端没要 usage 时不要主动带上，有的上游对多余字段很严格
+    let plain = provider
+        .decode_request(json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": true
+        }))
+        .unwrap();
+    assert!(!plain.body().canonical.include_usage);
+    let encoded = provider.encode_request(&config, &plain).unwrap();
+    assert!(encoded.get("stream_options").is_none());
+}
+
+#[test]
+fn openai_stream_tail_carries_usage_when_client_opted_in() {
+    let provider = provider_for(ModelFormat::OpenaiCompletions);
+    let config = model(ModelFormat::OpenaiCompletions, "https://api.openai.com/v1");
+
+    let mut state = WireState {
+        include_usage: true,
+        response_id: "chatcmpl-1".into(),
+        model: "gpt-4o".into(),
+        input_tokens: 100,
+        output_tokens: 7,
+        cache_read_tokens: 40,
+        ..WireState::default()
+    };
+    let events = provider.encode_stream_done(&config, &mut state);
+    assert_eq!(events.len(), 2);
+
+    // OpenAI 口径：prompt_tokens 含缓存命中
+    let usage = &events[0].data;
+    assert_eq!(usage["object"], "chat.completion.chunk");
+    assert_eq!(usage["choices"].as_array().unwrap().len(), 0);
+    assert_eq!(usage["usage"]["prompt_tokens"], 140);
+    assert_eq!(usage["usage"]["completion_tokens"], 7);
+    assert_eq!(usage["usage"]["total_tokens"], 147);
+    assert_eq!(usage["usage"]["prompt_tokens_details"]["cached_tokens"], 40);
+    assert_eq!(events[1].raw.as_deref(), Some("[DONE]"));
+
+    // 没声明 include_usage 时维持原样，只有结束标记
+    let mut plain = WireState::default();
+    let events = provider.encode_stream_done(&config, &mut plain);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].raw.as_deref(), Some("[DONE]"));
+}
+
+#[test]
+fn anthropic_passthrough_drops_openai_only_canonical_fields() {
+    let canonical = provider_for(ModelFormat::OpenaiCompletions)
+        .decode_request(json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": true,
+            "store": false,
+            "stream_options": { "include_usage": true }
+        }))
+        .unwrap();
+    assert!(canonical.body().canonical.include_usage);
+    assert_eq!(canonical.body().store, Some(false));
+
+    let encoded = provider_for(ModelFormat::AnthropicMessages)
+        .encode_request(
+            &model(ModelFormat::AnthropicMessages, "https://api.anthropic.com"),
+            &canonical,
+        )
+        .unwrap();
+    assert_eq!(encoded["model"], "upstream-model");
+    // 规范内部字段与 Anthropic 没有的字段都不能漏出去（Anthropic 会拒收未知键）。
+    for key in ["_canonical", "store", "n"] {
+        assert!(encoded.get(key).is_none(), "{key} 不该出现在 Anthropic 报文里");
+    }
+}
+
+/// 完备性守卫：规范请求的每个字段都必须在每个协议的 profile 里出现（映射或显式丢弃）。
+///
+/// 这里刻意用**不写** `..Default::default()` 的完整字面量构造 `RequestBody`：以后往规范请求里
+/// 加字段，这个测试会先因为缺字段编译不过，逼着人回来把协议表补上——「新字段被静默丢掉」不再可能。
+#[test]
+fn protocol_profiles_cover_every_canonical_field() {
+    let body = RequestBody {
+        model: "m".into(),
+        max_tokens: Some(1),
+        // 每个字段都必须给出 Some/非空，否则 serde 的 skip_serializing_if 会把它从字段集合里抹掉。
+        system: Some(SystemPrompt::Text("s".into())),
+        messages: Vec::new(),
+        tools: Some(Vec::new()),
+        tool_choice: Some(json!("auto")),
+        temperature: Some(0.0),
+        top_p: Some(0.0),
+        stop_sequences: Some(vec!["s".into()]),
+        stream: true,
+        top_k: Some(1.0),
+        store: Some(true),
+        metadata: Some(json!({})),
+        response_format: Some(json!({ "type": "text" })),
+        parallel_tool_calls: Some(true),
+        reasoning_effort: Some("low".into()),
+        service_tier: Some("auto".into()),
+        n: Some(1),
+        canonical: CanonicalOnly {
+            include_usage: true,
+            max_tokens_field: Some(MaxTokensField::MaxTokens),
+        },
+    };
+    let value = serde_json::to_value(&body).expect("规范请求应该能序列化");
+    let fields: Vec<&str> = value
+        .as_object()
+        .expect("规范请求是对象")
+        .keys()
+        .map(String::as_str)
+        .collect();
+
+    for format in ModelFormat::ALL {
+        let profile = wire::profile(format);
+        for field in &fields {
+            assert!(
+                profile.rules.iter().any(|rule| rule.field == *field),
+                "{} 的协议表漏了规范字段 {field}",
+                format.as_str()
+            );
+        }
+        for rule in profile.rules {
+            assert!(
+                fields.contains(&rule.field),
+                "{} 的协议表里有规范里不存在的字段 {}",
+                format.as_str(),
+                rule.field
+            );
+        }
+    }
+}
+
+/// 块状态机不变式：载荷只进匹配的块，索引严格递增，块收尾用它自己的索引。
+#[test]
+fn block_normalizer_keeps_payloads_in_their_own_block() {
+    let mut normalizer = BlockNormalizer::default();
+    let mut events = normalizer.thinking("先想一下");
+    events.extend(normalizer.text("然后正文"));
+    normalizer.tool_start(0, "toolu_1", "lookup");
+    events.extend(normalizer.tool_args(0, "{\"a\":1}"));
+    // 工具块之后又来思考：必须新开一个 thinking 块，不能写进工具块
+    events.extend(normalizer.thinking("再想一下"));
+    events.extend(normalizer.close());
+
+    let mut opens: Vec<i64> = Vec::new();
+    let mut deltas: Vec<(i64, &str)> = Vec::new();
+    for event in &events {
+        match event.data.get("type").and_then(Value::as_str) {
+            Some("content_block_start") => opens.push(event.data["index"].as_i64().unwrap()),
+            Some("content_block_delta") => deltas.push((
+                event.data["index"].as_i64().unwrap(),
+                event.data["delta"]["type"].as_str().unwrap(),
+            )),
+            _ => {}
+        }
+    }
+    assert_eq!(opens, vec![0, 1, 2, 3]);
+    assert_eq!(
+        deltas,
+        vec![
+            (0, "thinking_delta"),
+            (1, "text_delta"),
+            (2, "input_json_delta"),
+            (3, "thinking_delta"),
+        ]
+    );
+    let stops = events
+        .iter()
+        .filter(|event| event.data["type"] == "content_block_stop")
+        .count();
+    assert_eq!(stops, 4, "每个块都要收尾");
+}
+
+/// 并行工具调用：参数按序号缓冲，绝不串到别的工具块上（I4）。
+#[test]
+fn block_normalizer_serializes_parallel_tool_arguments() {
+    let mut normalizer = BlockNormalizer::default();
+    normalizer.tool_start(0, "toolu_a", "first");
+    normalizer.tool_start(1, "toolu_b", "second");
+
+    let mut events = normalizer.tool_args(0, "{\"one\"");
+    events.extend(normalizer.tool_args(1, "{\"two\""));
+    events.extend(normalizer.tool_args(0, ":1}"));
+    events.extend(normalizer.tool_args(1, ":2}"));
+    events.extend(normalizer.close());
+
+    let mut calls: Vec<(String, String)> = Vec::new();
+    for event in &events {
+        match (
+            event.data.get("type").and_then(Value::as_str),
+            event.data.pointer("/delta/type").and_then(Value::as_str),
+        ) {
+            (Some("content_block_start"), _) => calls.push((
+                event.data["content_block"]["id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                String::new(),
+            )),
+            (Some("content_block_delta"), Some("input_json_delta")) => calls
+                .last_mut()
+                .expect("参数前面一定有块")
+                .1
+                .push_str(event.data["delta"]["partial_json"].as_str().unwrap()),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        calls,
+        vec![
+            ("toolu_a".to_string(), "{\"one\":1}".to_string()),
+            ("toolu_b".to_string(), "{\"two\":2}".to_string()),
+        ]
+    );
+
+    // 上游没先声明就直接给参数：也只开一个块，参数不丢
+    let mut normalizer = BlockNormalizer::default();
+    let mut events = normalizer.tool_args(0, "{\"a\"");
+    events.extend(normalizer.tool_args(0, ":1}"));
+    events.extend(normalizer.close());
+    let starts = events
+        .iter()
+        .filter(|event| event.data["type"] == "content_block_start")
+        .count();
+    let partial: String = events
+        .iter()
+        .filter_map(|event| event.data.pointer("/delta/partial_json"))
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(starts, 1, "同一个工具不能开两个块");
+    assert_eq!(partial, "{\"a\":1}");
+}
+
+/// 流结束判定：只有思考、以及没发结束事件的流，都不该再被记成成功。
+#[test]
+fn stream_verdict_flags_reasoning_only_and_truncated() {
+    let config = model(ModelFormat::OpenaiCompletions, "https://api.openai.com/v1");
+    let provider = provider_for(ModelFormat::OpenaiCompletions);
+
+    // 实测形状（usage_detail_id=8）：上游只发 reasoning，finish_reason 仍是 stop
+    let mut state = StreamState::new("upstream-model");
+    provider
+        .decode_stream_event(
+            &config,
+            "",
+            &json!({ "choices": [{ "index": 0, "delta": { "reasoning": "想完就停了" }, "finish_reason": null }] }),
+            &mut state,
+        )
+        .unwrap();
+    provider
+        .decode_stream_event(
+            &config,
+            "",
+            &json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] }),
+            &mut state,
+        )
+        .unwrap();
+    assert_eq!(state.verdict(None), StreamVerdict::EmptyReasoningOnly);
+    assert!(!state.verdict(None).outcome().0, "这种收尾应记成失败");
+
+    // 有正文 → 正常
+    let mut state = StreamState::new("upstream-model");
+    provider
+        .decode_stream_event(
+            &config,
+            "",
+            &json!({ "choices": [{ "index": 0, "delta": { "content": "正文" }, "finish_reason": "stop" }] }),
+            &mut state,
+        )
+        .unwrap();
+    assert_eq!(state.verdict(None), StreamVerdict::Ok);
+
+    // 上游没发结束事件就断了：网关补的收尾不算上游结束 → 截断
+    let mut state = StreamState::new("upstream-model");
+    provider
+        .decode_stream_event(
+            &config,
+            "",
+            &json!({ "choices": [{ "index": 0, "delta": { "content": "半句" }, "finish_reason": null }] }),
+            &mut state,
+        )
+        .unwrap();
+    state.finish("end_turn");
+    assert_eq!(state.verdict(None), StreamVerdict::Truncated);
+
+    // 只有工具调用的流是正常的
+    let mut state = StreamState::new("upstream-model");
+    state.tool_start(0, "toolu_1", "f");
+    state.tool_args(0, "{}");
+    state.upstream_ended = true;
+    state.finish("tool_use");
+    assert_eq!(state.verdict(None), StreamVerdict::Ok);
+
+    // 传输/解码错误优先
+    assert_eq!(
+        state.verdict(Some("上游断开".into())),
+        StreamVerdict::UpstreamError("上游断开".into())
+    );
+
+    // 流内错误分片（OpenAI 系没有 choices、只有一个 error 对象）→ 转发给客户端并记失败
+    let mut state = StreamState::new("upstream-model");
+    let events = provider
+        .decode_stream_event(
+            &config,
+            "",
+            &json!({ "error": { "message": "rate limited", "type": "server_error" } }),
+            &mut state,
+        )
+        .unwrap();
+    assert_eq!(events[0].event, "error");
+    assert_eq!(
+        state.verdict(None),
+        StreamVerdict::UpstreamError("rate limited".into())
+    );
+}
+
+/// 一张规范请求在三个协议上的落地（对照官方文档的字段口径）。
+#[test]
+fn canonical_fields_are_forwarded_per_protocol() {
+    let inbound = provider_for(ModelFormat::OpenaiCompletions)
+        .decode_request(json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": true,
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "service_tier": "priority",
+            "store": true,
+            "metadata": { "user_id": "u1" },
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": { "name": "r", "schema": { "type": "object" }, "strict": true }
+            },
+            "parallel_tool_calls": false,
+            "reasoning_effort": "high",
+            "stop": ["END"],
+            "max_completion_tokens": 256,
+            "stream_options": { "include_usage": true }
+        }))
+        .unwrap();
+
+    // Chat Completions 上游：同名透传，且 max_completion_tokens 保真（不是改写成弃用的 max_tokens）
+    let encoded = inbound.raw();
+    assert_eq!(encoded["max_tokens"], 256);
+    let encoded = provider_for(ModelFormat::OpenaiCompletions)
+        .encode_request(
+            &model(ModelFormat::OpenaiCompletions, "https://api.openai.com/v1"),
+            &inbound,
+        )
+        .unwrap();
+    assert_eq!(encoded["temperature"], 0.2);
+    assert_eq!(encoded["top_p"], 0.9);
+    assert_eq!(encoded["service_tier"], "priority");
+    assert_eq!(encoded["store"], true);
+    assert_eq!(encoded["metadata"]["user_id"], "u1");
+    assert_eq!(encoded["parallel_tool_calls"], false);
+    assert_eq!(encoded["reasoning_effort"], "high");
+    assert_eq!(encoded["response_format"]["type"], "json_schema");
+    assert_eq!(encoded["stop"][0], "END");
+    assert_eq!(encoded["max_completion_tokens"], 256);
+    assert!(encoded.get("max_tokens").is_none());
+    assert_eq!(encoded["stream_options"]["include_usage"], true);
+    assert!(encoded.get("_canonical").is_none());
+
+    // Responses 上游：effort / 输出格式变形到 reasoning、text 里；stop 与 top_k 没有对应参数
+    let encoded = provider_for(ModelFormat::OpenaiResponses)
+        .encode_request(
+            &model(ModelFormat::OpenaiResponses, "https://api.openai.com/v1"),
+            &inbound,
+        )
+        .unwrap();
+    assert_eq!(encoded["max_output_tokens"], 256);
+    assert_eq!(encoded["reasoning"]["effort"], "high");
+    assert_eq!(encoded["text"]["format"]["type"], "json_schema");
+    assert_eq!(encoded["text"]["format"]["name"], "r");
+    assert_eq!(encoded["store"], true);
+    assert_eq!(encoded["parallel_tool_calls"], false);
+    assert_eq!(encoded["temperature"], 0.2);
+    for key in [
+        "response_format",
+        "reasoning_effort",
+        "stop",
+        "stop_sequences",
+        "top_k",
+        "_canonical",
+    ] {
+        assert!(encoded.get(key).is_none(), "{key} 不该出现在 Responses 报文里");
+    }
+
+    // Anthropic 上游：effort / format 归到 output_config，并行开关取反，metadata 只留 user_id
+    let encoded = provider_for(ModelFormat::AnthropicMessages)
+        .encode_request(
+            &model(ModelFormat::AnthropicMessages, "https://api.anthropic.com"),
+            &inbound,
+        )
+        .unwrap();
+    assert_eq!(encoded["output_config"]["effort"], "high");
+    assert_eq!(encoded["output_config"]["format"]["type"], "json_schema");
+    assert_eq!(encoded["output_config"]["format"]["schema"]["type"], "object");
+    assert_eq!(encoded["tool_choice"]["disable_parallel_tool_use"], true);
+    assert_eq!(encoded["metadata"]["user_id"], "u1");
+    assert_eq!(encoded["stop_sequences"][0], "END");
+    for key in [
+        "response_format",
+        "reasoning_effort",
+        "parallel_tool_calls",
+        "store",
+        "top_k",
+        "_canonical",
+    ] {
+        assert!(encoded.get(key).is_none(), "{key} 不该出现在 Anthropic 报文里");
+    }
+}
+
+/// 停止原因双向表（文档里的取值都要能对上）。
+#[test]
+fn stop_reasons_round_trip_per_protocol() {
+    assert_eq!(wire::stop_reason_from_finish_reason(Some("stop")), "end_turn");
+    assert_eq!(
+        wire::stop_reason_from_finish_reason(Some("length")),
+        "max_tokens"
+    );
+    assert_eq!(
+        wire::stop_reason_from_finish_reason(Some("tool_calls")),
+        "tool_use"
+    );
+    assert_eq!(
+        wire::stop_reason_from_finish_reason(Some("content_filter")),
+        "refusal"
+    );
+    assert_eq!(wire::stop_reason_from_finish_reason(None), "end_turn");
+
+    assert_eq!(wire::finish_reason(Some("end_turn")), "stop");
+    assert_eq!(wire::finish_reason(Some("max_tokens")), "length");
+    assert_eq!(wire::finish_reason(Some("tool_use")), "tool_calls");
+    assert_eq!(wire::finish_reason(Some("refusal")), "content_filter");
+    assert_eq!(wire::finish_reason(Some("stop_sequence")), "stop");
+    assert_eq!(wire::finish_reason(Some("pause_turn")), "stop");
+
+    assert_eq!(
+        wire::stop_reason_from_response(Some("completed"), true),
+        "tool_use"
+    );
+    assert_eq!(
+        wire::stop_reason_from_response(Some("completed"), false),
+        "end_turn"
+    );
+    assert_eq!(
+        wire::stop_reason_from_response(Some("incomplete"), false),
+        "max_tokens"
+    );
+    assert_eq!(
+        wire::response_status(Some("max_tokens")),
+        ("incomplete", Some("max_tokens"))
+    );
+    assert_eq!(wire::response_status(Some("end_turn")), ("completed", None));
+
+    assert_eq!(
+        wire::stop_reason_from_anthropic(Some("pause_turn")),
+        "pause_turn"
+    );
+    assert_eq!(wire::stop_reason_from_anthropic(Some("refusal")), "refusal");
+    assert_eq!(wire::stop_reason_from_anthropic(None), "end_turn");
+}
+
+#[test]
 fn openai_responses_reencodes_canonical_stream_into_events() {
     let events = encode_all(ModelFormat::OpenaiResponses);
     let kinds: Vec<&str> = events
@@ -741,6 +1231,7 @@ fn sqlite_persistence_round_trips() {
             output_tokens: 5,
             cache_read_tokens: None,
             cache_write_tokens: None,
+            reasoning_tokens: None,
             duration_ms: 12,
             ok: true,
             failover: false,
@@ -795,6 +1286,7 @@ fn sqlite_persistence_round_trips() {
             output_tokens: 4,
             cache_read_tokens: None,
             cache_write_tokens: None,
+            reasoning_tokens: None,
             duration_ms: 5,
             ok: true,
             failover: false,
@@ -841,6 +1333,7 @@ fn sqlite_persistence_round_trips() {
             output_tokens: 1,
             cache_read_tokens: None,
             cache_write_tokens: None,
+            reasoning_tokens: None,
             duration_ms: 1,
             ok: true,
             failover: false,
@@ -878,6 +1371,7 @@ fn sqlite_persistence_round_trips() {
             output_tokens: 1,
             cache_read_tokens: None,
             cache_write_tokens: None,
+            reasoning_tokens: None,
             duration_ms: 1,
             ok: true,
             failover: false,
@@ -915,6 +1409,7 @@ fn sqlite_persistence_round_trips() {
                 output_tokens: 1,
                 cache_read_tokens: None,
                 cache_write_tokens: None,
+                reasoning_tokens: None,
                 duration_ms: 1,
                 ok: true,
                 failover: false,
