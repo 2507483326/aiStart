@@ -312,8 +312,14 @@ async function submit() {
         class="px-1 text-xs"
         :class="testResult.ok ? 'text-emerald-600 dark:text-emerald-400' : 'text-destructive'"
       >
-        {{ testResult.ok ? "连通正常" : "连通失败" }} · {{ formatLatency(testResult.latencyMs) }} ·
-        {{ testResult.preview ?? testResult.message }}
+        {{ testResult.ok ? "连通正常" : "连通失败" }} ·
+        {{ formatLatency(testResult.latencyMs) }} ·
+        <span
+          :title="testResult.proxied ? '这次测试经代理出站' : '这次测试直连（代理未启用，或上游是本机地址）'"
+        >
+          {{ testResult.proxied ? "经代理" : "直连" }}
+        </span>
+        · {{ testResult.preview ?? testResult.message }}
       </p>
 
       <DialogFooter>

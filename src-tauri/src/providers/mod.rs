@@ -496,6 +496,35 @@ pub fn active_proxy() -> Option<String> {
     }
 }
 
+/// 这条发往 `url` 的请求会不会真的经过代理。
+///
+/// 「代理开着」还不够：目标是本机地址时客户端会绕开代理直连（见 `build_client` 的绕行规则），
+/// 所以明细落库、模型测试结果都以这里为准，别把「开着代理」误报成「走了代理」。
+pub fn request_proxies_through(url: &str) -> bool {
+    let Some(_) = active_proxy() else {
+        return false;
+    };
+    match reqwest::Url::parse(url) {
+        Ok(parsed) => !is_loopback_target(&parsed),
+        // 解析不了的目标套不了绕行规则：按「有代理就算走代理」记录。
+        Err(_) => true,
+    }
+}
+
+/// 目标是不是绕行名单里的本机地址（与 `build_client` 的 NoProxy 名单同源同义）。
+fn is_loopback_target(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    // IPv6 主机的序列化带方括号（[::1]），剥掉再认。
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host.to_ascii_lowercase().ends_with(".localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// 全应用共用的出站客户端：网关转发上游、模型探测、版本检查、安装包下载都从这里取。
 ///
 /// 代理设置（设置弹窗里的「网络代理」开关 + 地址）就挂在这个客户端上，所以它是可重建的：
@@ -527,7 +556,8 @@ fn build_client(proxy_url: &str) -> reqwest::Client {
             Ok(proxy) => {
                 // 回环地址不走代理：本机上跑的 Ollama 之类上游，代理软件多半也转发不了它自己，
                 // 「给远端上游配代理」不该顺手把本地链路也挡在外面。
-                let bypass = reqwest::NoProxy::from_string("localhost,127.0.0.1,::1");
+                // 名单与 is_loopback_target 同义（整个 127.0.0.0/8，不止 127.0.0.1）。
+                let bypass = reqwest::NoProxy::from_string("localhost,127.0.0.0/8,::1");
                 builder = builder.proxy(proxy.no_proxy(bypass));
             }
             // 地址在保存设置时已经校验过，走到这里说明库里的值是被手改过的：

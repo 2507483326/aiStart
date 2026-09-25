@@ -8,7 +8,7 @@ use crate::domain::model::{ModelConfig, ModelFormat, ModelInput};
 use crate::error::{AppError, AppResult};
 use crate::events;
 use crate::gateway;
-use crate::providers::{http_client, provider_for};
+use crate::providers::{http_client, provider_for, request_proxies_through};
 use crate::settings;
 
 /// 探测类请求（拉取模型列表、连通性测试）的硬超时。共享的 http_client 只设了
@@ -32,6 +32,8 @@ pub struct TestResult {
     pub preview: Option<String>,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// 这次探测是不是真的经过了代理（代理关着、或目标是本机地址走绕行时为 false）。
+    pub proxied: bool,
 }
 
 #[tauri::command]
@@ -248,8 +250,11 @@ async fn probe_completion(config: &ModelConfig) -> AppResult<TestResult> {
     }))?;
 
     let payload = provider.encode_request(config, &request)?;
+    let endpoint = provider.endpoint(config);
+    // 在真正发请求前取，和后面这次 send 用的是同一份代理状态。
+    let proxied = request_proxies_through(&endpoint);
     let mut builder = http_client()
-        .post(provider.endpoint(config))
+        .post(&endpoint)
         .timeout(PROBE_TIMEOUT)
         .json(&payload);
     for (name, value) in provider.headers(config) {
@@ -270,6 +275,7 @@ async fn probe_completion(config: &ModelConfig) -> AppResult<TestResult> {
             preview: None,
             input_tokens: 0,
             output_tokens: 0,
+            proxied,
         });
     }
 
@@ -290,6 +296,7 @@ async fn probe_completion(config: &ModelConfig) -> AppResult<TestResult> {
             .pointer("/usage/output_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0),
+        proxied,
     })
 }
 

@@ -1875,6 +1875,47 @@ fn proxy_url_is_validated_before_it_reaches_the_network() {
 }
 
 #[test]
+fn loopback_targets_bypass_the_proxy_and_requests_say_so() {
+    use crate::providers::request_proxies_through;
+
+    // 独立临时库：别的用例可能已经动过全局设置，这里从头初始化一份干净的
+    let dir = std::env::temp_dir().join(format!("ai-start-test-proxy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    crate::settings::init(&dir).expect("database should initialize");
+
+    // 代理没开时，谁都不算「走了代理」
+    assert!(!request_proxies_through("https://api.anthropic.com/v1/messages"));
+
+    // 开着代理
+    crate::settings::mutate(|store| {
+        store.proxy_enabled = true;
+        store.proxy_url = "http://127.0.0.1:7890".into();
+    })
+    .expect("settings should save");
+
+    // 远端地址走代理
+    assert!(request_proxies_through("https://api.anthropic.com/v1/messages"));
+    assert!(request_proxies_through("https://open.example.com/v1"));
+    // 本机地址绕行：显式名单里的、环回网段里的其他地址、IPv6 环回、localhost 变体
+    assert!(!request_proxies_through("http://127.0.0.1:11434/v1/chat/completions"));
+    assert!(!request_proxies_through("http://127.1.2.3:8080/v1"));
+    assert!(!request_proxies_through("http://[::1]:11434/v1"));
+    assert!(!request_proxies_through("http://localhost:11434/v1"));
+    assert!(!request_proxies_through("http://api.localhost/v1"));
+    // 带账号信息、端口号不影响判定
+    assert!(!request_proxies_through("http://user:pw@localhost:11434/v1"));
+
+    // 收尾：把代理关回去、地址清掉。全局 DB 连接（OnceLock）整个测试进程只有一份，
+    // 后面的用例「重新 init」也仍读这一个库，留下的状态会串场。
+    crate::settings::mutate(|store| {
+        store.proxy_enabled = false;
+        store.proxy_url = String::new();
+    })
+    .expect("settings should save");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn turning_the_proxy_on_requires_an_address() {
     use crate::commands::system::resolve_proxy;
 
@@ -1903,5 +1944,115 @@ fn autostart_quotes_the_executable_path() {
     assert_eq!(
         command_line(Path::new(r"C:\Program Files\AI Start\ai-start.exe")),
         r#""C:\Program Files\AI Start\ai-start.exe""#
+    );
+}
+
+/// 直通判定只有一条依据：入站协议 == 上游协议。请求侧、响应侧、流侧共用它。
+#[test]
+fn same_protocol_holds_exactly_when_the_formats_match() {
+    use crate::gateway::server::same_protocol;
+
+    for inbound in ModelFormat::ALL {
+        for upstream in ModelFormat::ALL {
+            assert_eq!(
+                same_protocol(inbound, &model(upstream, "https://example.com")),
+                inbound == upstream,
+                "入站 {inbound:?} / 上游 {upstream:?}"
+            );
+        }
+    }
+}
+
+/// 同协议直通（响应侧）：回给客户端的就是上游原文，`system_fingerprint`/`logprobs` 这类
+/// 只有上游知道的字段不再被重建吃掉；跨协议才按客户端协议重建。
+#[test]
+fn same_protocol_response_is_forwarded_verbatim() {
+    use crate::gateway::server::encode_client_response;
+
+    let upstream = json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "created": 1700000000,
+        "model": "upstream-model",
+        "system_fingerprint": "fp_abc",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": "hi", "refusal": null },
+            "finish_reason": "stop",
+            "logprobs": { "content": [] }
+        }],
+        "usage": { "prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4 }
+    });
+    let config = model(ModelFormat::OpenaiCompletions, "https://api.openai.com/v1");
+    let canonical = provider_for(ModelFormat::OpenaiCompletions)
+        .decode_response(&config, &upstream)
+        .expect("upstream body should decode");
+
+    // 同协议：一字不改
+    let same = encode_client_response(
+        ModelFormat::OpenaiCompletions,
+        &config,
+        &upstream,
+        &canonical,
+    )
+    .expect("same protocol response");
+    assert_eq!(same, upstream);
+
+    // 跨协议：重建成客户端（Anthropic）形状，上游专有字段不复存在
+    let crossed = encode_client_response(
+        ModelFormat::AnthropicMessages,
+        &config,
+        &upstream,
+        &canonical,
+    )
+    .expect("cross protocol response");
+    assert!(crossed.get("system_fingerprint").is_none());
+    assert!(crossed.get("created").is_none());
+    assert_eq!(crossed["content"][0]["type"], "text");
+    assert_eq!(crossed["content"][0]["text"], "hi");
+}
+
+/// 同协议直通（流侧）靠的就是这一份原文：解析器必须把上游那一帧原样带出来。
+///
+/// 顺带守住 `data` 的语义不变——记账旁路（`StreamState`/`ResponseAssembler`）读的是它，
+/// 解析器改动不能让记账跟着变。多行 `data:` 那条还钉住了「不能拿 `data` 重排回 SSE」的原因：
+/// 重排会把换行塞进 `data:` 行里，客户端的 SSE 解析器读到的是半截 JSON。
+#[tokio::test]
+async fn sse_frames_keep_the_upstream_bytes_intact() {
+    use crate::gateway::sse::{encode_channel_event, parse_sse_stream};
+    use futures_util::StreamExt;
+
+    let upstream = concat!(
+        ": ping\n\n",
+        "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "data: {\n",
+        "data:   \"id\": \"chatcmpl-1\",\n",
+        "data:   \"object\": \"chat.completion.chunk\"\n",
+        "data: }\n\n",
+        "data: [DONE]\n\n",
+    );
+    let frames: Vec<_> =
+        parse_sse_stream(futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(
+            bytes::Bytes::from(upstream),
+        )]))
+        .map(|frame| frame.expect("frame should parse"))
+        .collect()
+        .await;
+
+    assert_eq!(frames.len(), 4);
+
+    // 客户端拿到的字节 === 上游字节（心跳注释也没被吞掉）
+    let forwarded: String = frames.iter().map(|frame| frame.raw.as_str()).collect();
+    assert_eq!(forwarded, upstream);
+    assert_eq!(frames[0].raw, ": ping\n\n");
+    assert!(frames[0].data.is_empty());
+
+    // 多行 data 拼出来的副本仍是合法 JSON……
+    let multiline: Value = serde_json::from_str(&frames[2].data).expect("joined data is JSON");
+    assert_eq!(multiline["object"], "chat.completion.chunk");
+    // ……但重排回 SSE 会把它压成一行、把换行塞进 data 行里，所以直通必须发 raw
+    assert_ne!(
+        encode_channel_event(&frames[2].event, &frames[2].data),
+        frames[2].raw
     );
 }

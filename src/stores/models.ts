@@ -16,8 +16,6 @@ export const useModelsStore = defineStore("models", {
     formats: [] as FormatInfo[],
     activeModelId: null as number | null,
     loading: false,
-    testingId: null as number | null,
-    lastTest: null as TestResult | null,
     upstreamCache: {} as Record<number, string[]>,
   }),
   getters: {
@@ -87,17 +85,9 @@ export const useModelsStore = defineStore("models", {
       return true;
     },
     async test(id: number): Promise<TestResult | undefined> {
-      this.testingId = id;
-      try {
-        const result = await attempt(() => modelApi.test(id), {
-          error: "连通性测试失败",
-        });
-        if (!result) return undefined;
-        this.lastTest = result;
-        return result;
-      } finally {
-        this.testingId = null;
-      }
+      return attempt(() => modelApi.test(id), {
+        error: "连通性测试失败",
+      });
     },
     async testConfig(
       baseUrl: string,

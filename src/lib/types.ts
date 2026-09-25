@@ -190,6 +190,8 @@ export interface TestResult {
   preview: string | null;
   inputTokens: number;
   outputTokens: number;
+  /// 这次探测是否真的经过代理（代理关着、或目标是本机地址走绕行时为 false）。
+  proxied: boolean;
 }
 
 export type GatewayState = "stopped" | "starting" | "running" | "stopping";

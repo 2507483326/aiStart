@@ -17,7 +17,8 @@ use crate::domain::model::{ModelConfig, ModelFormat};
 use crate::error::{AppError, AppResult};
 use crate::events;
 use crate::providers::{
-    active_proxy, http_client, provider_for, ResponseAssembler, SseEvent, StreamState, WireState,
+    http_client, provider_for, request_proxies_through, ResponseAssembler, SseEvent, StreamState,
+    WireState,
 };
 
 use super::sse::{encode_channel_event, parse_sse_stream};
@@ -146,8 +147,9 @@ fn record_usage(
             source_app: source_app.to_string(),
             upstream_url: provider_for(config.format).endpoint(config),
             upstream_model: config.model.clone(),
-            // 能走到这里说明上游请求已经发出去了：这次出站是不是走代理，问当时的代理设置。
-            proxied: active_proxy().is_some(),
+            // 能走到这里说明上游请求已经发出去了。代理开着、但目标是本机地址时仍算直连
+            // （绕行规则见 providers::is_loopback_target），所以按目标地址判定。
+            proxied: request_proxies_through(&provider_for(config.format).endpoint(config)),
             inbound_protocol: inbound.as_str().to_string(),
             upstream_protocol: config.format.as_str().to_string(),
             input_tokens,
@@ -272,8 +274,9 @@ async fn route(
                 .map(|model| model.name.clone())
                 .unwrap_or_default();
             let source_app = source_app_for(token.as_deref().unwrap_or_default());
-            // 只有真发起了上游请求才谈得上「走了代理」：缺 Key、没启用模型这类失败压根没出网。
-            let proxied = !upstream_url.is_empty() && active_proxy().is_some();
+            // 只有真发起了上游请求才谈得上「走了代理」：缺 Key、没启用模型这类失败压根没出网；
+            // 本机地址即使代理开着也走的是直连。
+            let proxied = !upstream_url.is_empty() && request_proxies_through(&upstream_url);
             let (timestamp, date) = crate::usage::current_timestamp();
             crate::usage::record_with_payload(
                 &crate::usage::UsageRecord {
@@ -343,6 +346,15 @@ impl From<AppError> for RouteFailure {
     }
 }
 
+/// 同协议直通：入站协议与上游协议相同。
+///
+/// 请求侧据此选免转换快路；响应与流侧据此**原样转发上游字节**——不做转换、不合成起始事件、
+/// 不补结束信号，客户端拿到的与直连上游一致。记账与判罚不受影响：那一份始终走旁路
+/// （`StreamState`/`ResponseAssembler`）落库，与客户端出口无关。
+pub(crate) fn same_protocol(inbound: ModelFormat, config: &ModelConfig) -> bool {
+    config.format == inbound
+}
+
 /// 选定真正发往上游的报文：入站协议与上游协议相同时走免转换快路（以客户端原文为底，
 /// 只改模型名与被过滤字段），不同协议才经规范层重建。provider 没有快路时（返回 None）回退重建。
 pub(crate) fn encode_upstream_request(
@@ -351,12 +363,30 @@ pub(crate) fn encode_upstream_request(
     request: &CanonicalRequest,
 ) -> AppResult<Value> {
     let provider = provider_for(config.format);
-    if config.format == inbound {
+    if same_protocol(inbound, config) {
         if let Some(payload) = provider.encode_request_passthrough(config, request)? {
             return Ok(payload);
         }
     }
     provider.encode_request(config, request)
+}
+
+/// 选定回给客户端的响应报文：同协议直通时就是上游原文（解码只用来记账），
+/// 跨协议才把规范响应重建成客户端协议的形状。
+///
+/// Anthropic 上游的 `decode_response` 本就是恒等，所以这道分叉只对两个 OpenAI 协议有实际差别
+/// ——它们此前的重建会丢 `system_fingerprint`/`logprobs`、把 `created` 重生成当前时间、
+/// 把 `refusal` 压成纯文本。
+pub(crate) fn encode_client_response(
+    inbound: ModelFormat,
+    config: &ModelConfig,
+    raw_response: &Value,
+    canonical: &Value,
+) -> AppResult<Value> {
+    if same_protocol(inbound, config) {
+        return Ok(raw_response.clone());
+    }
+    provider_for(inbound).encode_response(config, canonical)
 }
 
 /// 把规范请求编码成上游协议原生报文并发起请求；成功时一并返回编码后的请求体（供落库展示）。
@@ -577,7 +607,9 @@ async fn handle(
             },
         );
 
-        let wire = inbound_provider.encode_response(&config, &canonical)?;
+        // 同协议直通：解码只用来记账，回给客户端的就是上游原文——重建会丢
+        // `system_fingerprint`/`logprobs`、把 `created` 重生、把 `refusal` 压成纯文本。
+        let wire = encode_client_response(inbound, &config, &raw_response, &canonical)?;
         return Ok(json_response(StatusCode::OK, wire));
     }
 
@@ -589,53 +621,79 @@ async fn handle(
     };
     let mut assembler = ResponseAssembler::default();
     let inbound_request_owned = inbound_request.to_string();
-    let emit_initial = !upstream_provider.is_passthrough();
+    // 同协议直通：客户端那条出口直接吐上游原文。既不合成起始事件，也不补结束信号——
+    // 上游自己的起始与结束就是客户端协议的（旧行为里合成的 `message_start` 会把网关的
+    // 随机 uuid 塞进客户端分片的 id；断流时还会替上游补一条"正常结束"，等于对客户端撒谎）。
+    let passthrough = same_protocol(inbound, &config);
+    // 上游不会自己发 message_start 时才需要补（Anthropic 上游会发，两个 OpenAI 协议不会）。
+    let emit_initial = !passthrough && !upstream_provider.is_passthrough();
     let events = parse_sse_stream(upstream.bytes_stream());
 
     let stream = async_stream::stream! {
         futures_util::pin_mut!(events);
         let mut stream_error: Option<String> = None;
 
+        // 规范事件 → 客户端字节。直通时返回空：客户端那条出口走上游原文，
+        // 解码出来的规范事件只喂记账（`ResponseAssembler` + `StreamState`）。
+        let encode_for_client = |canonical: &SseEvent, wire_state: &mut WireState| -> Vec<Bytes> {
+            if passthrough {
+                return Vec::new();
+            }
+            inbound_provider
+                .encode_stream_event(&config, canonical, wire_state)
+                .iter()
+                .map(|event| Bytes::from(encode_event(event)))
+                .collect()
+        };
+
         if emit_initial {
             for canonical in upstream_state.begin() {
                 assembler.apply(&canonical);
-                for event in inbound_provider.encode_stream_event(&config, &canonical, &mut wire_state) {
-                    yield Ok::<Bytes, std::io::Error>(Bytes::from(encode_event(&event)));
+                for bytes in encode_for_client(&canonical, &mut wire_state) {
+                    yield Ok::<Bytes, std::io::Error>(bytes);
                 }
             }
         }
 
         while let Some(item) = events.next().await {
             match item {
-                Ok((event_name, data)) => {
-                    if data.trim() == "[DONE]" {
+                Ok(frame) => {
+                    // 直通：这一帧原样发给客户端——注释行（心跳）、多行 data、分帧格式都保真。
+                    if passthrough {
+                        yield Ok(Bytes::from(frame.raw));
+                    }
+                    if frame.data.trim() == "[DONE]" {
                         // [DONE] 是上游真正的结束信号，记下来（没有它的流算被截断）。
                         upstream_state.upstream_ended = true;
                         for canonical in upstream_provider.decode_stream_done(&config, &mut upstream_state).unwrap_or_default() {
                             assembler.apply(&canonical);
-                            for event in inbound_provider.encode_stream_event(&config, &canonical, &mut wire_state) {
-                                yield Ok(Bytes::from(encode_event(&event)));
+                            for bytes in encode_for_client(&canonical, &mut wire_state) {
+                                yield Ok(bytes);
                             }
                         }
                         continue;
                     }
-                    let Ok(value) = serde_json::from_str::<Value>(&data) else {
+                    let Ok(value) = serde_json::from_str::<Value>(&frame.data) else {
                         continue;
                     };
-                    match upstream_provider.decode_stream_event(&config, &event_name, &value, &mut upstream_state) {
+                    match upstream_provider.decode_stream_event(&config, &frame.event, &value, &mut upstream_state) {
                         Ok(canonical_events) => {
                             for canonical in canonical_events {
                                 assembler.apply(&canonical);
-                                for event in inbound_provider.encode_stream_event(&config, &canonical, &mut wire_state) {
-                                    yield Ok(Bytes::from(encode_event(&event)));
+                                for bytes in encode_for_client(&canonical, &mut wire_state) {
+                                    yield Ok(bytes);
                                 }
                             }
                         }
                         Err(error) => {
                             let message = error.to_string();
                             stream_error = Some(message.clone());
-                            for event in error_events(inbound, &message) {
-                                yield Ok(Bytes::from(encode_event(&event)));
+                            // 直通时不能再补一条网关的错误事件：上游原文已经发出去了，
+                            // 补上去等于在客户端的流里伪造内容。只记账，不发。
+                            if !passthrough {
+                                for event in error_events(inbound, &message) {
+                                    yield Ok(Bytes::from(encode_event(&event)));
+                                }
                             }
                         }
                     }
@@ -643,8 +701,10 @@ async fn handle(
                 Err(error) => {
                     let message = error.to_string();
                     stream_error = Some(message.clone());
-                    for event in error_events(inbound, &message) {
-                        yield Ok(Bytes::from(encode_event(&event)));
+                    if !passthrough {
+                        for event in error_events(inbound, &message) {
+                            yield Ok(Bytes::from(encode_event(&event)));
+                        }
                     }
                     break;
                 }
@@ -653,8 +713,8 @@ async fn handle(
 
         for canonical in upstream_provider.decode_stream_done(&config, &mut upstream_state).unwrap_or_default() {
             assembler.apply(&canonical);
-            for event in inbound_provider.encode_stream_event(&config, &canonical, &mut wire_state) {
-                yield Ok(Bytes::from(encode_event(&event)));
+            for bytes in encode_for_client(&canonical, &mut wire_state) {
+                yield Ok(bytes);
             }
         }
         // usage 只在流的末尾事件里出现，message_start 时还没有；出站前按流状态的最终值补齐，
@@ -663,8 +723,12 @@ async fn handle(
         wire_state.output_tokens = upstream_state.output_tokens;
         wire_state.cache_read_tokens = upstream_state.cache_read_tokens;
         wire_state.reasoning_tokens = upstream_state.reasoning_tokens;
-        for event in inbound_provider.encode_stream_done(&config, &mut wire_state) {
-            yield Ok(Bytes::from(encode_event(&event)));
+        // 直通不补尾巴：上游的 usage 尾片与结束标记就是客户端该收到的那一份
+        //（请求侧直通后 `stream_options.include_usage` 会原样发给上游，它自己会带）。
+        if !passthrough {
+            for event in inbound_provider.encode_stream_done(&config, &mut wire_state) {
+                yield Ok(Bytes::from(encode_event(&event)));
+            }
         }
 
         // 形态判定：上游「只给了思考没给正文」或「没发结束事件就断了」以前都被记成成功，

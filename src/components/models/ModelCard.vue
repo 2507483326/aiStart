@@ -20,10 +20,9 @@ const props = defineProps<{
 
 const emit = defineEmits<{ edit: [model: ModelConfig] }>();
 
-const { activate, duplicate, remove, test, testingId, save, prefetchUpstream, upstreamCache } =
-  useModels();
+const { activate, duplicate, remove, test, save, prefetchUpstream, upstreamCache } = useModels();
 
-const testing = computed(() => testingId.value === props.model.id);
+const testing = ref(false);
 const result = ref<TestResult | null>(null);
 const modelId = ref(props.model.model);
 const upstreamOptions = computed(() => upstreamCache.value[props.model.id] ?? []);
@@ -40,13 +39,18 @@ let clearTimer: ReturnType<typeof setTimeout> | undefined;
 async function runTest() {
   result.value = null;
   if (clearTimer) clearTimeout(clearTimer);
-  const outcome = await test(props.model.id);
-  if (!outcome) return;
-  result.value = outcome;
-  if (outcome.ok) {
-    clearTimer = setTimeout(() => {
-      result.value = null;
-    }, 5000);
+  testing.value = true;
+  try {
+    const outcome = await test(props.model.id);
+    if (!outcome) return;
+    result.value = outcome;
+    if (outcome.ok) {
+      clearTimer = setTimeout(() => {
+        result.value = null;
+      }, 5000);
+    }
+  } finally {
+    testing.value = false;
   }
 }
 
@@ -105,7 +109,10 @@ async function duplicateModel() {
         :class="result.ok ? 'text-emerald-600 dark:text-emerald-400' : 'text-destructive'"
       >
         {{ result.ok ? "连通正常" : "连通失败" }} · {{ formatLatency(result.latencyMs) }} ·
-        {{ result.preview ?? result.message }}
+        <span :title="result.proxied ? '这次测试经代理出站' : '这次测试直连（代理未启用，或上游是本机地址）'">
+          {{ result.proxied ? "经代理" : "直连" }}
+        </span>
+        · {{ result.preview ?? result.message }}
       </p>
     </div>
 
