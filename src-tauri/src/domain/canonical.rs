@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::{json, Map, Value};
 
 use crate::error::{AppError, AppResult};
 
@@ -164,6 +164,164 @@ pub struct ToolDef {
     pub input_schema: Value,
 }
 
+/// 工具调用策略的规范形状（§7-A3：形状分歧字段必须类型化，decode 侧统一收进这里，
+/// encode 侧按本协议写出——形状解析只发生在入站协议自己的转换函数里，不再靠 JSON 猜臂）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum CanonicalToolChoice {
+    Auto,
+    None,
+    Required,
+    /// 强制调用某个具体工具。
+    Tool { name: String },
+}
+
+impl CanonicalToolChoice {
+    /// 规范 JSON（OpenAI Chat Completions 口径）：字符串同名字段 + `{type:function,function:{name}}`。
+    pub fn to_json(&self) -> Value {
+        match self {
+            Self::Auto => Value::String("auto".into()),
+            Self::None => Value::String("none".into()),
+            Self::Required => Value::String("required".into()),
+            Self::Tool { name } => json!({ "type": "function", "function": { "name": name } }),
+        }
+    }
+
+    /// 解析规范 JSON；不属于任何已知臂时报错（而不是静默降级成 auto）。
+    pub fn from_json(value: &Value) -> AppResult<Self> {
+        match value {
+            Value::String(kind) => match kind.as_str() {
+                "auto" => Ok(Self::Auto),
+                "none" => Ok(Self::None),
+                "required" => Ok(Self::Required),
+                other => Err(tool_choice_error(value, &format!("字符串 {other:?}"))),
+            },
+            Value::Object(object) => match object.get("type").and_then(Value::as_str) {
+                Some("function") => {
+                    let name = object
+                        .get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    Ok(Self::Tool { name: name.to_string() })
+                }
+                Some(other) => Err(tool_choice_error(value, other)),
+                None => Err(tool_choice_error(value, "缺少 type 字段")),
+            },
+            _ => Err(tool_choice_error(value, "既不是字符串也不是对象")),
+        }
+    }
+}
+
+fn tool_choice_error(value: &Value, detail: &str) -> AppError {
+    AppError::InvalidConfig(format!(
+        "tool_choice 形状非法（{detail}）: {}",
+        serde_json::to_string(value).unwrap_or_default()
+    ))
+}
+
+/// 输出格式的规范形状（OpenAI Chat Completions 口径的嵌套结构）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum CanonicalResponseFormat {
+    Text,
+    JsonObject,
+    JsonSchema {
+        name: String,
+        description: Option<String>,
+        schema: Value,
+        strict: Option<bool>,
+    },
+}
+
+impl CanonicalResponseFormat {
+    /// 规范 JSON：`{type:"json_schema", json_schema:{name,schema,strict}}`。
+    pub fn to_json(&self) -> Value {
+        match self {
+            Self::Text => json!({ "type": "text" }),
+            Self::JsonObject => json!({ "type": "json_object" }),
+            Self::JsonSchema { name, description, schema, strict } => {
+                let mut inner = Map::new();
+                inner.insert("name".into(), Value::String(name.clone()));
+                if let Some(description) = description {
+                    inner.insert("description".into(), Value::String(description.clone()));
+                }
+                inner.insert("schema".into(), schema.clone());
+                if let Some(strict) = strict {
+                    inner.insert("strict".into(), Value::Bool(*strict));
+                }
+                json!({ "type": "json_schema", "json_schema": Value::Object(inner) })
+            }
+        }
+    }
+
+    /// 解析规范 JSON；`text` / `json_object` 之外的 type 一律报错。
+    pub fn from_json(value: &Value) -> AppResult<Self> {
+        let kind = value
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AppError::InvalidConfig(
+                "response_format 形状非法: 缺少 type 字段".into(),
+            ))?;
+        match kind {
+            "text" => Ok(Self::Text),
+            "json_object" => Ok(Self::JsonObject),
+            "json_schema" => {
+                let inner = value.get("json_schema").ok_or_else(|| {
+                    AppError::InvalidConfig(
+                        "response_format 形状非法: json_schema 缺少 json_schema 对象".into(),
+                    )
+                })?;
+                Ok(Self::JsonSchema {
+                    name: inner
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    description: inner
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    schema: inner
+                        .get("schema")
+                        .cloned()
+                        .unwrap_or_else(|| json!({ "type": "object" })),
+                    strict: inner.get("strict").and_then(Value::as_bool),
+                })
+            }
+            other => Err(AppError::InvalidConfig(format!(
+                "response_format 形状非法: 未知的 type {other:?}"
+            ))),
+        }
+    }
+}
+
+/// `CanonicalToolChoice` 的 serde：按规范 JSON 存取，形状非法直接 400。
+impl Serialize for CanonicalToolChoice {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.to_json().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CanonicalToolChoice {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        Self::from_json(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// `CanonicalResponseFormat` 的 serde：按规范 JSON 存取。
+impl Serialize for CanonicalResponseFormat {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.to_json().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CanonicalResponseFormat {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        Self::from_json(&value).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestBody {
     #[serde(default)]
@@ -177,7 +335,7 @@ pub struct RequestBody {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolDef>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_choice: Option<Value>,
+    pub tool_choice: Option<CanonicalToolChoice>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -195,10 +353,10 @@ pub struct RequestBody {
     /// 结构化元数据：OpenAI / Responses 是任意字符串映射，Anthropic 只接受 `user_id`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
-    /// 输出格式，统一按 OpenAI Chat Completions 的形状表达
-    /// （`{type:"text"|"json_object"|"json_schema", json_schema:{name,schema,strict,description}}`）。
+    /// 输出格式：类型化的规范形状（Text / JsonObject / JsonSchema），
+    /// serde 反序列化在入站就拒绝非法形状（见 `CanonicalResponseFormat`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub response_format: Option<Value>,
+    pub response_format: Option<CanonicalResponseFormat>,
     /// 是否允许并行工具调用：OpenAI / Responses 同名，Anthropic 要取反写进 `tool_choice.disable_parallel_tool_use`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
@@ -302,10 +460,18 @@ impl CanonicalRequest {
     /// 规范级校验：无法保真转换的请求直接拒绝，避免「只转了一半」的静默行为。
     /// 目前只有多候选：网关与规范形状都只承载一条 assistant 消息。
     pub fn validate(&self) -> AppResult<()> {
-        if self.body.n.is_some_and(|count| count > 1) {
-            return Err(AppError::InvalidConfig(
-                "一次请求多个候选（n > 1）无法保真转发，请把 n 设为 1 或去掉该字段".into(),
-            ));
+        match self.body.n {
+            Some(0) => {
+                return Err(AppError::InvalidConfig(
+                    "n = 0 语义非法（一个候选都不生成），请去掉该字段或设为 1".into(),
+                ));
+            }
+            Some(count) if count > 1 => {
+                return Err(AppError::InvalidConfig(
+                    "一次请求多个候选（n > 1）无法保真转发，请把 n 设为 1 或去掉该字段".into(),
+                ));
+            }
+            _ => {}
         }
         Ok(())
     }

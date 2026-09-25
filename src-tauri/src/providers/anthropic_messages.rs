@@ -1,6 +1,8 @@
 use serde_json::{json, Map, Value};
 
-use crate::domain::canonical::CanonicalRequest;
+use crate::domain::canonical::{
+    CanonicalResponseFormat, CanonicalToolChoice, CanonicalRequest,
+};
 use crate::domain::model::ModelConfig;
 use crate::error::{AppError, AppResult};
 
@@ -81,28 +83,45 @@ impl ModelProvider for AnthropicMessagesProvider {
         if let Some(metadata) = metadata(body.metadata.as_ref()) {
             object.insert("metadata".into(), metadata);
         }
-        match tool_choice(body.tool_choice.as_ref(), body.parallel_tool_calls) {
+        match body.tool_choice.as_ref() {
             Some(choice) => {
-                object.insert("tool_choice".into(), choice);
+                object.insert("tool_choice".into(), tool_choice(choice, body.parallel_tool_calls).expect("类型化枚举必能转出 Anthropic 写法"));
             }
             None => {
-                if tool_choice_is_openai_shaped(object.get("tool_choice")) {
-                    object.remove("tool_choice");
+                // 没有指定策略但禁用了并行工具调用：合成 auto + 开关，语义才能落到 Anthropic。
+                // （body.tool_choice 为 None 时报文里不会有残留的 tool_choice：
+                // 非法形状在 decode_request 已 400，合法形状都会归一成 Some。）
+                if body.parallel_tool_calls == Some(false) {
+                    object.insert(
+                        "tool_choice".into(),
+                        json!({ "type": "auto", "disable_parallel_tool_use": true }),
+                    );
                 }
             }
         }
 
         // response_format 与 reasoning_effort 在 Anthropic 里都归到 output_config 下。
         let format = body.response_format.as_ref().and_then(anthropic_format);
-        let effort = body.reasoning_effort.clone();
-        if format.is_some() || effort.is_some() {
+        // 客户端原文带 thinking（预算式思考）时不再叠档位：reasoning_effort 是从预算
+        // 有损映射来的（见 decode_request），两个思考开关同时下发会被上游拒。
+        // 先算好要写什么再碰报文——没有可写的就不建 output_config 空对象。
+        let has_thinking_budget = object
+            .get("thinking")
+            .is_some_and(|thinking| thinking.get("budget_tokens").is_some());
+        let effort = if has_thinking_budget {
+            None
+        } else {
+            body.reasoning_effort.clone()
+        };
+        if let Some(format) = format {
             let config = output_config(object);
-            if let Some(format) = format {
-                config.insert("format".into(), format);
-            }
+            config.insert("format".into(), format);
             if let Some(effort) = effort {
                 config.insert("effort".into(), Value::String(effort));
             }
+        } else if let Some(effort) = effort {
+            let config = output_config(object);
+            config.insert("effort".into(), Value::String(effort));
         }
 
         Ok(payload)
@@ -112,30 +131,19 @@ impl ModelProvider for AnthropicMessagesProvider {
         Ok(raw.clone())
     }
 
-    /// 客户端原始报文就是规范形状，只需要把两个「藏起来的」字段抬到规范字段上，
-    /// 跨协议转发（Anthropic 入站 → OpenAI 出站）时才不会丢掉思考档位与并行开关：
-    /// `output_config.effort` → `reasoning_effort`，`tool_choice.disable_parallel_tool_use`
-    /// → `parallel_tool_calls`（取反）。
+    /// Anthropic 报文里藏着几个跨协议字段，先归一成规范形状再 parse（类型化字段只认
+    /// 规范形状，parse 之后再 map_raw 就来不及了）：
+    ///
+    /// * `tool_choice`（`{type:"auto"/"any"/"none"/"tool",…}`）→ OpenAI 口径规范形；
+    /// * `output_config.format` → `response_format`（A2：以前跨协议转发时静默丢失）；
+    /// * `output_config.effort` → `reasoning_effort`；
+    /// * `thinking`（预算式）→ `reasoning_effort` 的有损映射（档位按预算粗分），
+    ///   原键删除——它不属于其他协议，留着会在跨协议时原样漏出去；
+    /// * `tool_choice.disable_parallel_tool_use` → `parallel_tool_calls`（取反）。
     fn decode_request(&self, raw: Value) -> AppResult<CanonicalRequest> {
-        CanonicalRequest::parse(raw)?.map_raw(|value| {
-            let effort = value
-                .pointer("/output_config/effort")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let parallel = value
-                .pointer("/tool_choice/disable_parallel_tool_use")
-                .and_then(Value::as_bool);
-            let Some(object) = value.as_object_mut() else {
-                return Ok(());
-            };
-            if let Some(effort) = effort {
-                object.insert("reasoning_effort".into(), Value::String(effort));
-            }
-            if parallel == Some(true) {
-                object.insert("parallel_tool_calls".into(), Value::Bool(false));
-            }
-            Ok(())
-        })
+        let mut value = raw;
+        normalize_anthropic_request(&mut value)?;
+        CanonicalRequest::parse(value)
     }
 
     fn decode_stream_event(
@@ -247,61 +255,22 @@ fn metadata(value: Option<&Value>) -> Option<Value> {
     Some(json!({ "user_id": user_id }))
 }
 
-/// 规范（OpenAI 口径）的 `tool_choice` → Anthropic 写法。
+/// 规范 `tool_choice`（类型化）→ Anthropic 写法。
 /// `parallel_tool_calls == false` 在 Anthropic 里是 `tool_choice.disable_parallel_tool_use`（语义相反）。
-fn tool_choice(choice: Option<&Value>, parallel: Option<bool>) -> Option<Value> {
+fn tool_choice(choice: &CanonicalToolChoice, parallel: Option<bool>) -> Option<Value> {
     let mut converted = match choice {
-        Some(Value::String(kind)) => match kind.as_str() {
-            "auto" => json!({ "type": "auto" }),
-            "none" => json!({ "type": "none" }),
-            "required" => json!({ "type": "any" }),
-            _ => return None,
-        },
-        Some(Value::Object(source)) => match source.get("type").and_then(Value::as_str) {
-            // OpenAI 写法的 `{type:function,function:{name}}` → Anthropic 的 `{type:tool,name}`。
-            Some("function") => {
-                let name = source
-                    .get("function")
-                    .and_then(|function| function.get("name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                json!({ "type": "tool", "name": name })
-            }
-            // OpenAI 的 forced 叫 required，Anthropic 叫 any（其余扩展字段原样保留）。
-            Some("required") => {
-                let mut converted = source.clone();
-                converted.insert("type".into(), Value::String("any".into()));
-                Value::Object(converted)
-            }
-            // 已经是 Anthropic 写法（auto / any / none / tool），原样保留。
-            _ => Value::Object(source.clone()),
-        },
-        _ => {
-            if parallel == Some(false) {
-                json!({ "type": "auto" })
-            } else {
-                return None;
-            }
-        }
+        CanonicalToolChoice::Auto => json!({ "type": "auto" }),
+        CanonicalToolChoice::None => json!({ "type": "none" }),
+        CanonicalToolChoice::Required => json!({ "type": "any" }),
+        CanonicalToolChoice::Tool { name } => json!({ "type": "tool", "name": name }),
     };
 
-    if parallel == Some(false) {
+    if parallel == Some(false) && converted["type"] != "none" {
         if let Some(object) = converted.as_object_mut() {
-            if object.get("type").and_then(Value::as_str) != Some("none") {
-                object.insert("disable_parallel_tool_use".into(), Value::Bool(true));
-            }
+            object.insert("disable_parallel_tool_use".into(), Value::Bool(true));
         }
     }
     Some(converted)
-}
-
-/// 报文里残留的 `tool_choice` 是不是 OpenAI 写法（转换不出来时不该把它发给 Anthropic）。
-fn tool_choice_is_openai_shaped(value: Option<&Value>) -> bool {
-    match value {
-        Some(Value::String(_)) => true,
-        Some(Value::Object(object)) => object.contains_key("function"),
-        _ => false,
-    }
 }
 
 /// 取（必要时新建）`output_config` 对象。
@@ -317,9 +286,110 @@ fn output_config(object: &mut Map<String, Value>) -> &mut Map<String, Value> {
         .expect("output_config 刚被规范成对象")
 }
 
-/// 规范的 `response_format` → Anthropic 的 `output_config.format`。
+/// 规范 `response_format`（类型化）→ Anthropic 的 `output_config.format`。
 /// Anthropic 只支持 json_schema 一种结构化输出；text / json_object 没有对应语义。
-fn anthropic_format(value: &Value) -> Option<Value> {
-    let schema = value.pointer("/json_schema/schema")?;
+fn anthropic_format(value: &CanonicalResponseFormat) -> Option<Value> {
+    let CanonicalResponseFormat::JsonSchema { schema, .. } = value else {
+        return None;
+    };
     Some(json!({ "type": "json_schema", "schema": schema }))
+}
+
+/// 把 Anthropic 入站报文归一成规范形状（原地改写，详见 `decode_request` 的注释）。
+/// 只做「抬升」：把藏在嵌套里的跨协议字段补到规范字段上，不删 `thinking` / `output_config`
+/// 本身——同协议转发时客户端原文（raw）仍是报文底稿，这两个键必须原样保留。
+fn normalize_anthropic_request(value: &mut Value) -> AppResult<()> {
+    let Some(object) = value.as_object_mut() else {
+        return Ok(());
+    };
+
+    // tool_choice：Anthropic 形（{type:any/tool/...}，可带 disable_parallel_tool_use）→ 规范形。
+    if let Some(choice) = object.get("tool_choice").cloned() {
+        let parallel_disabled = choice
+            .get("disable_parallel_tool_use")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if let Some(kind) = choice.get("type").and_then(Value::as_str) {
+            let canonical = match kind {
+                "auto" => CanonicalToolChoice::Auto,
+                "none" => CanonicalToolChoice::None,
+                // Anthropic 的 any == OpenAI 的 required（扩展字段不保真，语义口径统一）。
+                "any" | "required" => CanonicalToolChoice::Required,
+                "tool" => CanonicalToolChoice::Tool {
+                    name: choice
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                },
+                other => {
+                    return Err(AppError::InvalidConfig(format!(
+                        "tool_choice 形状非法（未知的 type {other:?}）"
+                    )));
+                }
+            };
+            object.insert("tool_choice".into(), canonical.to_json());
+            if parallel_disabled {
+                object.insert("parallel_tool_calls".into(), Value::Bool(false));
+            }
+        }
+    }
+
+    // output_config：format → response_format；effort / thinking → reasoning_effort。
+    // effort 是显式档位，优先于预算式的 thinking（二选一时）。
+    let effort = object
+        .get("output_config")
+        .and_then(|config| config.get("effort"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let thinking_budget = object
+        .get("thinking")
+        .and_then(|thinking| thinking.get("budget_tokens"))
+        .and_then(Value::as_u64);
+    if let Some(format) = object
+        .get("output_config")
+        .and_then(|config| config.get("format"))
+        .cloned()
+    {
+        let schema = format.get("schema").cloned().ok_or_else(|| {
+            AppError::InvalidConfig("output_config.format 形状非法: 缺少 schema".into())
+        })?;
+        object.insert(
+            "response_format".into(),
+            CanonicalResponseFormat::JsonSchema {
+                // Anthropic 的 format 只有 type+schema，没有 name；跨协议到 OpenAI 系时补个缺省名。
+                name: format
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("response")
+                    .to_string(),
+                description: None,
+                schema,
+                strict: None,
+            }
+            .to_json(),
+        );
+    }
+    let effort = match (effort, thinking_budget) {
+        (Some(effort), _) => Some(effort),
+        (None, Some(budget)) => Some(effort_from_budget(budget).to_string()),
+        (None, None) => None,
+    };
+    if let Some(effort) = effort {
+        object.insert("reasoning_effort".into(), Value::String(effort));
+    }
+
+    Ok(())
+}
+
+/// thinking 预算 → 档位的有损映射：预算是连续值，档位只有三档，按官方参考值粗分。
+/// （32k 是 effort=high 的典型预算，8k 左右对应 medium，之下归 low。）
+fn effort_from_budget(budget: u64) -> &'static str {
+    if budget >= 32_000 {
+        "high"
+    } else if budget >= 8_000 {
+        "medium"
+    } else {
+        "low"
+    }
 }

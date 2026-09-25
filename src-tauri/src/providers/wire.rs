@@ -10,9 +10,11 @@
 //!
 //! 字段名与语义口径来自官方文档：OpenAI Chat Completions、OpenAI Responses、Anthropic Messages。
 
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 use crate::domain::model::ModelFormat;
+
+use super::SseEvent;
 
 /// 规范字段落到线上报文上的方式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,9 +39,6 @@ pub struct FieldRule {
 }
 
 pub struct ProtocolProfile {
-    /// 该协议承载「思考」的字段名，按优先级。DeepSeek 原生用 `reasoning_content`，
-    /// OpenRouter 系用 `reasoning`（实测 commandline 上游发的就是它）。
-    pub reasoning_fields: &'static [&'static str],
     /// 规范字段 → 该协议的落地方式，必须覆盖 `RequestBody` 的全部顶层字段。
     pub rules: &'static [FieldRule],
 }
@@ -73,7 +72,16 @@ const ANTHROPIC_RULES: &[FieldRule] = &[
     FieldRule { field: "response_format", slot: Slot::Transformed },
     FieldRule { field: "parallel_tool_calls", slot: Slot::Transformed },
     FieldRule { field: "reasoning_effort", slot: Slot::Transformed },
-    FieldRule { field: "service_tier", slot: Slot::Same },
+    // A5：`service_tier` 的取值词表是各家自己的（OpenAI 的 flex/priority/scale/default
+    // ↔ Anthropic 的 auto/standard_only），跨协议转发等于把 A 家的词丢进 B 家的枚举，
+    // 上游会按非法取值 400 掉整个请求。Anthropic 侧改为显式丢弃——丢的至多是一个
+    // 容量/优先级偏好（而 Anthropic 的默认档正是 `auto`），换来的是不会 400。
+    //
+    // 代价说清：`Dropped` 在**本协议的编码路径上同样生效**，所以 Anthropic 客户端自己
+    // 带的 `service_tier` 也会被这条规则删掉（这条路径与跨协议重建共用同一个
+    // `encode_request`，不像两个 OpenAI 协议那样有独立的 `encode_request_passthrough`）。
+    // 见 `docs/forwarding.md` §8 批 4 的取舍说明。
+    FieldRule { field: "service_tier", slot: Slot::Dropped },
     FieldRule { field: "n", slot: Slot::Dropped },
     FieldRule { field: CANONICAL_ONLY_KEY, slot: Slot::Dropped },
 ];
@@ -123,17 +131,14 @@ const RESPONSES_RULES: &[FieldRule] = &[
 ];
 
 const ANTHROPIC: ProtocolProfile = ProtocolProfile {
-    reasoning_fields: &["thinking"],
     rules: ANTHROPIC_RULES,
 };
 
 const OPENAI_COMPLETIONS: ProtocolProfile = ProtocolProfile {
-    reasoning_fields: &["reasoning_content", "reasoning"],
     rules: COMPLETIONS_RULES,
 };
 
 const OPENAI_RESPONSES: ProtocolProfile = ProtocolProfile {
-    reasoning_fields: &["reasoning_summary_text", "reasoning_text"],
     rules: RESPONSES_RULES,
 };
 
@@ -176,6 +181,44 @@ fn write(payload: &mut Map<String, Value>, key: &str, value: Option<&Value>, fil
         return;
     }
     payload.insert(key.to_string(), value.clone());
+}
+
+/// 流内错误事件的形状（A7）：**一份来源，三个协议共用**。
+///
+/// 上游在流里报错时，解码侧产出的规范错误事件是 Anthropic 形状
+/// （`{"type":"error","error":{…}}`——规范层的不变式）。原样转发给 OpenAI 客户端，
+/// 等于给它们发了一个自己协议里不存在的形状；而网关自产的错误（读到断流、解帧失败）
+/// 又是按入站协议出形状的——同一个客户端会碰上两种形状。这里把形状定义收成一处，
+/// 网关自产与上游流内错误都从它出。
+///
+/// Anthropic 客户端本来就是这个形状，`error_events` 与上游原文一致；两个 OpenAI 协议
+/// 用它们自己 HTTP 错误体的信封（`{"error":{message,type}}`），客户端对 4xx/5xx 响应体
+/// 已经在按这个形状解析了。
+pub fn stream_error_event(format: ModelFormat, kind: &str, message: &str) -> SseEvent {
+    match format {
+        ModelFormat::AnthropicMessages => SseEvent::new(
+            "error",
+            json!({ "type": "error", "error": { "type": kind, "message": message } }),
+        ),
+        _ => SseEvent::new(
+            "error",
+            json!({ "error": { "message": message, "type": kind } }),
+        ),
+    }
+}
+
+/// 从规范错误事件里取 `(kind, message)`，供各 provider 的 `encode_stream_event` 复用。
+pub fn stream_error_parts(canonical: &Value) -> (&str, &str) {
+    (
+        canonical
+            .pointer("/error/type")
+            .and_then(Value::as_str)
+            .unwrap_or("api_error"),
+        canonical
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or("上游返回错误"),
+    )
 }
 
 /// 规范 stop_reason → OpenAI Chat Completions 的 `finish_reason`。

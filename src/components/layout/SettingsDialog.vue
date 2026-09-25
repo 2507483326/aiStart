@@ -97,11 +97,6 @@ async function save() {
             :disabled="!proxyEnabled"
             placeholder="http://127.0.0.1:7890"
           />
-          <p class="text-xs text-muted-foreground">
-            打开开关后，转发上游、模型探测、版本检查、安装包下载等所有出站流量都走这个代理；
-            关掉即直连，地址会留着下次打开继续用。只支持 http/https，请填代理工具的 HTTP
-            端口（本机地址不走代理）。
-          </p>
         </div>
 
         <label class="flex items-center justify-between rounded-md border px-3 py-2.5">

@@ -154,9 +154,6 @@ onMounted(loadToday);
             {{ status.lastFailover }}
           </span>
         </template>
-        <span v-else class="text-muted-foreground">
-          上游失败时按模型列表顺序自动尝试下一个，成功者成为当前模型
-        </span>
       </div>
 
       <Alert v-if="status?.lastError" variant="destructive">

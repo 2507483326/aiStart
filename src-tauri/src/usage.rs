@@ -56,11 +56,14 @@ impl UsageRecord {
     }
 }
 
-/// 写入侧报文：一次调用的入站请求体 + 注入后发给上游的请求体 + 上游响应。截断与标记由 `record_with_payload` 统一处理。
+/// 写入侧报文：一次调用的入站请求体/HTTP header + 注入后发给上游的请求体 + 上游响应。
+/// 截断与标记由 `record_with_payload` 统一处理。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsagePayload {
     pub inbound_request: Option<String>,
+    /// 客户端入站 HTTP header（JSON 序列化的 `{ "名": "值" }`，原样保存不脱敏）。
+    pub inbound_headers: Option<String>,
     pub upstream_request: Option<String>,
     pub upstream_response: Option<String>,
     pub stream: bool,
@@ -73,6 +76,7 @@ pub struct UsagePayloadDetail {
     pub id: i64,
     pub time: String,
     pub inbound_request: Option<String>,
+    pub inbound_headers: Option<String>,
     pub upstream_request: Option<String>,
     pub upstream_response: Option<String>,
     pub request_truncated: bool,
@@ -249,18 +253,21 @@ pub fn record_with_payload(entry: &UsageRecord, payload: Option<&UsagePayload>) 
         };
 
         let (inbound_request, request_truncated) = cap_optional(payload.inbound_request.as_deref());
+        // header 通常很小，同一上限截断即可，不单设 truncated 标记列。
+        let (inbound_headers, _) = cap_optional(payload.inbound_headers.as_deref());
         let (upstream_request, upstream_request_truncated) =
             cap_optional(payload.upstream_request.as_deref());
         let (upstream_response, response_truncated) =
             cap_optional(payload.upstream_response.as_deref());
 
         transaction.execute(
-            "INSERT INTO usage_payload (usage_detail_id, inbound_request, upstream_request, upstream_response, \
+            "INSERT INTO usage_payload (usage_detail_id, inbound_request, inbound_headers, upstream_request, upstream_response, \
              request_truncated, upstream_request_truncated, response_truncated, is_stream, created_time, update_time) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
             params![
                 detail_id,
                 inbound_request,
+                inbound_headers,
                 upstream_request,
                 upstream_response,
                 i64::from(request_truncated),
@@ -289,22 +296,23 @@ fn cap_optional(text: Option<&str>) -> (Option<String>, bool) {
 pub fn payload_detail(usage_detail_id: i64) -> Option<UsagePayloadDetail> {
     db::with_conn(|connection| {
         let mut statement = connection.prepare(
-            "SELECT inbound_request, upstream_request, upstream_response, request_truncated, \
+            "SELECT inbound_request, inbound_headers, upstream_request, upstream_response, request_truncated, \
              upstream_request_truncated, response_truncated, is_stream, created_time FROM usage_payload \
              WHERE usage_detail_id = ?1 ORDER BY usage_payload_id DESC LIMIT 1",
         )?;
         let mut rows = statement.query_map(params![usage_detail_id], |row| {
-            let created_time: i64 = row.get(7)?;
+            let created_time: i64 = row.get(8)?;
             Ok(UsagePayloadDetail {
                 id: usage_detail_id,
                 time: db::iso_from_ms(created_time),
                 inbound_request: row.get(0)?,
-                upstream_request: row.get(1)?,
-                upstream_response: row.get(2)?,
-                request_truncated: row.get::<_, i64>(3)? != 0,
-                upstream_request_truncated: row.get::<_, i64>(4)? != 0,
-                response_truncated: row.get::<_, i64>(5)? != 0,
-                stream: row.get::<_, i64>(6)? != 0,
+                inbound_headers: row.get(1)?,
+                upstream_request: row.get(2)?,
+                upstream_response: row.get(3)?,
+                request_truncated: row.get::<_, i64>(4)? != 0,
+                upstream_request_truncated: row.get::<_, i64>(5)? != 0,
+                response_truncated: row.get::<_, i64>(6)? != 0,
+                stream: row.get::<_, i64>(7)? != 0,
             })
         })?;
         match rows.next() {

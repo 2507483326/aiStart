@@ -1,5 +1,6 @@
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::State;
@@ -15,14 +16,18 @@ use tower_http::cors::CorsLayer;
 use crate::domain::canonical::CanonicalRequest;
 use crate::domain::model::{ModelConfig, ModelFormat};
 use crate::error::{AppError, AppResult};
-use crate::events;
 use crate::providers::{
     http_client, provider_for, request_proxies_through, ResponseAssembler, SseEvent, StreamState,
     WireState,
 };
 
-use super::sse::{encode_channel_event, parse_sse_stream};
+use super::sse::{encode_channel_event, first_frame_timeout, parse_sse_stream};
 use super::{GatewayStats, MODEL_ROLES};
+
+/// 转发链路的超时（B1）：主链路此前只有 `connect_timeout(20s)`，上游建连后不响应会永久挂起
+/// （客户端干等、明细永不落库）。非流式用它限整个请求；流式不设总超时——长生成合法，
+/// 只限「等响应头」与「等首帧」两程（首帧见 `first_frame_timeout`）。
+const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub fn router() -> Router {
     Router::new()
@@ -78,6 +83,26 @@ fn source_app_for(token: &str) -> String {
         .unwrap_or_else(|| token.to_string())
 }
 
+/// 入站 HTTP header 序列化成 `{ "名": "值" }`（原样保存不脱敏，决策见 docs/forwarding.md §2）。
+/// 同名多值用逗号合并；非 ASCII 值按 lossy 转换保留，不静默丢 header。
+fn serialize_headers(headers: &HeaderMap) -> String {
+    let mut map = serde_json::Map::new();
+    for (name, value) in headers {
+        let key = name.as_str().to_string();
+        let value = String::from_utf8_lossy(value.as_bytes()).into_owned();
+        match map.entry(key) {
+            serde_json::map::Entry::Occupied(mut slot) => {
+                let existing = slot.get_mut().as_str().unwrap_or_default().to_string();
+                slot.insert(json!(format!("{existing}, {value}")));
+            }
+            serde_json::map::Entry::Vacant(slot) => {
+                slot.insert(json!(value));
+            }
+        }
+    }
+    json!(map).to_string()
+}
+
 fn encode_event(event: &SseEvent) -> String {
     let data = match &event.raw {
         Some(raw) => raw.clone(),
@@ -86,17 +111,15 @@ fn encode_event(event: &SseEvent) -> String {
     encode_channel_event(&event.event, &data)
 }
 
+/// 网关自产的流内错误（断流、解帧失败、首帧超时）→ 按入站协议出形状。
+/// 形状定义在 `wire::stream_error_event`（A7）：上游流内错误走的是同一份，
+/// 客户端不会因为错误来自哪一侧而收到两种形状。
 fn error_events(inbound: ModelFormat, message: &str) -> Vec<SseEvent> {
-    match inbound {
-        ModelFormat::AnthropicMessages => vec![SseEvent::new(
-            "error",
-            json!({ "type": "error", "error": { "type": "api_error", "message": message } }),
-        )],
-        _ => vec![SseEvent::new(
-            "error",
-            json!({ "error": { "message": message, "type": "api_error" } }),
-        )],
-    }
+    vec![crate::providers::wire::stream_error_event(
+        inbound,
+        "api_error",
+        message,
+    )]
 }
 
 fn sse_response(
@@ -119,6 +142,51 @@ fn sse_response(
         })
 }
 
+/// 构造一条明细记录（不含报文）。落库与非流式/流式两条路径共用；流式的断连兜底（B3）
+/// 也要用它——把「决定记什么」和「写库」分开，判定部分才能不碰真库地单测。
+#[allow(clippy::too_many_arguments)]
+fn build_usage_record(
+    active_model_name: &str,
+    config: &ModelConfig,
+    source_app: &str,
+    inbound: ModelFormat,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
+    reasoning_tokens: Option<u64>,
+    duration_ms: u64,
+    ok: bool,
+    failover: bool,
+    error: Option<String>,
+) -> crate::usage::UsageRecord {
+    let (timestamp, date) = crate::usage::current_timestamp();
+    crate::usage::UsageRecord {
+        id: 0,
+        timestamp,
+        date,
+        model_name: active_model_name.to_string(),
+        served_by: config.name.clone(),
+        source_app: source_app.to_string(),
+        upstream_url: provider_for(config.format).endpoint(config),
+        upstream_model: config.model.clone(),
+        // 能走到这里说明上游请求已经发出去了。代理开着、但目标是本机地址时仍算直连
+        // （绕行规则见 providers::is_loopback_target），所以按目标地址判定。
+        proxied: request_proxies_through(&provider_for(config.format).endpoint(config)),
+        inbound_protocol: inbound.as_str().to_string(),
+        upstream_protocol: config.format.as_str().to_string(),
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        reasoning_tokens,
+        duration_ms,
+        ok,
+        failover,
+        error,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_usage(
     active_model_name: &str,
@@ -136,22 +204,12 @@ fn record_usage(
     error: Option<String>,
     payload: crate::usage::UsagePayload,
 ) {
-    let (timestamp, date) = crate::usage::current_timestamp();
     crate::usage::record_with_payload(
-        &crate::usage::UsageRecord {
-            id: 0,
-            timestamp,
-            date,
-            model_name: active_model_name.to_string(),
-            served_by: config.name.clone(),
-            source_app: source_app.to_string(),
-            upstream_url: provider_for(config.format).endpoint(config),
-            upstream_model: config.model.clone(),
-            // 能走到这里说明上游请求已经发出去了。代理开着、但目标是本机地址时仍算直连
-            // （绕行规则见 providers::is_loopback_target），所以按目标地址判定。
-            proxied: request_proxies_through(&provider_for(config.format).endpoint(config)),
-            inbound_protocol: inbound.as_str().to_string(),
-            upstream_protocol: config.format.as_str().to_string(),
+        &build_usage_record(
+            active_model_name,
+            config,
+            source_app,
+            inbound,
             input_tokens,
             output_tokens,
             cache_read_tokens,
@@ -161,7 +219,7 @@ fn record_usage(
             ok,
             failover,
             error,
-        },
+        ),
         Some(&payload),
     );
 }
@@ -246,6 +304,7 @@ async fn route(
     let started = std::time::Instant::now();
     let inbound_request = String::from_utf8_lossy(&body).into_owned();
     let token = extract_token(&headers);
+    let inbound_headers = serialize_headers(&headers);
 
     match handle(
         inbound,
@@ -255,6 +314,7 @@ async fn route(
         body,
         started,
         &inbound_request,
+        &inbound_headers,
     )
     .await
     {
@@ -265,6 +325,7 @@ async fn route(
                 upstream_response,
                 upstream_url,
                 upstream_model,
+                failover_trigger,
             } = failure;
             stats.record_error(&error.to_string());
             let message = error.to_string();
@@ -277,6 +338,12 @@ async fn route(
             // 只有真发起了上游请求才谈得上「走了代理」：缺 Key、没启用模型这类失败压根没出网；
             // 本机地址即使代理开着也走的是直连。
             let proxied = !upstream_url.is_empty() && request_proxies_through(&upstream_url);
+            // 触发判定（写库时即可判定）：自动切换开 + 未点名 + 失败形态值得探测。
+            let probe_fired = failover_trigger
+                .as_ref()
+                .is_some_and(|trigger| {
+                    super::failover::qualifies(settings.auto_failover, trigger.named, trigger.retryable)
+                });
             let (timestamp, date) = crate::usage::current_timestamp();
             crate::usage::record_with_payload(
                 &crate::usage::UsageRecord {
@@ -298,16 +365,32 @@ async fn route(
                     reasoning_tokens: None,
                     duration_ms: started.elapsed().as_millis() as u64,
                     ok: false,
-                    failover: false,
+                    // 明细 failover 字段语义：这次请求触发了切换探测（写库时即可判定）；
+                    // 切换结果由事件与统计呈现。
+                    failover: probe_fired,
                     error: Some(message.clone()),
                 },
                 Some(&crate::usage::UsagePayload {
                     inbound_request: Some(inbound_request),
+                    inbound_headers: Some(inbound_headers),
                     upstream_request: None,
                     upstream_response,
                     stream: false,
                 }),
             );
+
+            // 事后切换：落库完成后异步探测（不拖慢本次错误响应）。
+            if probe_fired {
+                if let Some(trigger) = failover_trigger {
+                    super::failover::start_probe(
+                        stats,
+                        super::failover::FailoverContext {
+                            failed_model_id: trigger.failed_model_id,
+                            failed_model_name: trigger.failed_model_name,
+                        },
+                    );
+                }
+            }
 
             let (status, kind) = match error {
                 AppError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "authentication_error"),
@@ -327,12 +410,24 @@ struct UpstreamFailure {
     raw_response: Option<String>,
 }
 
-/// 透传给 `route()` 的失败信息：错误本身 + 上游原始报文 + 最后尝试的地址与模型，供失败记录落库展示。
+/// 一次上游失败里与「事后切换」相关的信息：失败的模型 + 失败形态是否值得探测。
+struct FailoverTrigger {
+    failed_model_id: i64,
+    failed_model_name: String,
+    /// dispatch 判定的 retryable（5xx / 401 / 403 / 404 / 408 / 429 / 网络错误）。
+    retryable: bool,
+    /// 本次是否点名模型：点名失败不触发切换。
+    named: bool,
+}
+
+/// 透传给 `route()` 的失败信息：错误本身 + 上游原始报文 + 最后尝试的地址与模型，供失败记录落库展示；
+/// `failover_trigger` 供 `route()` 落库后判定是否触发事后切换。
 struct RouteFailure {
     error: AppError,
     upstream_response: Option<String>,
     upstream_url: String,
     upstream_model: String,
+    failover_trigger: Option<FailoverTrigger>,
 }
 
 impl From<AppError> for RouteFailure {
@@ -342,6 +437,7 @@ impl From<AppError> for RouteFailure {
             upstream_response: None,
             upstream_url: String::new(),
             upstream_model: String::new(),
+            failover_trigger: None,
         }
     }
 }
@@ -389,6 +485,15 @@ pub(crate) fn encode_client_response(
     provider_for(inbound).encode_response(config, canonical)
 }
 
+/// 流式请求「等响应头」超时的错误：文案带模型名与秒数，明细与事件里能直接看出是超时。
+fn upstream_timeout_error(config: &ModelConfig) -> AppError {
+    AppError::Message(format!(
+        "上游 {} 超过 {} 秒未返回响应（超时）",
+        config.name,
+        UPSTREAM_TIMEOUT.as_secs()
+    ))
+}
+
 /// 把规范请求编码成上游协议原生报文并发起请求；成功时一并返回编码后的请求体（供落库展示）。
 async fn dispatch(
     inbound: ModelFormat,
@@ -417,8 +522,25 @@ async fn dispatch(
         }
     }
 
-    let response = builder.send().await.map_err(|error| UpstreamFailure {
-        error: error.into(),
+    // 超时（B1）：非流式限整个请求（reqwest 的请求级超时覆盖建连到响应体读完）；
+    // 流式不能设它——长生成合法，请求级超时会把流中途掐死，改为只限「等响应头」
+    //（响应体的首帧等待在 `first_frame_timeout` 里）。
+    let streaming = request.stream();
+    if !streaming {
+        builder = builder.timeout(UPSTREAM_TIMEOUT);
+    }
+
+    let send = if streaming {
+        match tokio::time::timeout(UPSTREAM_TIMEOUT, builder.send()).await {
+            Ok(result) => result.map_err(AppError::from),
+            Err(_elapsed) => Err(upstream_timeout_error(config)),
+        }
+    } else {
+        builder.send().await.map_err(AppError::from)
+    };
+    let response = send.map_err(|error| UpstreamFailure {
+        error,
+        // 超时与网络错误同类：换一个模型确实可能通，值得事后探测。
         retryable: true,
         raw_response: None,
     })?;
@@ -445,6 +567,171 @@ async fn dispatch(
     Ok((response, payload))
 }
 
+/// 流式请求的记账快照（B3）。
+///
+/// 落库原先只放在流式生成器的尾部：客户端中途断开（Esc、崩溃、连接超时）时 hyper 会把响应流
+/// 连同生成器一起丢弃，尾部代码永远跑不到——用量统计因此系统性漏记长生成的真实消耗。
+/// 快照收进 `Arc<Mutex<…>>`：生成器边跑边推进它，生成器里那个 `DisconnectGuard` 被中途销毁
+/// 时据此补一条「客户端断开」的失败记录。
+struct StreamAccounting {
+    /// 落库用的固定上下文（发起请求时就定下来了）
+    primary: String,
+    config: ModelConfig,
+    source_app: String,
+    inbound: ModelFormat,
+    started: std::time::Instant,
+    inbound_request: String,
+    inbound_headers: String,
+    upstream_request: String,
+    /// 边跑边推进的记账状态
+    upstream_state: StreamState,
+    assembler: ResponseAssembler,
+    stream_error: Option<String>,
+    /// 已认领收尾（常规落库或守卫补记）。守卫只在 false 时补记，不双记。
+    finished: bool,
+}
+
+impl StreamAccounting {
+    fn new(
+        primary: String,
+        config: ModelConfig,
+        source_app: String,
+        inbound: ModelFormat,
+        started: std::time::Instant,
+        inbound_request: String,
+        inbound_headers: String,
+        upstream_request: String,
+    ) -> Self {
+        let upstream_state = StreamState::new(config.name.clone());
+        Self {
+            primary,
+            config,
+            source_app,
+            inbound,
+            started,
+            inbound_request,
+            inbound_headers,
+            upstream_request,
+            upstream_state,
+            assembler: ResponseAssembler::default(),
+            stream_error: None,
+            finished: false,
+        }
+    }
+
+    /// 落库前构造记录：把判定与写库分开，判定部分才能不碰真库地单测。
+    fn usage_record(&self, ok: bool, error: Option<String>) -> crate::usage::UsageRecord {
+        build_usage_record(
+            &self.primary,
+            &self.config,
+            &self.source_app,
+            self.inbound,
+            self.upstream_state.input_tokens,
+            self.upstream_state.output_tokens,
+            (self.upstream_state.cache_read_tokens > 0)
+                .then_some(self.upstream_state.cache_read_tokens),
+            (self.upstream_state.cache_write_tokens > 0)
+                .then_some(self.upstream_state.cache_write_tokens),
+            (self.upstream_state.reasoning_tokens > 0)
+                .then_some(self.upstream_state.reasoning_tokens),
+            self.started.elapsed().as_millis() as u64,
+            ok,
+            false,
+            error,
+        )
+    }
+
+    /// 拼装结果 → 上游协议原生形状的报文文本（常规收尾与断连兜底共用）。
+    fn upstream_response_text(&self) -> String {
+        let mut canonical = self.assembler.to_value();
+        // 输入/缓存 token 只在流末尾的 usage 事件里出现，message_start 时还没有，
+        // 用流状态的最终值补齐，否则落库报文会显示输入 0。
+        if let Some(usage) = canonical.get_mut("usage").and_then(Value::as_object_mut) {
+            usage.insert("input_tokens".into(), json!(self.upstream_state.input_tokens));
+            usage.insert(
+                "cache_read_input_tokens".into(),
+                json!(self.upstream_state.cache_read_tokens),
+            );
+            usage.insert(
+                "cache_creation_input_tokens".into(),
+                json!(self.upstream_state.cache_write_tokens),
+            );
+            usage.insert(
+                "output_tokens_details".into(),
+                json!({ "thinking_tokens": self.upstream_state.reasoning_tokens }),
+            );
+        }
+        let native = provider_for(self.config.format)
+            .encode_response(&self.config, &canonical)
+            .unwrap_or(canonical);
+        serde_json::to_string_pretty(&native).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    fn payload(&self) -> crate::usage::UsagePayload {
+        crate::usage::UsagePayload {
+            inbound_request: Some(self.inbound_request.clone()),
+            inbound_headers: Some(self.inbound_headers.clone()),
+            upstream_request: Some(self.upstream_request.clone()),
+            upstream_response: Some(self.upstream_response_text()),
+            stream: true,
+        }
+    }
+
+    /// 统计 + 明细落库（常规收尾与断连兜底共用）。先置 `finished` 认领——两种收尾只会有一个跑。
+    fn record(&mut self, ok: bool, error: Option<String>, stats: &GatewayStats) {
+        self.finished = true;
+        stats.record_tokens(
+            self.upstream_state.input_tokens,
+            self.upstream_state.output_tokens,
+        );
+        if let Some(message) = error.as_deref() {
+            stats.record_error(message);
+        }
+        crate::usage::record_with_payload(&self.usage_record(ok, error), Some(&self.payload()));
+    }
+}
+
+/// 断连兜底的写入口：生产用 `StreamAccounting::record`，单测注入捕获实现（免得碰真库）。
+type StreamWriter = fn(&mut StreamAccounting, &GatewayStats, bool, Option<String>);
+
+/// 断连兜底守卫（B3）：随生成器一起被丢弃时，补记一条「客户端断开」。
+/// 正常收尾会先把 `finished` 置位，守卫随即让位，不双记。
+struct DisconnectGuard {
+    accounting: Arc<Mutex<StreamAccounting>>,
+    stats: Arc<GatewayStats>,
+    writer: StreamWriter,
+}
+
+impl DisconnectGuard {
+    fn new(accounting: Arc<Mutex<StreamAccounting>>, stats: Arc<GatewayStats>) -> Self {
+        Self {
+            accounting,
+            stats,
+            writer: |account, stats, ok, error| account.record(ok, error, stats),
+        }
+    }
+}
+
+impl Drop for DisconnectGuard {
+    fn drop(&mut self) {
+        // 锁即使被 poison（生成器持锁时 panic）也要能补记：快照本身仍是可读的数据。
+        let mut account = self
+            .accounting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if account.finished {
+            return;
+        }
+        account.finished = true;
+        (self.writer)(
+            &mut account,
+            &self.stats,
+            false,
+            Some("客户端断开".to_string()),
+        );
+    }
+}
+
 async fn handle(
     inbound: ModelFormat,
     stats: Arc<GatewayStats>,
@@ -453,6 +740,7 @@ async fn handle(
     body: Bytes,
     started: std::time::Instant,
     inbound_request: &str,
+    inbound_headers: &str,
 ) -> Result<Response, RouteFailure> {
     let settings = crate::settings::snapshot();
 
@@ -474,82 +762,48 @@ async fn handle(
         .retain_client_raw(raw);
     // 规范级校验：无法保真转换的请求直接拒掉，别转一半。
     request.validate()?;
-    // 过滤器：在转发前按规则改写规范请求。放在自动切换循环之外，
-    // 保证重试多个上游时规则只套用一次。
+    // 过滤器：在转发前按规则改写规范请求，只跑一次。
     let request = crate::filters::apply(&crate::filters::snapshot(), request)?;
 
-    // 请求里的模型名决定候选上游：别名（aiStart / auto）或未命中时走现有逻辑，
-    // 命中模型列表里的显示名时只调用那一个模型（自动切换对它无效）。
-    let candidates = settings.candidates_for(Some(request.body().model.as_str()));
-    if candidates.is_empty() {
-        return Err(RouteFailure::from(AppError::NotFound(
-            "网关没有启用中的模型".into(),
-        )));
-    }
+    // 一次请求只打一个上游：请求模型名命中显示名 → 该模型（锁定，失败不触发切换）；
+    // 否则（别名 aiStart/auto、未指定、未命中）→ 当前模型。没有可用模型立即报错。
+    let resolved = settings
+        .resolve_target(Some(request.body().model.as_str()))
+        .ok_or_else(|| RouteFailure::from(AppError::NotFound("网关没有启用中的模型".into())))?;
+    let named = resolved.is_named();
+    let config = resolved.into_config();
+    // 落库的 model_name：点名时是被点名的模型，否则就是请求到达时生效的当前模型
+    //（Active 分支拿到的 config 即当前模型）；事后切换事件登记「X → Y」的 X 也取它。
+    let primary = config.name.clone();
 
-    // 首选模型：自动切换登记「X → Y」时用它，落库的 model_name 也用它
-    // （现有逻辑下它就是当前模型；指定模型名时就是被指定的那个）。
-    let primary = candidates[0].name.clone();
-    let mut chosen: Option<(ModelConfig, reqwest::Response, Value)> = None;
-    let mut failover_used = false;
-    let mut last_error: Option<UpstreamFailure> = None;
-    // 最后一次真正发起（或尝试发起）的上游地址与模型，供失败记录展示。
-    let mut last_attempt: Option<(String, String)> = None;
+    // 最后一次尝试的上游地址与模型，供失败记录展示。
+    let last_attempt = (
+        provider_for(config.format).endpoint(&config),
+        config.model.clone(),
+    );
 
-    for (index, candidate) in candidates.iter().enumerate() {
-        last_attempt = Some((
-            provider_for(candidate.format).endpoint(candidate),
-            candidate.model.clone(),
-        ));
-        match dispatch(inbound, &request, &headers, candidate).await {
-            Ok((response, payload)) => {
-                if index > 0 {
-                    stats.record_failover(&primary, &candidate.name);
-                    // 切换成功后把接手方记为当前模型：模型列表的「使用中」随之移动，
-                    // 后续请求也直接以它为首选，不必每次都先撞一遍已失败的主模型。
-                    match crate::settings::mutate(|settings| {
-                        settings.active_model_id = Some(candidate.id);
-                    }) {
-                        Ok(()) => {
-                            events::log(
-                                "system",
-                                Some("网关"),
-                                "model.failover",
-                                Some("model"),
-                                Some(&candidate.id.to_string()),
-                                Some(json!({ "from": &primary, "to": &candidate.name })),
-                            );
-                            super::publish();
-                        }
-                        Err(error) => {
-                            stats.record_error(&format!("自动切换后更新当前模型失败: {error}"));
-                        }
-                    }
-                    failover_used = true;
-                }
-                chosen = Some((candidate.clone(), response, payload));
-                break;
-            }
-            Err(failure) => {
-                last_error = Some(failure);
-                if !last_error.as_ref().is_some_and(|failure| failure.retryable) {
-                    break;
-                }
-            }
+    let (upstream, upstream_payload) = match dispatch(inbound, &request, &headers, &config).await {
+        Ok(success) => success,
+        Err(failure) => {
+            let UpstreamFailure {
+                error,
+                retryable,
+                raw_response,
+            } = failure;
+            // 第一个上游失败立即返回客户端；是否事后探测切换由 route() 落库后判定。
+            return Err(RouteFailure {
+                error,
+                upstream_response: raw_response,
+                upstream_url: last_attempt.0,
+                upstream_model: last_attempt.1,
+                failover_trigger: Some(FailoverTrigger {
+                    failed_model_id: config.id,
+                    failed_model_name: config.name.clone(),
+                    retryable,
+                    named,
+                }),
+            });
         }
-    }
-
-    let Some((config, upstream, upstream_payload)) = chosen else {
-        let (upstream_url, upstream_model) = last_attempt.unwrap_or_default();
-        return Err(match last_error {
-            Some(failure) => RouteFailure {
-                error: failure.error,
-                upstream_response: failure.raw_response,
-                upstream_url,
-                upstream_model,
-            },
-            None => RouteFailure::from(AppError::Message("没有可用的上游模型".into())),
-        });
     };
 
     // 记录实际发往上游的请求体（已套用提示词注入），供详情页核对注入结果。
@@ -594,10 +848,11 @@ async fn handle(
             reasoning_tokens,
             started.elapsed().as_millis() as u64,
             true,
-            failover_used,
+            false,
             None,
             crate::usage::UsagePayload {
                 inbound_request: Some(inbound_request.to_string()),
+                inbound_headers: Some(inbound_headers.to_string()),
                 upstream_request: Some(upstream_request_text),
                 upstream_response: Some(
                     serde_json::to_string_pretty(&raw_response)
@@ -613,25 +868,44 @@ async fn handle(
         return Ok(json_response(StatusCode::OK, wire));
     }
 
-    let mut upstream_state = StreamState::new(config.name.clone());
     // include_usage（OpenAI 入站的 stream_options）决定出站流末尾要不要补 usage 分片。
     let mut wire_state = WireState {
         include_usage: request.body().canonical.include_usage,
         ..WireState::default()
     };
-    let mut assembler = ResponseAssembler::default();
-    let inbound_request_owned = inbound_request.to_string();
     // 同协议直通：客户端那条出口直接吐上游原文。既不合成起始事件，也不补结束信号——
     // 上游自己的起始与结束就是客户端协议的（旧行为里合成的 `message_start` 会把网关的
     // 随机 uuid 塞进客户端分片的 id；断流时还会替上游补一条"正常结束"，等于对客户端撒谎）。
     let passthrough = same_protocol(inbound, &config);
     // 上游不会自己发 message_start 时才需要补（Anthropic 上游会发，两个 OpenAI 协议不会）。
     let emit_initial = !passthrough && !upstream_provider.is_passthrough();
-    let events = parse_sse_stream(upstream.bytes_stream());
+    // 记账快照（B3）：生成器边跑边推进，连同一个 Drop 守卫一起进生成器——
+    // 客户端中途断开时生成器被丢弃，守卫据快照补一条「客户端断开」，不再整条漏记。
+    let accounting = Arc::new(Mutex::new(StreamAccounting::new(
+        primary.clone(),
+        config.clone(),
+        source_app.clone(),
+        inbound,
+        started,
+        inbound_request.to_string(),
+        inbound_headers.to_string(),
+        upstream_request_text,
+    )));
+    // 首帧限时（B1）：上游回了响应头却不吐数据时，流不能永久悬住。
+    let events = first_frame_timeout(parse_sse_stream(upstream.bytes_stream()), UPSTREAM_TIMEOUT);
 
     let stream = async_stream::stream! {
         futures_util::pin_mut!(events);
-        let mut stream_error: Option<String> = None;
+        // 守卫随生成器一起被丢弃：正常收尾会先落库并置位 finished，守卫随即让位（不双记）。
+        let _disconnect_guard = DisconnectGuard::new(accounting.clone(), stats.clone());
+
+        // 取记账快照锁。加锁一律收在单个语句或单个块里——MutexGuard 一旦跨 yield，
+        // 生成器就不再是 Send，而且守卫 drop 时可能撞上自己持有的锁。
+        let snapshot = || {
+            accounting
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        };
 
         // 规范事件 → 客户端字节。直通时返回空：客户端那条出口走上游原文，
         // 解码出来的规范事件只喂记账（`ResponseAssembler` + `StreamState`）。
@@ -647,9 +921,17 @@ async fn handle(
         };
 
         if emit_initial {
-            for canonical in upstream_state.begin() {
-                assembler.apply(&canonical);
-                for bytes in encode_for_client(&canonical, &mut wire_state) {
+            // 锁内推进记账、锁外发送（见 `snapshot` 的注释）。
+            let startup = {
+                let mut account = snapshot();
+                let startup_events = account.upstream_state.begin();
+                for canonical in &startup_events {
+                    account.assembler.apply(canonical);
+                }
+                startup_events
+            };
+            for canonical in &startup {
+                for bytes in encode_for_client(canonical, &mut wire_state) {
                     yield Ok::<Bytes, std::io::Error>(bytes);
                 }
             }
@@ -664,43 +946,58 @@ async fn handle(
                     }
                     if frame.data.trim() == "[DONE]" {
                         // [DONE] 是上游真正的结束信号，记下来（没有它的流算被截断）。
-                        upstream_state.upstream_ended = true;
-                        for canonical in upstream_provider.decode_stream_done(&config, &mut upstream_state).unwrap_or_default() {
-                            assembler.apply(&canonical);
-                            for bytes in encode_for_client(&canonical, &mut wire_state) {
-                                yield Ok(bytes);
-                            }
-                        }
+                        // 收尾统一到流末（B4）：这里不再提前调 decode_stream_done——原来
+                        // 「[DONE] 与流末各调一次、靠幂等兜底」是设计债。
+                        snapshot().upstream_state.upstream_ended = true;
                         continue;
                     }
                     let Ok(value) = serde_json::from_str::<Value>(&frame.data) else {
                         continue;
                     };
-                    match upstream_provider.decode_stream_event(&config, &frame.event, &value, &mut upstream_state) {
-                        Ok(canonical_events) => {
-                            for canonical in canonical_events {
-                                assembler.apply(&canonical);
-                                for bytes in encode_for_client(&canonical, &mut wire_state) {
-                                    yield Ok(bytes);
+                    // 锁内解码记账、锁外发送（见 `snapshot` 的注释）。
+                    let outgoing = {
+                        let mut account = snapshot();
+                        match upstream_provider.decode_stream_event(
+                            &config,
+                            &frame.event,
+                            &value,
+                            &mut account.upstream_state,
+                        ) {
+                            Ok(canonical_events) => {
+                                for canonical in &canonical_events {
+                                    account.assembler.apply(canonical);
+                                }
+                                canonical_events
+                                    .iter()
+                                    .flat_map(|canonical| {
+                                        encode_for_client(canonical, &mut wire_state)
+                                    })
+                                    .collect::<Vec<_>>()
+                            }
+                            Err(error) => {
+                                let message = error.to_string();
+                                account.stream_error = Some(message.clone());
+                                // 直通时不能再补一条网关的错误事件：上游原文已经发出去了，
+                                // 补上去等于在客户端的流里伪造内容。只记账，不发。
+                                if passthrough {
+                                    Vec::new()
+                                } else {
+                                    error_events(inbound, &message)
+                                        .iter()
+                                        .map(|event| Bytes::from(encode_event(event)))
+                                        .collect()
                                 }
                             }
                         }
-                        Err(error) => {
-                            let message = error.to_string();
-                            stream_error = Some(message.clone());
-                            // 直通时不能再补一条网关的错误事件：上游原文已经发出去了，
-                            // 补上去等于在客户端的流里伪造内容。只记账，不发。
-                            if !passthrough {
-                                for event in error_events(inbound, &message) {
-                                    yield Ok(Bytes::from(encode_event(&event)));
-                                }
-                            }
-                        }
+                    };
+                    for bytes in outgoing {
+                        yield Ok(bytes);
                     }
                 }
                 Err(error) => {
                     let message = error.to_string();
-                    stream_error = Some(message.clone());
+                    snapshot().stream_error = Some(message.clone());
+                    // 直通时同样不补网关的错误事件（上游原文已经发出去了）。
                     if !passthrough {
                         for event in error_events(inbound, &message) {
                             yield Ok(Bytes::from(encode_event(&event)));
@@ -711,80 +1008,181 @@ async fn handle(
             }
         }
 
-        for canonical in upstream_provider.decode_stream_done(&config, &mut upstream_state).unwrap_or_default() {
-            assembler.apply(&canonical);
-            for bytes in encode_for_client(&canonical, &mut wire_state) {
-                yield Ok(bytes);
+        // 流末收尾：decode_stream_done 只在这里调一次（B4），没等到上游结束事件的流
+        // 在这里补终态（判罚为 Truncated）。锁内构造、锁外发送。
+        let tail = {
+            let mut account = snapshot();
+            let mut bytes_out = Vec::new();
+            for canonical in upstream_provider
+                .decode_stream_done(&config, &mut account.upstream_state)
+                .unwrap_or_default()
+            {
+                account.assembler.apply(&canonical);
+                bytes_out.extend(encode_for_client(&canonical, &mut wire_state));
             }
-        }
-        // usage 只在流的末尾事件里出现，message_start 时还没有；出站前按流状态的最终值补齐，
-        // 否则 include_usage 的客户端会收到一份输入 token 为 0 的 usage 分片。
-        wire_state.input_tokens = upstream_state.input_tokens;
-        wire_state.output_tokens = upstream_state.output_tokens;
-        wire_state.cache_read_tokens = upstream_state.cache_read_tokens;
-        wire_state.reasoning_tokens = upstream_state.reasoning_tokens;
-        // 直通不补尾巴：上游的 usage 尾片与结束标记就是客户端该收到的那一份
-        //（请求侧直通后 `stream_options.include_usage` 会原样发给上游，它自己会带）。
-        if !passthrough {
-            for event in inbound_provider.encode_stream_done(&config, &mut wire_state) {
-                yield Ok(Bytes::from(encode_event(&event)));
+            // usage 只在流的末尾事件里出现，message_start 时还没有；出站前按流状态的最终值补齐，
+            // 否则 include_usage 的客户端会收到一份输入 token 为 0 的 usage 分片。
+            wire_state.input_tokens = account.upstream_state.input_tokens;
+            wire_state.output_tokens = account.upstream_state.output_tokens;
+            wire_state.cache_read_tokens = account.upstream_state.cache_read_tokens;
+            wire_state.reasoning_tokens = account.upstream_state.reasoning_tokens;
+            // 直通不补尾巴：上游的 usage 尾片与结束标记就是客户端该收到的那一份
+            //（请求侧直通后 `stream_options.include_usage` 会原样发给上游，它自己会带）。
+            if !passthrough {
+                for event in inbound_provider.encode_stream_done(&config, &mut wire_state) {
+                    bytes_out.push(Bytes::from(encode_event(&event)));
+                }
             }
+            bytes_out
+        };
+        for bytes in tail {
+            yield Ok(bytes);
         }
 
-        // 形态判定：上游「只给了思考没给正文」或「没发结束事件就断了」以前都被记成成功，
-        // 明细里看不出异常。线上报文保持不变，只把这条记录标成失败并写清原因。
-        let verdict = upstream_state.verdict(stream_error.clone());
+        // 常规收尾：形态判定（上游「只给了思考没给正文」/「没发结束事件就断了」以前都被记成
+        // 成功，明细里看不出异常）+ 落库。`record` 会置位 finished，断连守卫随即让位，不双记。
+        let mut account = snapshot();
+        let verdict = account.upstream_state.verdict(account.stream_error.clone());
         let (ok, error) = verdict.outcome();
-        stats.record_tokens(upstream_state.input_tokens, upstream_state.output_tokens);
-        if let Some(message) = error.as_deref() {
-            stats.record_error(message);
-        }
-        record_usage(
-            &primary,
-            &config,
-            &source_app,
-            inbound,
-            upstream_state.input_tokens,
-            upstream_state.output_tokens,
-            (upstream_state.cache_read_tokens > 0).then_some(upstream_state.cache_read_tokens),
-            (upstream_state.cache_write_tokens > 0).then_some(upstream_state.cache_write_tokens),
-            (upstream_state.reasoning_tokens > 0).then_some(upstream_state.reasoning_tokens),
-            started.elapsed().as_millis() as u64,
-            ok,
-            failover_used,
-            error,
-            crate::usage::UsagePayload {
-                inbound_request: Some(inbound_request_owned),
-                upstream_request: Some(upstream_request_text),
-                upstream_response: Some({
-                    // 拼装成 canonical 后转成上游协议的原生形状再落库，前端按协议解析（与非流式一致）
-                    let mut canonical = assembler.to_value();
-                    // 输入/缓存 token 只在流末尾的 usage 事件里出现，message_start 时还没有，
-                    // 用流状态的最终值补齐，否则落库报文会显示输入 0。
-                    if let Some(usage) = canonical.get_mut("usage").and_then(Value::as_object_mut) {
-                        usage.insert("input_tokens".into(), json!(upstream_state.input_tokens));
-                        usage.insert(
-                            "cache_read_input_tokens".into(),
-                            json!(upstream_state.cache_read_tokens),
-                        );
-                        usage.insert(
-                            "cache_creation_input_tokens".into(),
-                            json!(upstream_state.cache_write_tokens),
-                        );
-                        usage.insert(
-                            "output_tokens_details".into(),
-                            json!({ "thinking_tokens": upstream_state.reasoning_tokens }),
-                        );
-                    }
-                    let native = upstream_provider
-                        .encode_response(&config, &canonical)
-                        .unwrap_or(canonical);
-                    serde_json::to_string_pretty(&native).unwrap_or_else(|_| "{}".to_string())
-                }),
-                stream: true,
-            },
-        );
+        account.record(ok, error, &stats);
     };
 
     Ok(sse_response(stream))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 单测里替掉真库写入：`StreamAccounting::record` 会写进程级的 usage 库，
+    // 而 `sqlite_persistence_round_trips` 断言的是记录条数——这里只捕获参数。
+    thread_local! {
+        static CAPTURED: std::cell::RefCell<Vec<(bool, Option<String>, u64, u64)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn capture(
+        account: &mut StreamAccounting,
+        stats: &GatewayStats,
+        ok: bool,
+        error: Option<String>,
+    ) {
+        let (input, output) = (
+            account.upstream_state.input_tokens,
+            account.upstream_state.output_tokens,
+        );
+        // 与生产实现同款统计口径：兜底落库同样要计入面板与错误计数。
+        stats.record_tokens(input, output);
+        if let Some(message) = error.as_deref() {
+            stats.record_error(message);
+        }
+        CAPTURED.with(|captured| captured.borrow_mut().push((ok, error, input, output)));
+    }
+
+    fn taken() -> Vec<(bool, Option<String>, u64, u64)> {
+        CAPTURED.with(|captured| captured.borrow_mut().drain(..).collect())
+    }
+
+    fn config(format: ModelFormat) -> ModelConfig {
+        ModelConfig {
+            id: 1,
+            name: "Test".into(),
+            format,
+            base_url: "https://example.test/v1".into(),
+            api_key: "sk-test".into(),
+            model: "upstream-model".into(),
+            supports_1m: false,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    fn accounting() -> StreamAccounting {
+        StreamAccounting::new(
+            "Primary".into(),
+            config(ModelFormat::OpenaiCompletions),
+            "claude-desktop".into(),
+            ModelFormat::OpenaiCompletions,
+            std::time::Instant::now(),
+            "{}".into(),
+            "{}".into(),
+            "{}".into(),
+        )
+    }
+
+    /// B3 的核心承诺：客户端中途断开时，流已经被丢弃、生成器尾部跑不到了，
+    /// 那条「已经消耗掉的 token」仍要落库，并标明原因。
+    #[test]
+    fn disconnect_guard_records_what_the_stream_had_already_accounted_for() {
+        let stats = Arc::new(GatewayStats::default());
+        let mut account = accounting();
+        account.upstream_state.input_tokens = 7;
+        account.upstream_state.output_tokens = 3;
+        let shared = Arc::new(Mutex::new(account));
+
+        drop(DisconnectGuard {
+            accounting: shared.clone(),
+            stats: stats.clone(),
+            writer: capture,
+        });
+
+        assert_eq!(
+            taken(),
+            vec![(false, Some("客户端断开".to_string()), 7, 3)],
+            "断连兜底该恰好补一条，带上已记账的用量"
+        );
+        let (_, errors, input, output, _, last) = stats.snapshot();
+        assert_eq!((errors, input, output), (1, 7, 3), "统计不能被兜底路径漏掉");
+        assert_eq!(last.as_deref(), Some("客户端断开"));
+        assert!(
+            shared.lock().expect("lock").finished,
+            "兜底与常规收尾共用一个认领位"
+        );
+    }
+
+    /// 正常收尾先认领，随后生成器销毁守卫——不能再补一条，否则每次成功请求都双记。
+    #[test]
+    fn disconnect_guard_stays_silent_after_the_regular_hand_off() {
+        let stats = Arc::new(GatewayStats::default());
+        let mut account = accounting();
+        account.finished = true;
+        let shared = Arc::new(Mutex::new(account));
+
+        drop(DisconnectGuard {
+            accounting: shared.clone(),
+            stats: stats.clone(),
+            writer: capture,
+        });
+
+        assert!(taken().is_empty(), "常规收尾落库后守卫必须让位");
+        assert_eq!(stats.snapshot().1, 0, "让位的守卫也不该记错误");
+    }
+
+    /// A7：流内错误事件的形状只有一份来源。上游在流里报错时解码侧产出的是 Anthropic 形状的
+    /// 规范事件，不能原样发给 OpenAI 客户端；而网关自产错误（断流、解帧失败、首帧超时）
+    /// 走的是 `error_events`。两侧必须给同一个客户端同样的形状，否则它会碰到两种形状。
+    #[test]
+    fn stream_errors_have_one_shape_per_inbound_protocol() {
+        let message = "上游返回错误";
+        for inbound in [
+            ModelFormat::AnthropicMessages,
+            ModelFormat::OpenaiCompletions,
+            ModelFormat::OpenaiResponses,
+        ] {
+            let mut state = StreamState::new("upstream-model");
+            let canonical = state.error("api_error", message);
+            let encoded = provider_for(inbound).encode_stream_event(
+                &config(inbound),
+                &canonical[0],
+                &mut WireState::default(),
+            );
+            let upstream_side = error_events(inbound, message);
+            assert_eq!(encoded.len(), 1, "{inbound:?} 应产出恰好一个错误事件");
+            assert_eq!(encoded[0].event, upstream_side[0].event, "{inbound:?} 事件名");
+            assert_eq!(
+                encoded[0].data, upstream_side[0].data,
+                "{inbound:?}：上游流内错误与网关自产错误必须是同一形状"
+            );
+        }
+    }
 }

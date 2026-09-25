@@ -88,6 +88,7 @@ export interface UsagePayloadDetail {
   id: number;
   time: string;
   inboundRequest: string | null;
+  inboundHeaders: string | null;
   upstreamRequest: string | null;
   upstreamResponse: string | null;
   requestTruncated: boolean;

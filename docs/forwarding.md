@@ -188,15 +188,21 @@ pub(crate) fn same_protocol(inbound: ModelFormat, config: &ModelConfig) -> bool 
 
 ```
 parse_sse_stream(upstream)                       // → SseFrame { event, data, raw }
+  → first_frame_timeout(…, 300s)                 // 只限首帧；首帧之后不限时（B1）
   → 同协议：yield frame.raw（逐帧原文）
-  → data == "[DONE]"? → 记 upstream_ended（decode_stream_done 收敛后只在流末调用）
+  → data == "[DONE]"? → 只记 upstream_ended（收尾统一到流末，B4）
   → decode_stream_event（上游 → 规范事件）
       → assembler.apply（落库侧累积，两条路径都跑）
       → encode_for_client（跨协议才编码出站；直通返回空）
-  → 流末：decode_stream_done（幂等收尾）→ wire_state 补 usage 终值
+  → 流末：decode_stream_done（只在这里调一次）→ wire_state 补 usage 终值
       → 跨协议才 encode_stream_done（usage 尾片 / [DONE] / response.completed）
-  → verdict（Ok / EmptyReasoningOnly / Truncated / UpstreamError）→ record_usage
+  → verdict（Ok / EmptyReasoningOnly / Truncated / UpstreamError）→ record（统计 + 落库）
 ```
+
+记账快照（`StreamAccounting`）全程收在 `Arc<Mutex<…>>` 里，生成器另持一个 `DisconnectGuard`：
+客户端中途断开时 hyper 直接丢弃响应流、生成器尾部永远不会执行，守卫在 drop 时按快照补一条
+`ok=false` / `error=「客户端断开」` 的记录；正常收尾先置位 `finished` 认领，守卫随即让位。
+两种收尾共用同一份统计与落库代码，因此面板与明细的口径不会分叉。
 
 - **出站编码侧**：`WireState` 按客户端协议重建结构（分片 id、工具索引换算、文本 item 开闭）。
 - **解码侧**：`StreamState` 内嵌 `BlockNormalizer`，把任意上游增量收成合法规范块序列，
@@ -295,13 +301,14 @@ Responses 的解码按事件名硬编码，不查表。协议表与 provider 行
 **C3｜安全注意：固定 token + 全开放 CORS**（提示，非缺陷）
 应用 token 是固定可读字符串（= app kind），`CorsLayer::permissive()`。任何本机网页/进程都能
 用已知 token 调网关白嫖上游。单机工具场景可接受；若要收紧，优先校验 `Origin`/`Host` 或换
-随机 token，不必动转发逻辑。
+随机 token，不必动转发逻辑。**结论：决定不做**（2026-09-25 与用户确认），理由与两条备选路径
+见 §8 批 4。
 
 ## 8. 方案（分批落地）
 
 顺序按「流程收敛 → 保真 → 健壮性 → 杂项」。每批独立可回滚、独立可测。
 
-### 批 1：流程收敛——单上游 + 事后切换 + header 入库（§2 差距表的全部）
+### 批 1：流程收敛——单上游 + 事后切换 + header 入库（§2 差距表的全部）✅ 已完成（更早的提交落地）
 
 **1a. 上游选择收敛**：`candidates_for` 改为 `resolve_target(requested) -> Option<ModelConfig>`
 ——点名命中显示名 → 该模型；否则 → 当前模型；无启用模型 → None（调用方报错）。
@@ -336,28 +343,41 @@ header map），`usage_payload` 表加列（`schema.sql` + `db/mod.rs` 的 LEGAC
 `db/mod.rs`、`tests.rs`。规模 ~1.5 天。回滚：整体 revert；`resolve_target` 与循环版行为
 对点名/别名请求完全一致，风险集中在切换路径，出问题可临时把触发条件改为恒 false。
 
-### 批 2：跨协议保真（修 A1–A4、A6）
+### 批 2：跨协议保真（修 A1–A4、A6）✅ 已完成
 
 核心一步是**把形状分歧字段类型化**，其余缺口大多随之消失：
 
 1. 新增 `CanonicalToolChoice`（`Auto | None | Required | Tool{name}`）与
-   `CanonicalResponseFormat`（`Text | JsonObject | JsonSchema{name,schema,strict}`）枚举，
+   `CanonicalResponseFormat`（`Text | JsonObject | JsonSchema{name,description,schema,strict}`）枚举，
    `RequestBody` 的对应字段换成强类型；serde 反序列化天然拒绝非法形状（入站即 400，
-   而不是转发到上游才炸）。
-2. 每协议一对纯函数 `to_canonical / from_canonical`（tools、tool_choice、response_format、
-   image source 各一组），`decode_request` 在抬升时调用——顺带修掉 A1（completions 补抬
-   `tool_choice`）与 A2（Anthropic 补抬 `output_config.format`；`thinking` 有损映射为
-   `reasoning_effort` 或显式丢弃并留事件）。
-3. 图片：decode 侧把 http(s) `image_url` 存成 `{type:"url",url}` 的 image source
-   （encode 侧 `image_url_from_block` 已支持 url 形态，基本零成本）。
-4. `validate()` 补 `n == 0` 拒绝。
+   而不是转发到上游才炸）。规范 JSON 统一为 OpenAI Chat Completions 口径，
+   各协议 decode 侧先归一再 parse（Anthropic 的 decode 由「parse 后 map_raw」改成
+   「先 normalize 再 parse」，类型化字段才来得及校验形状）。
+2. 每协议 `to_canonical / from_canonical` 纯函数（tool_choice、response_format、image source），
+   `decode_request` 在抬升时调用——A1（completions 补抬 `tool_choice`）与 A2（Anthropic 补抬
+   `output_config.format`）随之修掉。形状抬不了的臂显式 400，不再静默降级/丢弃。
+3. 图片（A4）：decode 侧 `image_source_from_url` 把 http(s) `image_url` 存成
+   `{type:"url",url}` 的 image source，`data:` 仍收 base64；encode 两侧本就支持 url 形态。
+4. `validate()` 补 `n == 0` 拒绝；显式 `null` 的 tool_choice / response_format 视为未指定。
 
-涉及文件：`domain/canonical.rs`、三个 provider、`tests.rs`。规模 ~1.5 天。
-验收：`canonical_fields_are_forwarded_per_protocol` 补 tool_choice / json_schema / http 图 /
-`any`→Responses 样例，三方向穷举。
+落地时的设计决定（与原计划的差异）：
+
+* **`thinking` 有损映射口径**：预算 → 档位按 `≥32k → high`、`≥8k → medium`、其余 `low` 粗分；
+  `output_config.effort` 显式档位优先于预算。映射只做「抬升」，不删 `thinking` /
+  `output_config` 原键（同协议直通时客户端原文仍是底稿）；Anthropic 出站时报文里已有
+  `thinking.budget_tokens` 就不再叠加 `output_config.effort`（两个思考开关同发会被上游拒）。
+* Anthropic 的 `output_config.format` 只有 type+schema、没有 name，跨协议到 OpenAI 系时补
+  缺省名 `"response"`。
+* 测试：`canonical_fields_are_forwarded_per_protocol` 补 tool_choice / strict / 指定工具样例；
+  新增 `anthropic_inbound_hidden_fields_survive_cross_protocol`（A2/A3，含同协议 thinking
+  原样保留）、`http_image_urls_survive_cross_protocol`（A4）、
+  `invalid_n_and_malformed_shapes_are_rejected_at_inbound`（A6 + 非法形状入站 400）。
+  130 通过。
+
+涉及文件：`domain/canonical.rs`、三个 provider、`tests.rs`。
 回滚：纯增量改动，revert 即可。
 
-### 批 3：健壮性（修 B1–B3，顺带 B4）
+### 批 3：健壮性（修 B1–B3，顺带 B4）✅ 已完成
 
 1. **超时**：非流式在 `dispatch` 的请求 builder 上加 `.timeout(300s)`；流式对「建连 + 首帧」
    用 `tokio::time::timeout` 包裹首字节等待，流中不设总超时（长生成合法）。
@@ -370,18 +390,102 @@ header map），`usage_payload` 表加列（`schema.sql` + `db/mod.rs` 的 LEGAC
 4. （顺带）`[DONE]` 分支收敛为只记 `upstream_ended` + usage，`decode_stream_done` 只在流末
    调用一次。
 
-涉及文件：`gateway/server.rs`、`gateway/sse.rs`。规模 ~1 天。
+落地时的设计决定（与原计划的差异）：
+
+* **两程限时，而不是一个总超时**：流式链路其实有两段「等」，各有各的堵法——
+  第一段是 `builder.send()` 等响应头（上游受理但排队），第二段是响应体等首帧
+  （回了 200 却不吐字节）。两段各套一次 `UPSTREAM_TIMEOUT`（300s），首帧之后的流**不限时**。
+  第二段做成 `sse.rs::first_frame_timeout` 流适配器：超时以 `Err` 项进流，而不是直接中断，
+  这样它和上游断流走完全同一条路径（记账 + 跨协议时报错给客户端），不新增分支。
+* **超时算 `retryable`**：超时与网络错误同类（换一个模型可能就通了），因此照旧触发事后切换，
+  写库时 `failover` 字段照常置位。
+* **断连兜底用「生成器局部守卫」而非 channel + spawn**：`async_stream::stream!` 里的局部变量
+  恰好在 hyper drop 掉响应体（客户端断开）时随之销毁，`Drop` 时机精确；且局部变量按声明逆序
+  销毁——后声明的 `MutexGuard` 先释放，守卫才去加锁，不会自锁。
+* **`finished` 是单向认领位**：`record()` 与守卫都先置位再写库，两者只会有一个真正落库。
+  守卫加锁走 `unwrap_or_else(|poisoned| poisoned.into_inner())`——生成器持锁时 panic 也要能补记，
+  快照本身仍是可读数据。**锁一律收在单个语句或单个块内**：`MutexGuard` 跨 `yield` 会让生成器
+  不再是 `Send`。
+* **兜底也要计统计**：断连记录同样走 `stats.record_tokens` / `record_error`，否则面板与明细两个口径
+  会分叉。
+* **B4 的可见影响**：`[DONE]` 不再就地收尾，而由流末统一产出终态事件。跨协议流的出站顺序不变
+  （`decode_stream_done` 的规范事件仍在前、`encode_stream_done` 的协议尾片在后，只是两批都发生在
+  循环退出之后）；直通流的 `[DONE]` 原文仍在解析循环里逐帧发出，不受影响。
+* 测试：`first_frame_timeout_gives_up_when_the_upstream_never_speaks`、
+  `first_frame_timeout_stops_policing_after_the_first_frame`、
+  `sse_frames_decode_whole_lines_so_cjk_survives_chunk_boundaries`（B2），以及
+  `gateway/server.rs` 内的 `disconnect_guard_records_what_the_stream_had_already_accounted_for` /
+  `disconnect_guard_stays_silent_after_the_regular_hand_off`（守卫的 `StreamWriter` 做成可注入的
+  `fn` 指针，单测注入捕获实现，不碰进程级 usage 库——`sqlite_persistence_round_trips` 断言的是
+  记录条数）。135 通过。
+
+涉及文件：`gateway/server.rs`、`gateway/sse.rs`、`tests.rs`。规模 ~1 天。
 回滚：三项彼此独立，可单项 revert。
 
-### 批 4：杂项与可选
+### 批 4：杂项与可选（A5 / A7 / C1 / C2 ✅ 已完成；C3 决定不做）
 
-- **A5** `service_tier`：实测 Anthropic 对未知参数的行为，报 400 就改 `Dropped`（一行 + 一个测试）。
-- **A7** 错误事件形状：`encode_stream_event` 的 `"error"` 臂改为按入站协议重排（与
-  `error_events` 同一形状来源），或把 `error_events` 提成共享函数。
-- **C1** completions 解码捕获分片 `id` 填进 `StreamState.message_id`（几行）。
-- **C2** `reasoning_fields`：Responses 解码改走表，或收窄表并注明（诚实化优先，行为不变）。
-- **C3** 安全收紧：`CorsLayer` 换成按 `Origin` 白名单；或设置里提供「随机 token」选项。
-  默认行为不变，作为可选项。
+**A5 `service_tier`（Anthropic 侧改 `Dropped`）**
+
+原计划是「实测 Anthropic 对未知参数的行为，报 400 就改 `Dropped`」。此处没做成实测（容器内无外网；
+也不该拿用户的 Key 去试探上游），但**不需要实测就能判定 `Same` 是错的**：`service_tier` 的取值是
+各家的词表——OpenAI 的 `flex`/`priority`/`scale`/`default` 与 Anthropic 的 `auto`/`standard_only`
+只有 `auto` 重合。即便该参数在 Anthropic 侧存在，把入站的 `priority` 原样转发也会因非法枚举 400，
+而 400 会废掉整个请求。丢弃则在两种假设下都安全：最坏是丢一个容量/优先级偏好，而 Anthropic
+的默认档正是 `auto`——丢 `auto` 等于没丢。
+
+代价（写在这里免得日后当 bug 查）：`Dropped` 在 Anthropic **本协议的编码路径上同样生效**，
+所以 Anthropic 客户端自己带的 `service_tier` 也会被删掉——这条路与跨协议重建共用同一个
+`encode_request`，不像两个 OpenAI 协议那样有独立的 `encode_request_passthrough`（它们以
+客户端原文为底，从不查这张表，因此完全不受影响）。丢一个容量偏好换「绝不 400」，是这个改动
+认下的取舍。
+
+> 若日后实测确认 Anthropic 接受 `service_tier`，升级路径是把它从 `Dropped` 改成值映射
+> （`auto` → `auto`，其余丢弃），而不是改回 `Same`；那样连 Anthropic 客户端自带的值也能保住。
+
+**A7 错误事件形状**（`wire.rs` + 两个 OpenAI provider + `gateway/server.rs`）
+
+形状定义收成一处：`wire::stream_error_event(format, kind, message)`（配 `stream_error_parts`
+从规范错误事件里取 kind/message）。网关自产错误（`error_events`）与两个 OpenAI provider 的
+`encode_stream_event` 的 `error` 臂都从它出——原先后者是把 Anthropic 形状的规范事件原样转发给
+OpenAI 客户端，两侧形状不一致。Anthropic 臂保持逐字转发（默认实现即恒等：上游的 `error.type`
+（如 `overloaded_error`）与附加字段因此保真，所以这一路等价于表里的形状）。测试
+`stream_errors_have_one_shape_per_inbound_protocol` 对三个协议分别断言两个来源**逐字段相等**。
+
+**C1 分片 id**：completions 解码捕获分片 `id`（空串不覆盖）填进 `StreamState.message_id`。
+影响面只有落库的 `upstream_response.id` 与跨协议时发给客户端的 `message_start.message.id`——
+同协议直通发的是上游原文，本来就不受影响。
+
+**C2 `reasoning_fields`**：从 `ProtocolProfile` 移除，收窄成 `openai_completions.rs` 的
+`REASONING_FIELDS` 常量（全链路只有它读）。Anthropic 的思考是内容块类型（`thinking`）、
+Responses 的思考按事件名区分（`response.reasoning_summary_text.delta`），都不存在
+「按 JSON 字段名找思考」这件事——表里那两条是死数据，还会让人以为它们在约束三个协议。
+行为不变。
+
+测试：`stream_errors_have_one_shape_per_inbound_protocol`（A7）、
+`completions_stream_captures_the_upstream_chunk_id`（C1），
+`anthropic_clients_lose_their_own_service_tier_until_the_parameter_is_verified`（A5 的代价，见上），
+`canonical_fields_are_forwarded_per_protocol` 补两处断言（A5：Anthropic 丢弃 vs. 两个 OpenAI 协议保留）。
+
+**顺手修的测试隔离问题**：`sqlite_persistence_round_trips` 与
+`loopback_targets_bypass_the_proxy_and_requests_say_so` 都会 init/mutate 全局设置库，
+并发跑时 `init` 的「读盘 → 覆盖内存 → 落盘」会把对方刚落盘的设置抹掉——实测表现为
+`applied` 绑定凭空消失、`sqlite_persistence_round_trips` 偶发失败（首次遇到时本批还在改
+`service_tier`，一度被误判为改动引起；单独跑必过、连跑偶发）。加了一把测试内的互斥锁串行化
+这两者，连跑 5 次稳定。生产侧 `settings::init` 只在启动时调用一次（`lib.rs`），不存在这个交错，
+所以这是纯测试隔离问题，未动生产代码。
+
+**C3 决定不做**（2026-09-25 与用户确认）：`CorsLayer::permissive()` + 固定可读 token（= app kind）
+在单机工具场景下可接受（§7-C3）——网关只监听 `127.0.0.1`，风险限于「本机的网页/进程能不能白嫖
+上游」，而当前用法里客户端都是本机 app，收紧的收益不抵改动风险。两条备选路径留档，日后要做时
+按此评估，不必重新推导：
+
+* **`Origin` 白名单**：改动最小，但会影响网页/WebView 形态的客户端（本 app 自己的 WebView 若直接
+  调网关端口也要进白名单），且对非浏览器来源没有任何作用。
+* **随机 token**：真正能挡住网页 drive-by 的手段，但会让所有已绑定客户端失效、需要重新绑定。
+  做成「设置项 + 默认关」可以不破坏现有绑定，代价是需要同时动 Rust 设置、DB 列与
+  `SettingsDialog.vue` / `types.ts`。
+
+138 通过。
 
 ### 不做的（明确排除）
 
@@ -393,7 +497,7 @@ header map），`usage_payload` 表加列（`schema.sql` + `db/mod.rs` 的 LEGAC
 - **不重建直通开关**：同协议直通按 `same_protocol` 硬边界生效，无配置项；回滚手段就是让
   谓词返回 `false`（一行）。
 
-## 9. 守护测试现状（124 passed）
+## 9. 守护测试现状（138 passed）
 
 关键守护点与对应测试：
 
@@ -405,6 +509,12 @@ header map），`usage_payload` 表加列（`schema.sql` + `db/mod.rs` 的 LEGAC
 | 直通判定恰好等价协议相等 | `same_protocol_holds_exactly_when_the_formats_match` |
 | 响应逐字转发 | `same_protocol_response_is_forwarded_verbatim` |
 | SSE 字节保真（心跳/多行 data/分帧） | `sse_frames_keep_the_upstream_bytes_intact` |
+| SSE 跨 chunk 的多字节字符 | `sse_frames_decode_whole_lines_so_cjk_survives_chunk_boundaries` |
+| 首帧限时不掐长生成 | `first_frame_timeout_gives_up_when_the_upstream_never_speaks`、`first_frame_timeout_stops_policing_after_the_first_frame` |
+| 断连兜底落库且不双记 | `gateway::server::tests::disconnect_guard_records_what_the_stream_had_already_accounted_for`、`disconnect_guard_stays_silent_after_the_regular_hand_off` |
+| 流内错误事件形状（两个来源一致） | `gateway::server::tests::stream_errors_have_one_shape_per_inbound_protocol` |
+| 分片 id 进记账 | `completions_stream_captures_the_upstream_chunk_id` |
+| `service_tier` 对 Anthropic 一律丢弃（含客户端自带值） | `anthropic_clients_lose_their_own_service_tier_until_the_parameter_is_verified` |
 | 块状态机不变式 | `block_normalizer_keeps_payloads_in_their_own_block`、`block_normalizer_serializes_parallel_tool_arguments` |
 | 流判罚 | `stream_verdict_flags_reasoning_only_and_truncated` |
 | 过滤器 | `filter_injects_system_prompt`、`filter_skips_disabled_and_stacks_in_order` |

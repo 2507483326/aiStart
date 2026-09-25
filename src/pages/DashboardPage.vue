@@ -41,7 +41,7 @@ onMounted(async () => {
     <GatewayPanel />
 
     <div class="grid gap-4 lg:grid-cols-2">
-      <Card>
+      <Card class="gap-4">
         <CardHeader>
           <div class="flex items-center justify-between">
             <div class="space-y-1">
@@ -88,7 +88,7 @@ onMounted(async () => {
         </CardContent>
       </Card>
 
-      <Card>
+      <Card class="gap-4">
         <CardHeader>
           <div class="flex items-center justify-between">
             <div class="space-y-1">

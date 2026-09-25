@@ -1,3 +1,4 @@
+pub mod failover;
 pub mod server;
 pub mod sse;
 
@@ -359,6 +360,9 @@ pub fn start() -> AppResult<GatewayStatus> {
     drop(guard);
 
     set_state(GatewayState::Running);
+
+    // 重置事后切换哨兵：上一轮探测任务可能随旧运行时一起被丢弃。
+    failover::reset();
 
     events::log(
         "system",

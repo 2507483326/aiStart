@@ -1,12 +1,13 @@
 use serde_json::{json, Map, Value};
 
 use crate::domain::canonical::{
-    blocks_to_text, content_to_text, CanonicalRequest, ContentBlock, SystemPrompt,
+    blocks_to_text, content_to_text, CanonicalRequest, CanonicalResponseFormat,
+    CanonicalToolChoice, ContentBlock, SystemPrompt,
 };
 use crate::domain::model::{ModelConfig, ModelFormat};
 use crate::error::{AppError, AppResult};
 
-use super::openai_completions::{data_url_to_source, parse_arguments};
+use super::openai_completions::{image_source_from_url, parse_arguments};
 use super::wire::{self, Fill};
 use super::{ModelProvider, SseEvent, StreamState, WireState};
 
@@ -101,67 +102,66 @@ fn reasoning_text(item: &Value) -> String {
     }
 }
 
-/// 规范的 `tool_choice`（Chat Completions 口径）→ Responses 写法：
-/// `auto` / `none` / `required` 同名，`{type:function,function:{name}}` 摊平成 `{type:function,name}`。
-fn tool_choice(choice: &Value) -> Option<Value> {
+/// 规范 `tool_choice`（类型化）→ Responses 写法：
+/// `auto` / `none` / `required` 同名，指定工具摊平成 `{type:function,name}`。
+fn tool_choice(choice: &CanonicalToolChoice) -> Value {
     match choice {
-        Value::String(kind) => Some(Value::String(kind.clone())),
-        Value::Object(object) => match object.get("type").and_then(Value::as_str) {
-            Some("function") => Some(json!({
-                "type": "function",
-                "name": object
-                    .get("function")
-                    .and_then(|function| function.get("name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-            })),
-            Some("tool") => Some(json!({
-                "type": "function",
-                "name": object.get("name").and_then(Value::as_str).unwrap_or_default()
-            })),
-            _ => None,
-        },
-        _ => None,
+        CanonicalToolChoice::Auto => Value::String("auto".into()),
+        CanonicalToolChoice::None => Value::String("none".into()),
+        CanonicalToolChoice::Required => Value::String("required".into()),
+        CanonicalToolChoice::Tool { name } => {
+            json!({ "type": "function", "name": name })
+        }
     }
 }
 
-/// Responses 的 `tool_choice` → 规范（Chat Completions 口径）。
+/// Responses 的 `tool_choice` → 规范 JSON（供类型化反序列化收口）。
+/// 残缺/未知臂返回 None，调用方按「形状非法」报错。
 fn canonical_tool_choice(choice: &Value) -> Option<Value> {
     match choice {
-        Value::String(kind) => Some(Value::String(kind.clone())),
+        Value::String(kind) => match kind.as_str() {
+            "auto" | "none" | "required" => Some(Value::String(kind.clone())),
+            _ => None,
+        },
         Value::Object(object) => match object.get("type").and_then(Value::as_str) {
-            Some("function") => Some(json!({
-                "type": "function",
-                "function": {
-                    "name": object.get("name").and_then(Value::as_str).unwrap_or_default()
-                }
-            })),
+            Some("function") => object
+                .get("name")
+                .and_then(Value::as_str)
+                .map(|name| json!({ "type": "function", "function": { "name": name } })),
             _ => None,
         },
         _ => None,
     }
 }
 
-/// 规范的 `response_format` → Responses 的 `text.format`：
+/// 规范 `response_format`（类型化）→ Responses 的 `text.format`：
 /// Responses 把 `json_schema` 的嵌套层摊平（`{type, name, schema, strict}`），`text` / `json_object` 同名。
-fn text_format(value: &Value) -> Option<Value> {
-    match value.get("type").and_then(Value::as_str)? {
-        "json_schema" => {
-            let schema = value.get("json_schema")?;
+fn text_format(value: &CanonicalResponseFormat) -> Value {
+    match value {
+        CanonicalResponseFormat::Text => json!({ "type": "text" }),
+        CanonicalResponseFormat::JsonObject => json!({ "type": "json_object" }),
+        CanonicalResponseFormat::JsonSchema {
+            name,
+            description,
+            schema,
+            strict,
+        } => {
             let mut format = Map::new();
             format.insert("type".into(), Value::String("json_schema".into()));
-            for key in ["name", "description", "schema", "strict"] {
-                if let Some(field) = schema.get(key) {
-                    format.insert(key.to_string(), field.clone());
-                }
+            format.insert("name".into(), Value::String(name.clone()));
+            if let Some(description) = description {
+                format.insert("description".into(), Value::String(description.clone()));
             }
-            Some(Value::Object(format))
+            format.insert("schema".into(), schema.clone());
+            if let Some(strict) = strict {
+                format.insert("strict".into(), Value::Bool(*strict));
+            }
+            Value::Object(format)
         }
-        kind => Some(json!({ "type": kind })),
     }
 }
 
-/// Responses 的 `text.format` → 规范（Chat Completions 口径）。
+/// Responses 的 `text.format` → 规范 JSON（供类型化反序列化收口）。
 fn canonical_format(value: &Value) -> Option<Value> {
     match value.get("type").and_then(Value::as_str)? {
         "json_schema" => {
@@ -173,7 +173,8 @@ fn canonical_format(value: &Value) -> Option<Value> {
             }
             Some(json!({ "type": "json_schema", "json_schema": Value::Object(schema) }))
         }
-        kind => Some(json!({ "type": kind })),
+        "text" | "json_object" => Some(json!({ "type": value.get("type") })),
+        _ => None,
     }
 }
 
@@ -253,12 +254,12 @@ impl ModelProvider for OpenaiResponsesProvider {
                 payload.insert("tools".into(), encode_tools(tools));
             }
         }
-        if let Some(choice) = body.tool_choice.as_ref().and_then(tool_choice) {
-            payload.insert("tool_choice".into(), choice);
+        if let Some(choice) = body.tool_choice.as_ref() {
+            payload.insert("tool_choice".into(), tool_choice(choice));
         }
         // Responses 把输出格式与思考档位分别装在 text / reasoning 两个对象里。
-        if let Some(format) = body.response_format.as_ref().and_then(text_format) {
-            object_field(&mut payload, "text").insert("format".into(), format);
+        if let Some(format) = body.response_format.as_ref() {
+            object_field(&mut payload, "text").insert("format".into(), text_format(format));
         }
         if let Some(effort) = &body.reasoning_effort {
             object_field(&mut payload, "reasoning").insert("effort".into(), Value::String(effort.clone()));
@@ -604,7 +605,8 @@ impl ModelProvider for OpenaiResponsesProvider {
                                             .get("image_url")
                                             .and_then(Value::as_str)
                                             .unwrap_or_default();
-                                        if let Some(source) = data_url_to_source(url) {
+                                        // data: 收成 base64 source，http(s) 原样存 url source（A4）。
+                                        if let Some(source) = image_source_from_url(url) {
                                             blocks.push(json!({ "type": "image", "source": source }));
                                         }
                                     }
@@ -664,8 +666,16 @@ impl ModelProvider for OpenaiResponsesProvider {
         {
             canonical.insert("response_format".into(), format);
         }
-        if let Some(choice) = object.get("tool_choice").and_then(canonical_tool_choice) {
-            canonical.insert("tool_choice".into(), choice);
+        if let Some(choice) = object.get("tool_choice") {
+            if !choice.is_null() {
+                let normalized = canonical_tool_choice(choice).ok_or_else(|| {
+                    AppError::InvalidConfig(format!(
+                        "tool_choice 形状非法: {}",
+                        serde_json::to_string(choice).unwrap_or_default()
+                    ))
+                })?;
+                canonical.insert("tool_choice".into(), normalized);
+            }
         }
         if let Some(tools) = object.get("tools").and_then(Value::as_array) {
             let converted: Vec<Value> = tools
@@ -956,7 +966,16 @@ impl ModelProvider for OpenaiResponsesProvider {
                     .map(str::to_string);
                 Vec::new()
             }
-            "error" => vec![canonical.clone()],
+            // A7：规范错误事件是 Anthropic 形状，不能原样发给 OpenAI 客户端——
+            // 按本协议的信封重排，形状与网关自产的流内错误（`gateway::server::error_events`）同源。
+            "error" => {
+                let (kind, message) = wire::stream_error_parts(data);
+                vec![wire::stream_error_event(
+                    ModelFormat::OpenaiResponses,
+                    kind,
+                    message,
+                )]
+            }
             _ => Vec::new(),
         }
     }

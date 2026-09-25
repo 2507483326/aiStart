@@ -9,6 +9,27 @@ use crate::domain::app::AppKind;
 use crate::domain::model::{ModelConfig, ModelFormat, ModelInput};
 use crate::error::{AppError, AppResult};
 
+/// 解析结果：点名命中的模型锁定单打，失败不参与切换；其余落到当前模型。
+#[derive(Debug, Clone)]
+pub enum ResolvedTarget {
+    /// 请求模型名命中显示名：只调用该模型，失败不触发切换。
+    Named(ModelConfig),
+    /// 别名（aiStart/auto）/ 未指定 / 未命中：用当前模型，失败可触发事后切换。
+    Active(ModelConfig),
+}
+
+impl ResolvedTarget {
+    pub fn is_named(&self) -> bool {
+        matches!(self, Self::Named(_))
+    }
+
+    pub fn into_config(self) -> ModelConfig {
+        match self {
+            Self::Named(config) | Self::Active(config) => config,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub models: Vec<ModelConfig>,
@@ -76,40 +97,26 @@ impl Settings {
             .and_then(|(kind, _)| AppKind::parse(kind))
     }
 
-    pub fn candidate_models(&self) -> Vec<ModelConfig> {
-        let mut list: Vec<ModelConfig> = Vec::new();
-        if let Some(active) = self.active_model() {
-            list.push(active.clone());
-        }
-        if !self.auto_failover {
-            return list;
-        }
-        for model in &self.models {
-            if self.active_model_id == Some(model.id) {
-                continue;
-            }
-            list.push(model.clone());
-        }
-        list
-    }
-
-    /// 请求里带的模型名决定本次的候选上游：
-    /// - 网关别名（`aiStart`）与 `auto`（不区分大小写）→ 现有逻辑，见 [`Self::candidate_models`]；
-    /// - 命中模型列表里的某个显示名（不区分大小写）→ **只调用该模型**，自动切换对它无效；
-    /// - 其余（含未指定、未命中）→ 现有逻辑。
-    pub fn candidates_for(&self, requested: Option<&str>) -> Vec<ModelConfig> {
-        let Some(needle) = requested
+    /// 解析本次请求的上游目标（一次请求只打一个上游，没有候选循环）：
+    /// - 请求模型名命中某个模型的显示名（不区分大小写）→ 该模型（锁定，失败不参与切换）；
+    /// - 别名 aiStart/auto（不区分大小写）、未指定、未命中 → 当前模型；
+    /// - 没有可用模型 → None（调用方报错）。
+    pub fn resolve_target(&self, requested: Option<&str>) -> Option<ResolvedTarget> {
+        if let Some(needle) = requested
             .map(str::trim)
             .filter(|name| !name.is_empty() && !crate::gateway::is_auto_alias(name))
-        else {
-            return self.candidate_models();
-        };
-        let needle = needle.to_lowercase();
-        self.models
-            .iter()
-            .find(|model| model.name.to_lowercase() == needle)
-            .map(|model| vec![model.clone()])
-            .unwrap_or_else(|| self.candidate_models())
+        {
+            let needle = needle.to_lowercase();
+            if let Some(model) = self
+                .models
+                .iter()
+                .find(|model| model.name.to_lowercase() == needle)
+            {
+                return Some(ResolvedTarget::Named(model.clone()));
+            }
+            // 未命中 → 当前模型，与旧候选逻辑一致。
+        }
+        self.active_model().cloned().map(ResolvedTarget::Active)
     }
 
     fn next_model_id(&self) -> i64 {

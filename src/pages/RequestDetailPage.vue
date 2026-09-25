@@ -182,7 +182,11 @@ function goBack(): void {
                 </Badge>
                 <Badge v-else variant="destructive">失败</Badge>
                 <Badge v-if="record.failover" variant="outline">
-                  自动切换{{ failoverFrom ? ` · 从 ${failoverFrom}` : "" }}
+                  {{
+                    record.ok
+                      ? `自动切换${failoverFrom ? ` · 从 ${failoverFrom}` : ""}`
+                      : "已触发自动切换"
+                  }}
                 </Badge>
               </div>
             </div>
@@ -321,6 +325,11 @@ function goBack(): void {
                 :raw="requestRaw.text"
                 label="请求原文"
                 :truncated="requestRaw.truncated"
+              />
+              <RawPayload
+                v-if="payload.inboundHeaders"
+                :raw="payload.inboundHeaders"
+                label="请求 Header（原样保存）"
               />
               <RawPayload
                 v-if="payload.upstreamResponse"

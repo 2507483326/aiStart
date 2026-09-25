@@ -184,6 +184,7 @@ CREATE TABLE IF NOT EXISTS usage_payload (
   usage_payload_id   INTEGER PRIMARY KEY AUTOINCREMENT,  -- 报文行号，自增
   usage_detail_id    INTEGER NOT NULL,   -- 关联明细行 usage_detail.usage_detail_id（松引用）
   inbound_request    TEXT,               -- 客户端发来的原始请求体（原生协议 JSON）；未捕获为 NULL
+  inbound_headers    TEXT,               -- 客户端发来的 HTTP header（JSON 对象，原样保存不脱敏）；未捕获为 NULL
   upstream_request   TEXT,               -- 提示词注入后实际发往上游的请求体（上游协议原生形状）；未捕获为 NULL
   upstream_response  TEXT,               -- 上游原生响应：非流式=上游返回原文；流式=拼装后转回上游协议原生形状
   request_truncated  INTEGER NOT NULL DEFAULT 0,  -- 1=入站请求体因超上限被截断

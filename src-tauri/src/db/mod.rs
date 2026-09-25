@@ -9,7 +9,7 @@ use crate::error::{AppError, AppResult};
 pub const SCHEMA_SQL: &str = include_str!("schema.sql");
 
 /// 当前 schema 版本号，写入 schema_meta.db_schema_version。
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 static DB: OnceLock<Mutex<Connection>> = OnceLock::new();
 
@@ -61,6 +61,8 @@ pub fn init(dir: &Path) -> AppResult<()> {
         "upstream_request_truncated",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    // v9：入站 HTTP header 原样入库（用户确认不脱敏）。
+    ensure_column(&connection, "usage_payload", "inbound_headers", "TEXT")?;
 
     // v7：app_version_records 由「追加式历史」改为「每个应用一行」。旧表先改名让 schema.sql
     // 建出新结构，数据在 DDL 之后搬运（见 copy_legacy_app_version_records）。

@@ -2,7 +2,8 @@ use serde_json::{json, Value};
 
 use crate::commands::models::parse_model_ids;
 use crate::domain::canonical::{
-    CanonicalOnly, CanonicalRequest, MaxTokensField, RequestBody, SystemPrompt,
+    CanonicalOnly, CanonicalRequest, CanonicalResponseFormat, CanonicalToolChoice, MaxTokensField,
+    RequestBody, SystemPrompt,
 };
 use crate::domain::model::{ModelConfig, ModelFormat};
 use crate::providers::normalizer::{BlockNormalizer, StreamVerdict};
@@ -50,8 +51,7 @@ fn urls_handle_base_with_and_without_v1_suffix() {
     );
 }
 
-#[test]
-fn candidate_models_puts_active_first_and_only_expands_when_failover_is_on() {
+fn resolve_target_settings() -> Settings {
     let mut settings = Settings::default();
     for name in ["A", "B", "C"] {
         settings.upsert(crate::domain::model::ModelInput {
@@ -65,73 +65,105 @@ fn candidate_models_puts_active_first_and_only_expands_when_failover_is_on() {
         });
     }
     settings.active_model_id = Some(2);
-
-    settings.auto_failover = false;
-    let single = settings.candidate_models();
-    assert_eq!(single.len(), 1);
-    assert_eq!(single[0].name, "B");
-
-    settings.auto_failover = true;
-    let all = settings.candidate_models();
-    let names: Vec<&str> = all.iter().map(|m| m.name.as_str()).collect();
-    assert_eq!(names, vec!["B", "A", "C"]);
+    settings
 }
 
 #[test]
-fn candidates_for_routes_aliases_to_the_usual_logic_and_named_models_to_themselves() {
-    let mut settings = Settings::default();
-    for name in ["A", "B", "C"] {
-        settings.upsert(crate::domain::model::ModelInput {
-            id: None,
-            name: name.into(),
-            format: ModelFormat::OpenaiCompletions,
-            base_url: "https://example.com/v1".into(),
-            api_key: String::new(),
-            model: name.into(),
-            supports_1m: false,
-        });
-    }
-    settings.active_model_id = Some(2);
+fn resolve_target_sends_aliases_and_misses_to_the_active_model() {
+    let mut settings = resolve_target_settings();
     settings.auto_failover = true;
 
-    let names = |list: Vec<ModelConfig>| {
-        list.into_iter()
-            .map(|model| model.name)
-            .collect::<Vec<String>>()
+    let label = |resolved: &crate::settings::ResolvedTarget| match resolved {
+        crate::settings::ResolvedTarget::Named(model) => format!("named:{}", model.name),
+        crate::settings::ResolvedTarget::Active(model) => format!("active:{}", model.name),
     };
 
-    // 网关别名与 auto（任意大小写、带空白）→ 现有逻辑：当前模型优先，其后依次是其余模型。
-    for alias in [
-        "aiStart", "aistart", "AISTART", "auto", "Auto", "AUTO", "  auto  ", "  aiStart ",
+    // 网关别名与 auto（任意大小写、带空白）、未指定、空白、未命中 → 当前模型，可参与切换。
+    for requested in [
+        Some("aiStart"),
+        Some("aistart"),
+        Some("AISTART"),
+        Some("auto"),
+        Some("Auto"),
+        Some("AUTO"),
+        Some("  auto  "),
+        Some("  aiStart "),
+        None,
+        Some("   "),
+        Some("不存在"),
     ] {
+        let resolved = settings
+            .resolve_target(requested)
+            .expect("应解析到当前模型");
         assert_eq!(
-            names(settings.candidates_for(Some(alias))),
-            vec!["B", "A", "C"],
-            "{alias:?} 应走现有逻辑"
+            label(&resolved),
+            "active:B",
+            "{requested:?} 应落到当前模型"
         );
     }
-    // 未指定 / 空 → 现有逻辑。
-    assert_eq!(names(settings.candidates_for(None)), vec!["B", "A", "C"]);
-    assert_eq!(names(settings.candidates_for(Some("   "))), vec!["B", "A", "C"]);
-    // 未命中模型列表 → 现有逻辑。
-    assert_eq!(
-        names(settings.candidates_for(Some("不存在"))),
-        vec!["B", "A", "C"]
-    );
+}
 
-    // 命中模型列表里的显示名（不区分大小写）→ 只调用该模型，自动切换对它无效。
-    for name in ["C", "c", "  C  "] {
-        assert_eq!(
-            names(settings.candidates_for(Some(name))),
-            vec!["C"],
-            "{name:?} 应只调用 C"
-        );
+#[test]
+fn resolve_target_locks_named_models_and_requires_an_enabled_model() {
+    let settings = resolve_target_settings();
+
+    // 命中显示名（不区分大小写、带空白）→ 锁定该模型：只调用它，失败不触发切换。
+    for name in ["C", "c", "  C  ", "A", "  a  "] {
+        let resolved = settings.resolve_target(Some(name)).expect("点名应命中");
+        assert!(resolved.is_named(), "{name:?} 应识别为点名");
+        match resolved {
+            crate::settings::ResolvedTarget::Named(model) => {
+                let expected = name.trim().to_uppercase();
+                assert_eq!(model.name, expected, "{name:?} 应锁定到 {expected}");
+            }
+            _ => unreachable!(),
+        }
     }
 
-    // 关掉自动切换同样成立（本来就是单模型）。
-    settings.auto_failover = false;
-    assert_eq!(names(settings.candidates_for(Some("A"))), vec!["A"]);
-    assert_eq!(names(settings.candidates_for(Some("auto"))), vec!["B"]);
+    // 没有任何模型 → None，调用方报错。
+    let empty = Settings::default();
+    assert!(empty.resolve_target(Some("auto")).is_none());
+    assert!(empty.resolve_target(Some("A")).is_none());
+
+    // 点名命中时 auto_failover 开关无关紧要：锁定语义不受影响。
+    let mut locked = resolve_target_settings();
+    locked.auto_failover = false;
+    assert!(locked.resolve_target(Some("C")).is_some());
+    assert!(locked.resolve_target(Some("auto")).is_some());
+}
+
+#[test]
+fn failover_qualifies_only_when_auto_on_unnamed_and_retryable() {
+    use crate::gateway::failover::qualifies;
+
+    // 全部满足才触发。
+    assert!(qualifies(true, false, true));
+    // 关闭自动切换 / 点名模型 / 不可重试的失败（4xx 中换模型救不了的）都不触发。
+    assert!(!qualifies(false, false, true));
+    assert!(!qualifies(true, true, true));
+    assert!(!qualifies(true, false, false));
+    // 关闭自动切换时，其余条件再齐也不触发。
+    assert!(!qualifies(false, true, false));
+}
+
+#[test]
+fn probe_order_skips_the_failed_model_and_may_switch_guards_manual_changes() {
+    use crate::gateway::failover::{may_switch, probe_order};
+
+    let mut settings = resolve_target_settings(); // A(1) B(2) C(3)，当前 B
+    settings.auto_failover = true;
+
+    // 探测顺序 = 模型列表原顺序，跳过刚失败的模型。
+    assert_eq!(probe_order(&settings.models, 2), vec![1, 3]);
+    assert_eq!(probe_order(&settings.models, 1), vec![2, 3]);
+    assert_eq!(probe_order(&settings.models, 3), vec![1, 2]);
+    // 失败的模型不在列表里（如已删除）→ 不跳过任何模型，全部可探测。
+    assert_eq!(probe_order(&settings.models, 99), vec![1, 2, 3]);
+
+    // 切换守卫：当前模型仍是刚失败的那个才允许切；用户手动换过就放弃。
+    assert!(may_switch(Some(2), 2));
+    assert!(!may_switch(Some(3), 2));
+    assert!(!may_switch(None, 2));
 }
 
 #[test]
@@ -665,7 +697,7 @@ fn protocol_profiles_cover_every_canonical_field() {
         system: Some(SystemPrompt::Text("s".into())),
         messages: Vec::new(),
         tools: Some(Vec::new()),
-        tool_choice: Some(json!("auto")),
+        tool_choice: Some(CanonicalToolChoice::Auto),
         temperature: Some(0.0),
         top_p: Some(0.0),
         stop_sequences: Some(vec!["s".into()]),
@@ -673,7 +705,7 @@ fn protocol_profiles_cover_every_canonical_field() {
         top_k: Some(1.0),
         store: Some(true),
         metadata: Some(json!({})),
-        response_format: Some(json!({ "type": "text" })),
+        response_format: Some(CanonicalResponseFormat::Text),
         parallel_tool_calls: Some(true),
         reasoning_effort: Some("low".into()),
         service_tier: Some("auto".into()),
@@ -912,6 +944,11 @@ fn canonical_fields_are_forwarded_per_protocol() {
                 "type": "json_schema",
                 "json_schema": { "name": "r", "schema": { "type": "object" }, "strict": true }
             },
+            "tool_choice": { "type": "function", "function": { "name": "lookup" } },
+            "tools": [{
+                "type": "function",
+                "function": { "name": "lookup", "parameters": { "type": "object" } }
+            }],
             "parallel_tool_calls": false,
             "reasoning_effort": "high",
             "stop": ["END"],
@@ -937,6 +974,7 @@ fn canonical_fields_are_forwarded_per_protocol() {
     assert_eq!(encoded["parallel_tool_calls"], false);
     assert_eq!(encoded["reasoning_effort"], "high");
     assert_eq!(encoded["response_format"]["type"], "json_schema");
+    assert_eq!(encoded["tool_choice"]["function"]["name"], "lookup");
     assert_eq!(encoded["stop"][0], "END");
     assert_eq!(encoded["max_completion_tokens"], 256);
     assert!(encoded.get("max_tokens").is_none());
@@ -954,9 +992,13 @@ fn canonical_fields_are_forwarded_per_protocol() {
     assert_eq!(encoded["reasoning"]["effort"], "high");
     assert_eq!(encoded["text"]["format"]["type"], "json_schema");
     assert_eq!(encoded["text"]["format"]["name"], "r");
+    assert_eq!(encoded["text"]["format"]["strict"], true);
+    assert_eq!(encoded["tool_choice"], json!({ "type": "function", "name": "lookup" }));
     assert_eq!(encoded["store"], true);
     assert_eq!(encoded["parallel_tool_calls"], false);
     assert_eq!(encoded["temperature"], 0.2);
+    // A5 的另一半：OpenAI 系协议之间词表相同，照旧原样带过去（只有 Anthropic 上游丢弃）。
+    assert_eq!(encoded["service_tier"], "priority");
     for key in [
         "response_format",
         "reasoning_effort",
@@ -978,6 +1020,8 @@ fn canonical_fields_are_forwarded_per_protocol() {
     assert_eq!(encoded["output_config"]["effort"], "high");
     assert_eq!(encoded["output_config"]["format"]["type"], "json_schema");
     assert_eq!(encoded["output_config"]["format"]["schema"]["type"], "object");
+    assert_eq!(encoded["tool_choice"]["type"], "tool");
+    assert_eq!(encoded["tool_choice"]["name"], "lookup");
     assert_eq!(encoded["tool_choice"]["disable_parallel_tool_use"], true);
     assert_eq!(encoded["metadata"]["user_id"], "u1");
     assert_eq!(encoded["stop_sequences"][0], "END");
@@ -987,10 +1031,254 @@ fn canonical_fields_are_forwarded_per_protocol() {
         "parallel_tool_calls",
         "store",
         "top_k",
+        // A5：`service_tier` 的取值是各家自己的词表（这里入站是 OpenAI 的 "priority"），
+        // 原样发给 Anthropic 会被按非法取值 400 掉整个请求。
+        "service_tier",
         "_canonical",
     ] {
         assert!(encoded.get(key).is_none(), "{key} 不该出现在 Anthropic 报文里");
     }
+}
+
+/// A5 的代价写成测试，免得日后被当 bug 查：`Dropped` 在 Anthropic **本协议**的编码路径上
+/// 同样生效，所以 Anthropic 客户端自己带的 `service_tier` 也会被删（跨协议重建与同协议补写
+/// 共用同一个 `encode_request`，不像两个 OpenAI 协议有独立的直通路径）。只要该参数在
+/// Anthropic 侧的存在性与取值词表还没被实测确认，丢它换「绝不 400」就是认下的取舍
+/// （见 `docs/forwarding.md` §8 批 4）。日后实测确认后，改法是把 `Slot::Dropped` 换成
+/// 值映射并改写本测试——**不要**改回 `Same`。
+#[test]
+fn anthropic_clients_lose_their_own_service_tier_until_the_parameter_is_verified() {
+    let inbound = provider_for(ModelFormat::AnthropicMessages)
+        .decode_request(json!({
+            "model": "claude-sonnet-5",
+            "max_tokens": 64,
+            "messages": [{ "role": "user", "content": "hi" }],
+            "service_tier": "auto",
+        }))
+        .unwrap();
+    let encoded = provider_for(ModelFormat::AnthropicMessages)
+        .encode_request(
+            &model(ModelFormat::AnthropicMessages, "https://api.anthropic.com"),
+            &inbound,
+        )
+        .unwrap();
+    assert!(
+        encoded.get("service_tier").is_none(),
+        "A5 之下连 Anthropic 自带的 service_tier 也会被丢弃"
+    );
+    // 代价范围就这一个键：同一条报文里的其余字段照常落地。
+    assert_eq!(encoded["max_tokens"], 64);
+    assert_eq!(encoded["messages"].as_array().map(Vec::len), Some(1));
+}
+
+/// Anthropic 入站的隐藏字段跨协议不丢（A2）：output_config.format → response_format、
+/// thinking 预算 → reasoning_effort（有损映射）、`{type:"any"}` 的 tool_choice → Responses
+/// 不再被 `_ => None` 静默丢弃（A3）。
+#[test]
+fn anthropic_inbound_hidden_fields_survive_cross_protocol() {
+    // Anthropic 入站：结构化输出 + thinking 预算 + 强制任意工具
+    let inbound = provider_for(ModelFormat::AnthropicMessages)
+        .decode_request(json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 1024,
+            "messages": [{ "role": "user", "content": "hi" }],
+            "output_config": {
+                "effort": "medium",
+                "format": { "type": "json_schema", "schema": { "type": "object" } }
+            },
+            "thinking": { "type": "enabled", "budget_tokens": 4096 },
+            "tool_choice": { "type": "any" }
+        }))
+        .unwrap();
+
+    // 抬升结果先验一遍：format/effort/thinking 都在规范字段上
+    assert_eq!(inbound.body().reasoning_effort.as_deref(), Some("medium"));
+    match &inbound.body().response_format {
+        Some(CanonicalResponseFormat::JsonSchema { schema, .. }) => {
+            assert_eq!(schema["type"], "object");
+        }
+        other => panic!("response_format 应该是 JsonSchema，实际 {other:?}"),
+    }
+    // effort 显式档位优先于 thinking 预算（避免两套口径打架）
+
+    // → Responses 出站：format 进 text.format，tool_choice 的 any → required
+    let encoded = provider_for(ModelFormat::OpenaiResponses)
+        .encode_request(
+            &model(ModelFormat::OpenaiResponses, "https://api.openai.com/v1"),
+            &inbound,
+        )
+        .unwrap();
+    assert_eq!(encoded["text"]["format"]["type"], "json_schema");
+    assert_eq!(encoded["text"]["format"]["schema"]["type"], "object");
+    assert_eq!(encoded["tool_choice"], json!("required"));
+
+    // → Completions 出站：any → required，format 原形状透传
+    let encoded = provider_for(ModelFormat::OpenaiCompletions)
+        .encode_request(
+            &model(ModelFormat::OpenaiCompletions, "https://api.openai.com/v1"),
+            &inbound,
+        )
+        .unwrap();
+    assert_eq!(encoded["tool_choice"], "required");
+    assert_eq!(encoded["response_format"]["type"], "json_schema");
+
+    // thinking 预算式（没有 output_config.effort）→ 档位映射：4k → low
+    let inbound = provider_for(ModelFormat::AnthropicMessages)
+        .decode_request(json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 1024,
+            "messages": [{ "role": "user", "content": "hi" }],
+            "thinking": { "type": "enabled", "budget_tokens": 4096 }
+        }))
+        .unwrap();
+    assert_eq!(inbound.body().reasoning_effort.as_deref(), Some("low"));
+    // 跨协议到 Responses 时档位落在 reasoning.effort
+    let encoded = provider_for(ModelFormat::OpenaiResponses)
+        .encode_request(
+            &model(ModelFormat::OpenaiResponses, "https://api.openai.com/v1"),
+            &inbound,
+        )
+        .unwrap();
+    assert_eq!(encoded["reasoning"]["effort"], "low");
+
+    // 同协议（Anthropic → Anthropic）：thinking / output_config 原样保留（不删、不叠档位）
+    let client = json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 1024,
+        "messages": [{ "role": "user", "content": "hi" }],
+        "thinking": { "type": "enabled", "budget_tokens": 4096 },
+        "tool_choice": { "type": "auto", "disable_parallel_tool_use": true }
+    });
+    let inbound = provider_for(ModelFormat::AnthropicMessages)
+        .decode_request(client.clone())
+        .unwrap();
+    let encoded = provider_for(ModelFormat::AnthropicMessages)
+        .encode_request(
+            &model(ModelFormat::AnthropicMessages, "https://api.anthropic.com"),
+            &inbound,
+        )
+        .unwrap();
+    assert_eq!(
+        encoded["thinking"],
+        json!({ "type": "enabled", "budget_tokens": 4096 })
+    );
+    assert!(encoded.get("output_config").is_none());
+    assert_eq!(
+        encoded["tool_choice"],
+        json!({ "type": "auto", "disable_parallel_tool_use": true })
+    );
+}
+
+/// http(s) 图片地址跨协议不再静默丢块（A4）：Completions / Responses 入站的 image_url
+/// 收成 url source，两条出站路径都能还原。
+#[test]
+fn http_image_urls_survive_cross_protocol() {
+    let url = "https://example.com/cat.png";
+    let inbound = provider_for(ModelFormat::OpenaiCompletions)
+        .decode_request(json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "看图" },
+                    { "type": "image_url", "image_url": { "url": url } }
+                ]
+            }]
+        }))
+        .unwrap();
+    assert_eq!(
+        inbound.raw()["messages"][0]["content"][1]["source"],
+        json!({ "type": "url", "url": url })
+    );
+
+    // → Anthropic 出站：url source 原样落到 image 块
+    let encoded = provider_for(ModelFormat::AnthropicMessages)
+        .encode_request(
+            &model(ModelFormat::AnthropicMessages, "https://api.anthropic.com"),
+            &inbound,
+        )
+        .unwrap();
+    assert_eq!(encoded["messages"][0]["content"][1]["source"]["type"], "url");
+    assert_eq!(encoded["messages"][0]["content"][1]["source"]["url"], url);
+
+    // → Responses 出站：url source 还原成 input_image
+    let encoded = provider_for(ModelFormat::OpenaiResponses)
+        .encode_request(
+            &model(ModelFormat::OpenaiResponses, "https://api.openai.com/v1"),
+            &inbound,
+        )
+        .unwrap();
+    assert_eq!(encoded["input"][0]["content"][1]["type"], "input_image");
+    assert_eq!(encoded["input"][0]["content"][1]["image_url"], url);
+
+    // Responses 入站同样收 url source
+    let inbound = provider_for(ModelFormat::OpenaiResponses)
+        .decode_request(json!({
+            "model": "gpt-4o",
+            "input": [{
+                "role": "user",
+                "content": [{ "type": "input_image", "image_url": url }]
+            }]
+        }))
+        .unwrap();
+    assert_eq!(
+        inbound.raw()["messages"][0]["content"][0]["source"],
+        json!({ "type": "url", "url": url })
+    );
+}
+
+/// 规范级校验（A6）：n = 0 与 n > 1 都拒绝；非法的 tool_choice / response_format 形状
+/// 在入站反序列化时就报错，而不是转发到上游才炸（A3 的类型化收口）。
+#[test]
+fn invalid_n_and_malformed_shapes_are_rejected_at_inbound() {
+    // n = 0 语义非法
+    let parsed = request(json!({
+        "model": "m",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "n": 0
+    }));
+    assert!(parsed.validate().is_err());
+
+    // n > 1 多候选
+    let parsed = request(json!({
+        "model": "m",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "n": 2
+    }));
+    assert!(parsed.validate().is_err());
+
+    // 显式 null 视为「未指定」，不能 400
+    let parsed = request(json!({
+        "model": "m",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "tool_choice": null,
+        "response_format": null
+    }));
+    assert!(parsed.validate().is_ok());
+
+    // tool_choice 未知臂 / 嵌套残缺
+    assert!(CanonicalRequest::parse(json!({
+        "model": "m",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "tool_choice": { "type": "any" }
+    }))
+    .is_err());
+    assert!(provider_for(ModelFormat::OpenaiCompletions)
+        .decode_request(json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tool_choice": { "type": "function" }
+        }))
+        .is_err());
+
+    // response_format 未知 type
+    assert!(provider_for(ModelFormat::OpenaiCompletions)
+        .decode_request(json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "response_format": { "type": "yaml" }
+        }))
+        .is_err());
 }
 
 /// 取某协议的同协议直通报文（测试辅助）。
@@ -1334,6 +1622,19 @@ fn canonical_responses_are_re_encoded_for_openai_clients() {
     assert_eq!(responses["status"], "completed");
 }
 
+/// 全局设置库整个测试进程只有一份（`settings::init` 的 OnceLock），而 `init` 是
+/// 「读盘 → 覆盖内存里的设置 → 落盘」。两个用例并发跑时，B 的读盘可能落在 A 落盘之前，
+/// B 随后的落盘就把 A 的写入抹掉——实测表现为 `applied` 绑定凭空消失、`sqlite_persistence_round_trips`
+/// 偶发失败。凡是 init/mutate 全局设置的用例都拿这把锁串起来（纯测试隔离，
+/// 生产侧 `settings::init` 只在启动时调一次，不存在这个交错）。
+static SETTINGS_DB_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_settings_db() -> std::sync::MutexGuard<'static, ()> {
+    SETTINGS_DB_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 fn sqlite_persistence_round_trips() {
     use crate::domain::app::AppKind;
@@ -1341,6 +1642,7 @@ fn sqlite_persistence_round_trips() {
     use crate::usage::{self, UsageRecord};
     use crate::{events, settings, updates};
 
+    let _settings_db = lock_settings_db();
     let dir = std::env::temp_dir().join(format!("ai-start-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
 
@@ -1467,6 +1769,7 @@ fn sqlite_persistence_round_trips() {
         },
         Some(&usage::UsagePayload {
             inbound_request: Some("{\"hello\":1}".into()),
+            inbound_headers: Some("{\"x-api-key\":[\"claude-desktop\"]}".into()),
             upstream_request: Some("{\"system\":\"injected\"}".into()),
             upstream_response: Some("{\"ok\":true}".into()),
             stream: false,
@@ -1515,6 +1818,7 @@ fn sqlite_persistence_round_trips() {
         },
         Some(&usage::UsagePayload {
             inbound_request: Some("{\"day\":\"first\"}".into()),
+            inbound_headers: None,
             upstream_request: None,
             upstream_response: None,
             stream: false,
@@ -1554,6 +1858,7 @@ fn sqlite_persistence_round_trips() {
         },
         Some(&usage::UsagePayload {
             inbound_request: Some("x".repeat(300 * 1024)),
+            inbound_headers: None,
             upstream_request: None,
             upstream_response: None,
             stream: true,
@@ -1593,6 +1898,7 @@ fn sqlite_persistence_round_trips() {
             },
             Some(&usage::UsagePayload {
                 inbound_request: Some("{}".into()),
+                inbound_headers: None,
                 upstream_request: None,
                 upstream_response: None,
                 stream: false,
@@ -1878,6 +2184,7 @@ fn proxy_url_is_validated_before_it_reaches_the_network() {
 fn loopback_targets_bypass_the_proxy_and_requests_say_so() {
     use crate::providers::request_proxies_through;
 
+    let _settings_db = lock_settings_db();
     // 独立临时库：别的用例可能已经动过全局设置，这里从头初始化一份干净的
     let dir = std::env::temp_dir().join(format!("ai-start-test-proxy-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -2055,4 +2362,142 @@ async fn sse_frames_keep_the_upstream_bytes_intact() {
         encode_channel_event(&frames[2].event, &frames[2].data),
         frames[2].raw
     );
+}
+
+/// 多字节字符（CJK）被 TCP 分帧从中间切开时不能变成乱码：按 chunk 解码会吞掉半个字符，
+/// 按「凑齐一整行再解码」才能保真（B2）。
+#[tokio::test]
+async fn sse_frames_decode_whole_lines_so_cjk_survives_chunk_boundaries() {
+    use crate::gateway::sse::parse_sse_stream;
+    use futures_util::StreamExt;
+
+    let line = "data: {\"id\":1,\"choices\":[{\"delta\":{\"content\":\"你好世界，测试\"}}]}\n\n";
+    let bytes = line.as_bytes();
+    // 每次只给 3 个字节：多个 UTF-8 字符与 JSON 结构都被切开。
+    let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> = bytes
+        .chunks(3)
+        .map(|chunk| Ok::<_, reqwest::Error>(bytes::Bytes::copy_from_slice(chunk)))
+        .collect();
+    let frames: Vec<_> = parse_sse_stream(futures_util::stream::iter(chunks))
+        .map(|frame| frame.expect("frame should parse"))
+        .collect()
+        .await;
+
+    assert_eq!(frames.len(), 1);
+    // 正文一字不差
+    let payload: Value = serde_json::from_str(&frames[0].data).expect("joined data is JSON");
+    assert_eq!(
+        payload["choices"][0]["delta"]["content"],
+        "你好世界，测试"
+    );
+    // 直通原文同样保真
+    assert_eq!(frames[0].raw, line);
+
+    // \r\n 行尾跨 chunk 也要归一（\r 在上一个 chunk 结尾、\n 在下一个开头）
+    let crlf_chunks: Vec<Result<bytes::Bytes, reqwest::Error>> = vec![
+        Ok(bytes::Bytes::from_static(b"data: {\"a\":1}\r")),
+        Ok(bytes::Bytes::from_static(b"\n\r\ndata: [DONE]\r\n")),
+    ];
+    let frames: Vec<_> = parse_sse_stream(futures_util::stream::iter(crlf_chunks))
+        .map(|frame| frame.expect("frame should parse"))
+        .collect()
+        .await;
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames[0].data, "{\"a\":1}");
+    assert_eq!(frames[0].raw, "data: {\"a\":1}\n\n");
+    assert_eq!(frames[1].data, "[DONE]");
+}
+
+/// 首帧限时（B1）：上游接受了请求、回了响应头，却一直不吐第一个字节时，等待必须被掐断——
+/// 否则流永久悬住，客户端干等、明细永远落不了库。超时以 `Err` 项进流（不是直接中断），
+/// 才能和上游断流走同一条处理路径：记账 + 跨协议时报错给客户端。
+#[tokio::test]
+async fn first_frame_timeout_gives_up_when_the_upstream_never_speaks() {
+    use crate::gateway::sse::{first_frame_timeout, SseFrame};
+    use futures_util::StreamExt;
+    use std::time::Duration;
+
+    let silent = futures_util::stream::pending::<crate::error::AppResult<SseFrame>>();
+    let items: Vec<_> = first_frame_timeout(silent, Duration::from_millis(30))
+        .collect()
+        .await;
+
+    assert_eq!(items.len(), 1, "超时只该产出一个错误项然后收流");
+    let message = items[0].as_ref().expect_err("超时必须是 Err").to_string();
+    assert!(message.contains("首帧"), "{message}");
+}
+
+/// 限时只针对首帧：第一帧到了就撤掉（长生成合法，加总超时会把正常输出长文的流掐断）。
+#[tokio::test]
+async fn first_frame_timeout_stops_policing_after_the_first_frame() {
+    use crate::error::AppError;
+    use crate::gateway::sse::{first_frame_timeout, SseFrame};
+    use futures_util::StreamExt;
+    use std::time::Duration;
+
+    // 首帧立刻到，第二帧拖过限时之后才到。
+    let slow_but_alive = async_stream::stream! {
+        yield Ok::<_, AppError>(SseFrame {
+            event: String::new(),
+            data: "{\"a\":1}".into(),
+            raw: "data: {\"a\":1}\n\n".into(),
+        });
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        yield Ok::<_, AppError>(SseFrame {
+            event: String::new(),
+            data: "{\"a\":2}".into(),
+            raw: "data: {\"a\":2}\n\n".into(),
+        });
+    };
+    let items: Vec<_> = first_frame_timeout(slow_but_alive, Duration::from_millis(30))
+        .collect()
+        .await;
+
+    assert_eq!(items.len(), 2, "首帧之后不再限时");
+    assert_eq!(items[1].as_ref().expect("frame 应通过").data, "{\"a\":2}");
+    assert_eq!(items[1].as_ref().expect("frame 应通过").raw, "data: {\"a\":2}\n\n");
+}
+
+/// C1：Completions 上游每个分片都带同一条补全的 `id`（`chatcmpl-…`），要捕获进记账状态。
+/// 不读它的话，落库的 `upstream_response.id` 永远是网关合成的 `msg_<uuid>`——对不上上游侧的日志，
+/// 而跨协议（Anthropic / Responses 入站）时这个 id 还会直接发给客户端。
+#[test]
+fn completions_stream_captures_the_upstream_chunk_id() {
+    let provider = provider_for(ModelFormat::OpenaiCompletions);
+    let config = model(ModelFormat::OpenaiCompletions, "https://api.openai.com/v1");
+    let mut state = StreamState::new("gpt-4o");
+    let synthesized = state.message_id.clone();
+
+    let events = provider
+        .decode_stream_event(
+            &config,
+            "",
+            &json!({
+                "id": "chatcmpl-abc123",
+                "object": "chat.completion.chunk",
+                "choices": [{ "delta": { "content": "hi" } }]
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+    assert_ne!(state.message_id, synthesized, "id 该换成上游分片的 id");
+    assert_eq!(state.message_id, "chatcmpl-abc123");
+    // 第一个正文分片会带出规范 message_start，客户端与落库读的都是这里的 id
+    let start = events
+        .iter()
+        .find(|event| event.data["type"] == "message_start")
+        .expect("首个正文分片应带出 message_start");
+    assert_eq!(start.data["message"]["id"], "chatcmpl-abc123");
+
+    // 分片没带 id（或带空串）时保留既有值，不要写成空
+    provider
+        .decode_stream_event(
+            &config,
+            "",
+            &json!({ "id": "", "choices": [{ "delta": { "content": "!" } }] }),
+            &mut state,
+        )
+        .unwrap();
+    assert_eq!(state.message_id, "chatcmpl-abc123");
 }

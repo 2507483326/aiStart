@@ -1,7 +1,8 @@
 use serde_json::{json, Map, Value};
 
 use crate::domain::canonical::{
-    blocks_to_text, content_to_text, CanonicalRequest, ContentBlock, MaxTokensField, SystemPrompt,
+    blocks_to_text, content_to_text, CanonicalRequest, CanonicalToolChoice, ContentBlock,
+    MaxTokensField, SystemPrompt,
 };
 use crate::domain::model::{ModelConfig, ModelFormat};
 use crate::error::{AppError, AppResult};
@@ -11,10 +12,18 @@ use super::{ModelProvider, SseEvent, StreamState, WireState};
 
 pub struct OpenaiCompletionsProvider;
 
-/// 上游承载思考的字段按协议表依次尝试（DeepSeek 原生用 `reasoning_content`，OpenRouter 系用 `reasoning`）。
+/// 上游承载思考的字段名，按优先级（DeepSeek 原生用 `reasoning_content`，OpenRouter 系用 `reasoning`；
+/// 不带它俩的上游还会把思考塞在 `reasoning_details[]` 里，见 `reasoning_details_text`）。
+///
+/// C2：这几个名字原先挂在 `wire::ProtocolProfile` 上，但全链路只有本文件真正读它们——
+/// Anthropic 的思考是内容块类型（`thinking`），Responses 的思考由事件名区分
+/// （`response.reasoning_summary_text.delta`），都不存在「按 JSON 字段名找思考」这回事。
+/// 表里那两条是死数据，还会让人误以为它们在约束三个协议，于是收窄成本文件自己的常量。
+const REASONING_FIELDS: &[&str] = &["reasoning_content", "reasoning"];
+
+/// 上游承载思考的字段按协议表依次尝试。
 fn reasoning_text(value: &Value) -> Option<&str> {
-    wire::profile(ModelFormat::OpenaiCompletions)
-        .reasoning_fields
+    REASONING_FIELDS
         .iter()
         .find_map(|field| value.get(*field).and_then(Value::as_str))
         .filter(|text| !text.is_empty())
@@ -96,21 +105,36 @@ fn encode_tools(tools: &[crate::domain::canonical::ToolDef]) -> Value {
     )
 }
 
-fn encode_tool_choice(choice: &Value) -> Option<Value> {
-    let kind = choice.get("type").and_then(Value::as_str)?;
-    Some(match kind {
-        "auto" => Value::String("auto".into()),
-        "any" => Value::String("required".into()),
-        "none" => Value::String("none".into()),
-        "tool" => {
-            let name = choice
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
+/// 规范 `tool_choice`（类型化）→ Completions 写法：字符串同名，指定工具摊开成嵌套结构。
+fn encode_tool_choice(choice: &CanonicalToolChoice) -> Value {
+    match choice {
+        CanonicalToolChoice::Auto => Value::String("auto".into()),
+        CanonicalToolChoice::None => Value::String("none".into()),
+        CanonicalToolChoice::Required => Value::String("required".into()),
+        CanonicalToolChoice::Tool { name } => {
             json!({ "type": "function", "function": { "name": name } })
         }
-        _ => Value::String("auto".into()),
-    })
+    }
+}
+
+/// Completions 的 `tool_choice` → 规范 JSON（供类型化反序列化收口）。
+/// 字符串三臂同名；嵌套写法摊平。残缺/未知臂返回 None，调用方按「形状非法」报错。
+fn canonical_tool_choice(value: &Value) -> Option<Value> {
+    match value {
+        Value::String(kind) => match kind.as_str() {
+            "auto" | "none" | "required" => Some(Value::String(kind.clone())),
+            _ => None,
+        },
+        Value::Object(object) => match object.get("type").and_then(Value::as_str) {
+            Some("function") => object
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .map(|name| json!({ "type": "function", "function": { "name": name } })),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// 客户端有没有给出输出上限（`max_tokens` / `max_completion_tokens`；`null` 或非法值都算没给）。
@@ -261,9 +285,7 @@ impl ModelProvider for OpenaiCompletionsProvider {
             }
         }
         if let Some(choice) = &body.tool_choice {
-            if let Some(encoded) = encode_tool_choice(choice) {
-                payload.insert("tool_choice".into(), encoded);
-            }
+            payload.insert("tool_choice".into(), encode_tool_choice(choice));
         }
 
         // 其余标量字段按协议表落地（同名写入 / 改名写入 / 显式丢弃）。
@@ -376,6 +398,17 @@ impl ModelProvider for OpenaiCompletionsProvider {
     ) -> AppResult<Vec<SseEvent>> {
         if let Some(usage) = data.get("usage").filter(|value| !value.is_null()) {
             apply_usage(state, usage);
+        }
+
+        // C1：分片的 `id` 就是上游本次补全的 id（同一条流里每片都相同）。以前不读它，
+        // 明细里的 `upstream_response.id` 永远是网关合成的 `msg_<uuid>`——上游那个
+        // `chatcmpl-…` 没法拿去和上游侧的日志对账。
+        if let Some(id) = data
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            state.message_id = id.to_string();
         }
 
         // OpenAI 系的流内错误是「没有 choices、只有一个 error 对象」的分片：
@@ -548,7 +581,9 @@ impl ModelProvider for OpenaiCompletionsProvider {
                                             .pointer("/image_url/url")
                                             .and_then(Value::as_str)
                                             .unwrap_or_default();
-                                        if let Some(source) = data_url_to_source(url) {
+                                        // data: URL 收成 base64 source；http(s) 原样存 url source
+                                        // （A4：以前静默丢块，客户端的图跨协议转发时消失）。
+                                        if let Some(source) = image_source_from_url(url) {
                                             blocks.push(json!({ "type": "image", "source": source }));
                                         }
                                     }
@@ -604,8 +639,24 @@ impl ModelProvider for OpenaiCompletionsProvider {
             "service_tier",
             "n",
         ] {
-            if let Some(value) = object.get(key) {
+            // 显式 null 等价于「未指定」（有的客户端会送 null），跳过而不是抬升——
+            // 否则 null 会撞上类型化字段的形状校验，把合法请求打成 400。
+            if let Some(value) = object.get(key).filter(|value| !value.is_null()) {
                 canonical.insert(key.into(), value.clone());
+            }
+        }
+        // tool_choice（A1）：入站形状归一成规范形，形状交给类型化字段收口——
+        // 以前这个键根本不抬升，强制/禁用工具的意图跨协议静默丢失。
+        // 抬不了（残缺/未知臂）显式报错，不再静默丢字段。
+        if let Some(choice) = object.get("tool_choice") {
+            if !choice.is_null() {
+                let normalized = canonical_tool_choice(choice).ok_or_else(|| {
+                    AppError::InvalidConfig(format!(
+                        "tool_choice 形状非法: {}",
+                        serde_json::to_string(choice).unwrap_or_default()
+                    ))
+                })?;
+                canonical.insert("tool_choice".into(), normalized);
             }
         }
         // stream_options.include_usage 决定流式响应末尾是否要带 usage 事件，需要透传到上游与本端出站。
@@ -865,7 +916,16 @@ impl ModelProvider for OpenaiCompletionsProvider {
                 state.stop_reason = reason.map(str::to_string);
                 vec![chunk(state, json!({}), Some(wire::finish_reason(reason)))]
             }
-            "error" => vec![canonical.clone()],
+            // A7：规范错误事件是 Anthropic 形状，不能原样发给 OpenAI 客户端——
+            // 按本协议的信封重排，形状与网关自产的流内错误（`gateway::server::error_events`）同源。
+            "error" => {
+                let (kind, message) = wire::stream_error_parts(data);
+                vec![wire::stream_error_event(
+                    ModelFormat::OpenaiCompletions,
+                    kind,
+                    message,
+                )]
+            }
             _ => Vec::new(),
         }
     }
@@ -892,7 +952,19 @@ pub(crate) fn parse_arguments(value: Option<&Value>) -> Value {
     }
 }
 
-pub(crate) fn data_url_to_source(url: &str) -> Option<Value> {
+/// 客户端给的图片地址 → 规范 image source：`data:` URL 收成 base64，
+/// http(s) 存成 url source（A4）。两者之外的形状（空串、非 base64 的 data:）None。
+pub(crate) fn image_source_from_url(url: &str) -> Option<Value> {
+    if url.starts_with("data:") {
+        return data_url_to_source(url);
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return Some(json!({ "type": "url", "url": url }));
+    }
+    None
+}
+
+fn data_url_to_source(url: &str) -> Option<Value> {
     let rest = url.strip_prefix("data:")?;
     let (meta, data) = rest.split_once(',')?;
     if !meta.contains("base64") {

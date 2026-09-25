@@ -238,8 +238,9 @@ fn preview_from_response(response: &Value) -> Option<String> {
 }
 
 /// 用给定配置真实发一次最小补全请求，返回连通性结果。已保存模型（`test_model`）
-/// 与表单未保存值（`test_model_config`）共用这一条路径，避免两份实现漂移。
-async fn probe_completion(config: &ModelConfig) -> AppResult<TestResult> {
+/// 与表单未保存值（`test_model_config`）共用这一条路径，避免两份实现漂移；
+/// 事后切换的连接测试也复用它（`gateway::failover`）。
+pub(crate) async fn probe_completion(config: &ModelConfig) -> AppResult<TestResult> {
     let provider = provider_for(config.format);
 
     let request = CanonicalRequest::parse(json!({
