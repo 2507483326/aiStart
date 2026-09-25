@@ -67,6 +67,7 @@ export const systemApi = {
     invoke<SettingsView>("update_settings", { input }),
   info: () => invoke<AppInfo>("app_info"),
   openDownloadDir: () => invoke<void>("open_download_dir"),
+  openDataDir: () => invoke<void>("open_data_dir"),
 };
 
 export const eventApi = {

@@ -9,7 +9,7 @@ use crate::error::{AppError, AppResult};
 pub const SCHEMA_SQL: &str = include_str!("schema.sql");
 
 /// 当前 schema 版本号，写入 schema_meta.db_schema_version。
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 8;
 
 static DB: OnceLock<Mutex<Connection>> = OnceLock::new();
 
@@ -44,6 +44,12 @@ pub fn init(dir: &Path) -> AppResult<()> {
     )?;
     ensure_column(
         &connection,
+        "usage_detail",
+        "proxied",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        &connection,
         "app_model_bindings",
         "token",
         "TEXT NOT NULL DEFAULT ''",
@@ -56,7 +62,13 @@ pub fn init(dir: &Path) -> AppResult<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
 
+    // v7：app_version_records 由「追加式历史」改为「每个应用一行」。旧表先改名让 schema.sql
+    // 建出新结构，数据在 DDL 之后搬运（见 copy_legacy_app_version_records）。
+    rename_legacy_app_version_records(&connection)?;
+
     connection.execute_batch(SCHEMA_SQL)?;
+
+    copy_legacy_app_version_records(&connection)?;
 
     let now = now_ms();
     connection.execute(
@@ -73,25 +85,65 @@ pub fn init(dir: &Path) -> AppResult<()> {
 /// 幂等补列：旧库缺列时执行 ALTER TABLE ADD COLUMN（SQLite 无 ADD COLUMN IF NOT EXISTS）。
 /// 表尚不存在（全新库）时直接跳过——由 schema.sql 建出带该列的表。
 fn ensure_column(connection: &Connection, table: &str, column: &str, decl: &str) -> AppResult<()> {
-    let table_exists: bool = connection.query_row(
+    if !table_exists(connection, table)? {
+        return Ok(());
+    }
+    if !table_has_column(connection, table, column)? {
+        connection.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+    }
+    Ok(())
+}
+
+fn table_exists(connection: &Connection, table: &str) -> AppResult<bool> {
+    Ok(connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
         [table],
         |row| row.get(0),
-    )?;
-    if !table_exists {
-        return Ok(());
-    }
+    )?)
+}
 
+fn table_has_column(connection: &Connection, table: &str, column: &str) -> AppResult<bool> {
+    if !table_exists(connection, table)? {
+        return Ok(false);
+    }
     let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-    let column_exists = statement
+    let exists = statement
         .query_map([], |row| row.get::<_, String>(1))?
         .filter_map(Result::ok)
         .any(|name| name == column);
-    drop(statement);
+    Ok(exists)
+}
 
-    if !column_exists {
-        connection.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+/// v7 迁移第一步：旧版 app_version_records（自增主键、追加式历史）改名为 legacy，
+/// 让 schema.sql 建出「每个应用一行」的新表。
+fn rename_legacy_app_version_records(connection: &Connection) -> AppResult<()> {
+    if table_has_column(connection, "app_version_records", "app_version_record_id")? {
+        connection
+            .execute_batch("ALTER TABLE app_version_records RENAME TO app_version_records_legacy")?;
     }
+    Ok(())
+}
+
+/// v7 迁移第二步：把每个应用最新的一条有效 check 搬进新表，然后丢弃旧表。
+/// 安装/更新动作行不搬（events 表已留有审计），未确认的 unreachable 行也丢弃。
+fn copy_legacy_app_version_records(connection: &Connection) -> AppResult<()> {
+    if !table_exists(connection, "app_version_records_legacy")? {
+        return Ok(());
+    }
+    connection.execute_batch(
+        "INSERT OR IGNORE INTO app_version_records \
+           (app_kind, action, installed_version, target_version, latest_version, update_available, \
+            source_url, status, message, event_time, created_time, update_time) \
+         SELECT app_kind, 'check', installed_version, target_version, latest_version, update_available, \
+                source_url, status, message, event_time, created_time, update_time \
+         FROM app_version_records_legacy r \
+         WHERE action = 'check' AND status <> 'unreachable' \
+           AND r.app_version_record_id = ( \
+             SELECT r2.app_version_record_id FROM app_version_records_legacy r2 \
+             WHERE r2.app_kind = r.app_kind AND r2.action = 'check' AND r2.status <> 'unreachable' \
+             ORDER BY r2.event_time DESC, r2.app_version_record_id DESC LIMIT 1);\
+         DROP TABLE app_version_records_legacy",
+    )?;
     Ok(())
 }
 
@@ -127,4 +179,71 @@ pub fn ms_from_iso(text: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(text)
         .ok()
         .map(|value| value.timestamp_millis())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v6 之前的 app_version_records：自增主键，每次检查/动作追加一行。
+    const LEGACY_DDL: &str = "CREATE TABLE app_version_records (\
+        app_version_record_id INTEGER PRIMARY KEY AUTOINCREMENT,\
+        app_kind TEXT NOT NULL, action TEXT NOT NULL, installed_version TEXT, target_version TEXT,\
+        latest_version TEXT, update_available INTEGER NOT NULL DEFAULT 0, source_url TEXT,\
+        status TEXT NOT NULL, message TEXT, event_time INTEGER NOT NULL, created_time INTEGER NOT NULL,\
+        update_time INTEGER NOT NULL)";
+
+    fn migrate(connection: &Connection) -> AppResult<()> {
+        rename_legacy_app_version_records(connection)?;
+        connection.execute_batch(SCHEMA_SQL)?;
+        copy_legacy_app_version_records(connection)
+    }
+
+    #[test]
+    fn collapses_legacy_records_to_one_row_per_app() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(LEGACY_DDL).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO app_version_records \
+                   (app_kind, action, installed_version, latest_version, status, event_time, created_time, update_time) \
+                 VALUES \
+                   ('claude-desktop',   'check',  '1.0.0', '2.0.0', 'found',       100, 100, 100), \
+                   ('claude-desktop',   'update', '1.0.0', NULL,    'launched',    200, 200, 200), \
+                   ('claude-desktop',   'check',  '1.0.0', '2.1.0', 'found',       300, 300, 300), \
+                   ('deepseek-desktop', 'check',  NULL,    NULL,    'unreachable', 150, 150, 150)",
+            )
+            .unwrap();
+
+        migrate(&connection).unwrap();
+
+        let rows: Vec<(String, String, Option<String>, String)> = connection
+            .prepare("SELECT app_kind, action, latest_version, status FROM app_version_records ORDER BY app_kind")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+
+        // 每个应用最多一行；只有有效 check 的应用被迁移，动作行与 unreachable 行丢弃。
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "claude-desktop");
+        assert_eq!(rows[0].1, "check");
+        assert_eq!(rows[0].2.as_deref(), Some("2.1.0")); // 取最新的一条 check
+        assert_eq!(rows[0].3, "found");
+    }
+
+    #[test]
+    fn migration_is_a_no_op_on_a_fresh_or_already_migrated_database() {
+        let fresh = Connection::open_in_memory().unwrap();
+        migrate(&fresh).unwrap();
+        migrate(&fresh).unwrap();
+
+        let rows: i64 = fresh
+            .query_row("SELECT COUNT(*) FROM app_version_records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
 }

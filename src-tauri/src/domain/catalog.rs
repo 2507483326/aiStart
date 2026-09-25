@@ -168,13 +168,15 @@ pub fn builtin_apps() -> Vec<AppDescriptor> {
             // 用 `kind` 决定线协议，凭据与地址放在 `options.{apiKey,baseURL}`；aiStart 以
             // 固定 id `aistart` 合并进去。见 `platform/zcode.rs`。
             config_target: r"%USERPROFILE%\.zcode\v2\config.json".into(),
-            // 待实测：`https://zcode.z.ai/changelog` 是 HTML，现有 `updates::parse_latest` 解析不了，
-            // 暂不做版本探测。CDN 已是版本化直链（见 upgrade 注释），补上版本源即可开启自动安装。
-            latest_version_urls: vec![],
+            // 更新日志页（Next.js SSR 的 HTML）：最新版本排在最前，`updates::parse_latest`
+            // 取正文里第一条 `Release vX.Y.Z`。官方没有 JSON 版本接口，electron-builder 的
+            // latest.yml 也只在带版本号的路径下（`.../releases/{version}/...`），
+            // 拿不到版本号就拼不出地址，所以只能解析这一页。
+            latest_version_urls: vec!["https://zcode.z.ai/cn/changelog".into()],
             upgrade: UpgradeSpec {
-                // 官方下载页已有各平台的版本化 CDN 直链，但没有可解析的「最新版本」源，
-                // 无法填 `{version}` 占位，故本期只保留 Manual 兜底（打开下载页）。
-                // follow-up: 找到版本源后加 `Direct{ url: "https://cdn-zcode.z.ai/zcode/electron/releases/{version}/windows-x64/ZCode-{version}-win-x64.exe" }`（installer = Nsis）。
+                // 已有版本源，CDN 也是版本化直链，但自动安装（`installer = Nsis` +
+                // `Direct{ .../releases/{version}/windows-x64/ZCode-{version}-win-x64.exe }`）
+                // 尚未启用，故本期仍只保留 Manual 兜底（打开下载页）。
                 sources: vec![ReleaseSource::Manual {
                     page: "https://zcode.z.ai/cn".into(),
                 }],
@@ -320,6 +322,18 @@ mod tests {
             .expect("WorkBuddy 应配置版本探测源");
         assert!(url.contains("copilot.tencent.com/v2/update"), "{url}");
         assert!(url.contains("{version}"), "{url}");
+    }
+
+    #[test]
+    fn zcode_probes_its_changelog_page() {
+        // 探测地址必须能被 `updates::parse_latest` 的 ZCode 分支识别（它按域名
+        // `zcode.z.ai` 匹配），否则会退回通用兜底、从 HTML 里读出垃圾版本号。
+        let zcode = builtin_app(AppKind::ZCode);
+        let url = zcode
+            .latest_version_urls
+            .first()
+            .expect("ZCode 应配置版本探测源");
+        assert!(url.contains("zcode.z.ai"), "{url}");
     }
 
     #[test]

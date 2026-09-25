@@ -22,6 +22,10 @@ pub struct UsageRecord {
     /// 实际发往上游的模型 ID（wire model，与显示名 `served_by` 不同）；未发起上游请求为空。
     #[serde(default)]
     pub upstream_model: String,
+    /// 这次请求是否经代理出站（按当时生效的「网络代理」开关 + 地址判定）；
+    /// 未发起上游请求的失败（缺 Key、无启用模型）算直连；历史数据为 false。
+    #[serde(default)]
+    pub proxied: bool,
     pub inbound_protocol: String,
     pub upstream_protocol: String,
     pub input_tokens: u64,
@@ -133,12 +137,13 @@ pub struct UsageSummary {
 
 const SELECT_COLUMNS: &str = "usage_detail_id, day, event_time, model_name, served_by, inbound_protocol, \
      upstream_protocol, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, duration_ms, ok, failover, error, source_app, \
-     upstream_url, upstream_model, reasoning_tokens";
+     upstream_url, upstream_model, reasoning_tokens, proxied";
 
 fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRecord> {
     let event_time: i64 = row.get(2)?;
     let ok: i64 = row.get(12)?;
     let failover: i64 = row.get(13)?;
+    let proxied: i64 = row.get(19)?;
     Ok(UsageRecord {
         id: row.get(0)?,
         timestamp: db::iso_from_ms(event_time),
@@ -159,6 +164,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRecord> {
         source_app: row.get(15)?,
         upstream_url: row.get(16)?,
         upstream_model: row.get(17)?,
+        proxied: proxied != 0,
     })
 }
 
@@ -188,8 +194,8 @@ pub fn record_with_payload(entry: &UsageRecord, payload: Option<&UsagePayload>) 
         transaction.execute(
             "INSERT INTO usage_detail (day, event_time, model_name, served_by, inbound_protocol, upstream_protocol, \
              input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens, \
-             duration_ms, ok, failover, error, source_app, upstream_url, upstream_model, created_time, update_time) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?20)",
+             duration_ms, ok, failover, error, source_app, upstream_url, upstream_model, proxied, created_time, update_time) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?21)",
             params![
                 entry.date,
                 event_time,
@@ -210,6 +216,7 @@ pub fn record_with_payload(entry: &UsageRecord, payload: Option<&UsagePayload>) 
                 entry.source_app,
                 entry.upstream_url,
                 entry.upstream_model,
+                i64::from(entry.proxied),
                 event_time,
             ],
         )?;

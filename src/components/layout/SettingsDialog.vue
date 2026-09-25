@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, watch } from "vue";
-import { Copy, FolderCog, FolderDown, FolderOpen } from "lucide";
+import { FolderCog, FolderOpen, Globe, Power } from "lucide";
 
 import MorphIconBox from "@/components/common/MorphIconBox.vue";
 import { Button } from "@/components/ui/button";
@@ -15,19 +15,26 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import { useSettings } from "@/composables/useSettings";
-import { openDownloadDir } from "@/lib/open";
-import { notifySuccess } from "@/lib/notify";
+import { openDataDir } from "@/lib/open";
 
 const { settings, info, update } = useSettings();
 
 const open = ref(false);
 const port = ref<string>("");
+const proxyEnabled = ref(false);
+const proxyUrl = ref<string>("");
+const launchAtLogin = ref(true);
 const saving = ref(false);
 
+// 打开时用当前设置填表单，只点「保存」才写回去：取消就丢弃这一轮的改动。
 watch(open, (value) => {
   if (!value || !settings.value) return;
   port.value = String(settings.value.gatewayPort);
+  proxyEnabled.value = settings.value.proxyEnabled;
+  proxyUrl.value = settings.value.proxyUrl;
+  launchAtLogin.value = settings.value.launchAtLogin;
 });
 
 async function save() {
@@ -38,18 +45,19 @@ async function save() {
   }
   saving.value = true;
   try {
-    await update({ gatewayPort: parsed });
-    open.value = false;
+    // 代理地址在后端校验：写错了会带着原因报错，此时整批设置都不落库（端口也不会白改）。
+    // 「开着却没地址」同样由后端拦下，前端不复刻这套规则，省得两处口径打架。
+    const saved = await update({
+      gatewayPort: parsed,
+      proxyEnabled: proxyEnabled.value,
+      proxyUrl: proxyUrl.value.trim(),
+      launchAtLogin: launchAtLogin.value,
+    });
+    // 存失败就别关窗：报错多半是代理地址没填对，用户得能就地改。
+    if (saved) open.value = false;
   } finally {
     saving.value = false;
   }
-}
-
-async function copyDownloadDir() {
-  const dir = info.value?.downloadDir;
-  if (!dir) return;
-  await navigator.clipboard.writeText(dir);
-  notifySuccess("下载地址已复制");
 }
 </script>
 
@@ -62,7 +70,7 @@ async function copyDownloadDir() {
       <DialogHeader>
         <DialogTitle>设置</DialogTitle>
         <DialogDescription>
-          本地网关端口。修改端口会自动重启网关。
+          网关端口、开机启动与出站代理。修改端口会自动重启网关。
         </DialogDescription>
       </DialogHeader>
 
@@ -75,28 +83,50 @@ async function copyDownloadDir() {
           </p>
         </div>
 
+        <div class="space-y-2">
+          <div class="flex items-center justify-between">
+            <Label for="proxy-url" class="flex items-center gap-1.5">
+              <MorphIconBox :icon="Globe" :size="13" />
+              网络代理
+            </Label>
+            <Switch v-model="proxyEnabled" />
+          </div>
+          <Input
+            id="proxy-url"
+            v-model="proxyUrl"
+            :disabled="!proxyEnabled"
+            placeholder="http://127.0.0.1:7890"
+          />
+          <p class="text-xs text-muted-foreground">
+            打开开关后，转发上游、模型探测、版本检查、安装包下载等所有出站流量都走这个代理；
+            关掉即直连，地址会留着下次打开继续用。只支持 http/https，请填代理工具的 HTTP
+            端口（本机地址不走代理）。
+          </p>
+        </div>
+
+        <label class="flex items-center justify-between rounded-md border px-3 py-2.5">
+          <span class="space-y-0.5">
+            <span class="flex items-center gap-1.5 text-sm font-medium">
+              <MorphIconBox :icon="Power" :size="13" />
+              开机启动
+            </span>
+            <span class="block text-xs font-normal text-muted-foreground">
+              登录 Windows 后自动启动本应用。
+            </span>
+          </span>
+          <Switch v-model="launchAtLogin" />
+        </label>
+
         <div class="rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
           <p class="flex items-center gap-1.5">
             <MorphIconBox :icon="FolderCog" :size="13" />
             应用数据目录
           </p>
           <p class="mt-1 break-all font-mono">{{ info?.configDir }}</p>
-        </div>
-
-        <div class="rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-          <p class="flex items-center gap-1.5">
-            <MorphIconBox :icon="FolderDown" :size="13" />
-            下载文件夹
-          </p>
-          <p class="mt-1 break-all font-mono">{{ info?.downloadDir }}</p>
-          <div class="mt-2 flex gap-2">
-            <Button variant="outline" class="gap-1.5" @click="openDownloadDir">
+          <div class="mt-2">
+            <Button variant="outline" class="gap-1.5" @click="openDataDir">
               <MorphIconBox :icon="FolderOpen" :size="14" />
-              打开下载文件夹
-            </Button>
-            <Button variant="outline" class="gap-1.5" @click="copyDownloadDir">
-              <MorphIconBox :icon="Copy" :size="14" />
-              复制下载地址
+              打开文件夹
             </Button>
           </div>
         </div>

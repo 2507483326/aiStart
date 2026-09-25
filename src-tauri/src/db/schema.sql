@@ -1,5 +1,5 @@
 -- =====================================================================
--- AI Start SQLite schema v6（db_schema_version = 6）
+-- AI Start SQLite schema v8（db_schema_version = 8）
 -- v1 首次落库：app_settings / models / app_model_bindings（配置与模型，取代 settings.json）、
 -- usage_detail / usage_daily_total（token 消耗，取代 usage.jsonl）、events（审计事件）、
 -- app_version_records（应用版本检查与更新记录）。
@@ -8,10 +8,13 @@
 -- v4 新增：usage_detail.source_app（请求来源应用 / 原样 token）、app_model_bindings.token（应用专属网关 Key）。
 -- v5 新增：usage_payload.upstream_request / upstream_request_truncated（提示词注入后实际发往上游的请求体）。
 -- v6 新增：usage_detail.upstream_url / upstream_model（实际发往上游的接口地址与模型 ID，供「请求详情」展示）。
+-- v7 变更：app_version_records 由「每次检查/动作追加一行」改为「每个应用一行」（app_kind 作主键，
+--          刷新只更新这一行）。
+-- v8 新增：usage_detail.proxied（这次请求是否经代理出站）。
 --
 -- 规范（对齐 eTeam：C:\eTeam\src\host\state\schema.sql）：
 --   主键 = 每张表自己的编号列，统一 INTEGER 自增（仅 schema_meta / app_settings 以 key 为主键，
---          usage_daily_total 以 day 为主键）
+--          usage_daily_total 以 day 为主键，app_version_records 以 app_kind 为主键）
 --   时间列一律以 *_time 结尾（Unix 毫秒）；每张表末尾固定 created_time / update_time
 --   枚举 = TEXT（合法取值写在列注释里）；JSON = TEXT 存 JSON 字符串
 --   表上不建外键、CHECK、UNIQUE、触发器——规则全部由写入代码保证
@@ -56,6 +59,7 @@ CREATE TABLE IF NOT EXISTS usage_detail (
   source_app        TEXT NOT NULL DEFAULT '',  -- 来源应用：按请求 token 匹配到的 app_kind；未匹配则原样存该 token；''=历史数据/未记录
   upstream_url      TEXT NOT NULL DEFAULT '',  -- 实际发往上游的接口地址（完整 URL，含路径）；未发起上游请求为空
   upstream_model    TEXT NOT NULL DEFAULT '',  -- 实际发往上游的模型 ID（wire model，与显示名 served_by 不同）；未发起上游请求为空
+  proxied           INTEGER NOT NULL DEFAULT 0,  -- 1=这次请求经代理出站 / 0=直连（含未发起上游请求的失败）
   created_time      INTEGER NOT NULL,       -- 入库时刻
   update_time       INTEGER NOT NULL        -- 明细行只插不改，= created_time
 );
@@ -103,15 +107,14 @@ CREATE INDEX IF NOT EXISTS idx_events_type   ON events (type, event_id);
 CREATE INDEX IF NOT EXISTS idx_events_target ON events (target_kind, target_id, event_id) WHERE target_id IS NOT NULL;
 
 -- ---------------------------------------------------------------------
--- 4. app_version_records —— 应用版本检查与更新记录
---    一行 = 某个被管理应用（Claude Desktop / DeepSeek Desktop）的一次版本动作
---    action=check 落检查结果，action=install/update 落安装更新动作与结果；
+-- 4. app_version_records —— 应用版本记录（一行 = 一个被管理应用的最新版本状态）
+--    action=check 落检查结果，action=install/update 落安装更新动作；
+--    两者都 upsert 该应用唯一的那一行（不追加历史），刷新只更新这一行；
 --    同时作为「最近一次检查结果」的持久化来源，重启后徽标无需等待重新联网
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS app_version_records (
-  app_version_record_id INTEGER PRIMARY KEY AUTOINCREMENT,  -- 记录号，自增
-  app_kind          TEXT NOT NULL,   -- 应用：claude-desktop / deepseek-desktop
-  action            TEXT NOT NULL,   -- 动作：check=版本检查 / install=首次安装 / update=更新
+  app_kind          TEXT PRIMARY KEY,   -- 应用：claude-desktop / deepseek-desktop（行即主键）
+  action            TEXT NOT NULL,   -- 最近一次动作：check=版本检查 / install=首次安装 / update=更新
   installed_version TEXT,            -- 动作前的已安装版本；未安装为 NULL
   target_version    TEXT,            -- 检查到/要更新到的目标版本；检查失败为 NULL
   latest_version    TEXT,            -- 检查到的官方最新版本（check 专用快照，便于回看）
@@ -120,18 +123,16 @@ CREATE TABLE IF NOT EXISTS app_version_records (
   status            TEXT NOT NULL,   -- check: found=发现新版本 / up-to-date=已最新 / unreachable=上游不可达
                                      -- install|update: launched=已启动 / succeeded=成功 / failed=失败
   message           TEXT,            -- 说明 / 错误信息
-  event_time        INTEGER NOT NULL,  -- 动作时刻（Unix 毫秒）
-  created_time      INTEGER NOT NULL,  -- 创建时间
-  update_time       INTEGER NOT NULL   -- 更新时间
+  event_time        INTEGER NOT NULL,  -- 最近一次动作时刻（Unix 毫秒）
+  created_time      INTEGER NOT NULL,  -- 首次建行时间
+  update_time       INTEGER NOT NULL   -- 最近一次更新时间
 );
-
-CREATE INDEX IF NOT EXISTS idx_app_version_records_kind   ON app_version_records (app_kind, event_time DESC);
-CREATE INDEX IF NOT EXISTS idx_app_version_records_action ON app_version_records (action, event_time DESC);
 
 -- ---------------------------------------------------------------------
 -- 5. app_settings —— 应用设置（键值对；DB 即唯一存储，取代 settings.json 的标量字段）
 --    合法键：active_model_id（生效模型 ID）/ gateway_port（本地网关端口）
---            / auto_failover（1/0）
+--            / auto_failover（1/0）/ launch_at_login（开机启动，1/0）
+--            / proxy_enabled（代理开关，1/0）/ proxy_url（出站代理地址，空串 = 直连）
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS app_settings (
   key            TEXT PRIMARY KEY,             -- 设置键（行即主键，key 例外同 schema_meta）

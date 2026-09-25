@@ -1,6 +1,8 @@
 use serde_json::{json, Map, Value};
 
-use crate::domain::canonical::{blocks_to_text, content_to_text, CanonicalRequest, ContentBlock};
+use crate::domain::canonical::{
+    blocks_to_text, content_to_text, CanonicalRequest, ContentBlock, SystemPrompt,
+};
 use crate::domain::model::{ModelConfig, ModelFormat};
 use crate::error::{AppError, AppResult};
 
@@ -273,6 +275,47 @@ impl ModelProvider for OpenaiResponsesProvider {
         );
 
         Ok(Value::Object(payload))
+    }
+
+    /// 同协议（Responses → Responses）免转换快路：以客户端原文为底，只改上游模型名、
+    /// 被过滤器改写的 instructions、规范内部字段；其余键（`previous_response_id`、`include`、
+    /// `truncation`、`tools` 的私有扩展……）原样带给上游。
+    fn encode_request_passthrough(
+        &self,
+        cfg: &ModelConfig,
+        req: &CanonicalRequest,
+    ) -> AppResult<Option<Value>> {
+        let Some(client) = req.client_raw().and_then(Value::as_object) else {
+            return Ok(None);
+        };
+        let mut payload = client.clone();
+
+        payload.insert("model".into(), Value::String(cfg.model.clone()));
+        if !payload
+            .get("max_output_tokens")
+            .is_some_and(|value| value.as_u64().is_some())
+        {
+            payload.insert(
+                "max_output_tokens".into(),
+                json!(crate::domain::model::DEFAULT_MAX_TOKENS),
+            );
+        }
+        // 只有过滤器注入过系统提示词才重写 instructions；没注入过就保留客户端原样。
+        if req.is_dirty("system") {
+            let text = req
+                .body()
+                .system
+                .as_ref()
+                .map(SystemPrompt::plain_text)
+                .unwrap_or_default();
+            if text.is_empty() {
+                payload.remove("instructions");
+            } else {
+                payload.insert("instructions".into(), Value::String(text));
+            }
+        }
+        payload.remove(wire::CANONICAL_ONLY_KEY);
+        Ok(Some(Value::Object(payload)))
     }
 
     fn decode_response(&self, cfg: &ModelConfig, raw: &Value) -> AppResult<Value> {

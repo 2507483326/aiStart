@@ -1,3 +1,4 @@
+mod autostart;
 mod commands;
 mod db;
 mod domain;
@@ -28,6 +29,9 @@ pub fn run() {
         .setup(|app| {
             let config_dir = app.path().app_config_dir()?;
             settings::init(&config_dir)?;
+            // 开机启动由设置里的开关驱动（默认开启）：启动时同步一次注册表，
+            // 既让默认值在首次运行就落地，也让「安装位置变了」自愈。失败不拦启动。
+            let _ = autostart::apply(settings::snapshot().launch_at_login);
             filters::load()?;
             gateway::hydrate();
             gateway::attach(app.handle().clone());
@@ -70,6 +74,7 @@ pub fn run() {
             commands::system::get_settings,
             commands::system::update_settings,
             commands::system::app_info,
+            commands::system::open_data_dir,
             commands::events::list_events,
             commands::usage::usage_summary,
             commands::usage::usage_records,

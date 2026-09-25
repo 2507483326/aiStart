@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -240,6 +242,15 @@ pub enum MaxTokensField {
 pub struct CanonicalRequest {
     raw: Value,
     body: RequestBody,
+    /// 客户端入站报文的**原文**（入站协议的本来形状）。
+    ///
+    /// 规范层为了统一，`raw` 是重建后的规范形状（OpenAI 入站时由 `decode_request` 重拼），
+    /// 客户端的原文会在入站处留一份：同协议转发（入站协议 == 上游协议）时以它为准做免转换直通，
+    /// 客户端自己的字段名、消息结构、协议扩展键才能原样带到上游。
+    client_raw: Option<Value>,
+    /// 被过滤器改写过的规范字段名。同协议直通只覆盖这些字段，其余以客户端原文为准
+    /// ——否则注入的提示词会被客户端原文盖回去。
+    dirty: BTreeSet<String>,
 }
 
 impl CanonicalRequest {
@@ -247,7 +258,33 @@ impl CanonicalRequest {
         let body: RequestBody = serde_json::from_value(raw.clone()).map_err(|err| {
             crate::error::AppError::InvalidConfig(format!("请求体格式非法: {err}"))
         })?;
-        Ok(Self { raw, body })
+        Ok(Self {
+            raw,
+            body,
+            client_raw: None,
+            dirty: BTreeSet::new(),
+        })
+    }
+
+    /// 记下客户端原始报文（网关在入站处调用，`decode_request` 之前的那份 JSON）。
+    pub fn retain_client_raw(mut self, raw: Value) -> Self {
+        self.client_raw = Some(raw);
+        self
+    }
+
+    /// 客户端原始报文；没有保留过（内部构造的请求如翻译命令）时为 None。
+    pub fn client_raw(&self) -> Option<&Value> {
+        self.client_raw.as_ref()
+    }
+
+    /// 标记某个规范字段已被改写（过滤器用）。
+    pub fn mark_dirty(&mut self, field: &str) {
+        self.dirty.insert(field.to_string());
+    }
+
+    /// 该规范字段是否被过滤器改写过。
+    pub fn is_dirty(&self, field: &str) -> bool {
+        self.dirty.contains(field)
     }
 
     pub fn raw(&self) -> &Value {

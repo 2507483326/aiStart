@@ -5,13 +5,13 @@ pub mod openai_responses;
 pub mod wire;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 use serde_json::{json, Value};
 
 use crate::domain::canonical::CanonicalRequest;
 use crate::domain::model::{ModelConfig, ModelFormat};
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 
 use normalizer::{BlockNormalizer, StreamVerdict};
 
@@ -406,6 +406,20 @@ pub trait ModelProvider: Send + Sync {
 
     fn encode_request(&self, cfg: &ModelConfig, req: &CanonicalRequest) -> AppResult<Value>;
 
+    /// 同协议转发（入站协议 == 上游协议）的免转换快路：以客户端原文
+    /// （`CanonicalRequest::client_raw`）为底，只覆盖必须改写的字段——上游模型名、被过滤器改过的
+    /// 规范字段、规范内部字段。客户端自己的字段名、消息结构、协议扩展键全部原样带给上游。
+    ///
+    /// 返回 `None` 表示这个 provider 不需要快路（规范形状就是本协议形状，例如 Anthropic），
+    /// 调用方回退到 `encode_request`。
+    fn encode_request_passthrough(
+        &self,
+        _cfg: &ModelConfig,
+        _req: &CanonicalRequest,
+    ) -> AppResult<Option<Value>> {
+        Ok(None)
+    }
+
     fn decode_response(&self, cfg: &ModelConfig, raw: &Value) -> AppResult<Value>;
 
     fn decode_stream_event(
@@ -465,12 +479,115 @@ pub fn provider_for(format: ModelFormat) -> &'static dyn ModelProvider {
     }
 }
 
-pub fn http_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(20))
-            .build()
-            .expect("failed to build reqwest client")
-    })
+/// 出站客户端缓存：`(建它时用的代理, 客户端)`；代理用空串表示直连。
+static CLIENT: OnceLock<RwLock<Option<(String, reqwest::Client)>>> = OnceLock::new();
+
+/// 当前出站流量走哪个代理：`None` = 直连。
+///
+/// 开关和地址都看过才算数（开着但地址空着仍是直连）。建客户端和「明细里记这次走没走代理」
+/// 都问它，两边口径不会漂。
+pub fn active_proxy() -> Option<String> {
+    let (enabled, url) = crate::settings::proxy_settings();
+    let url = url.trim();
+    if enabled && !url.is_empty() {
+        Some(url.to_string())
+    } else {
+        None
+    }
+}
+
+/// 全应用共用的出站客户端：网关转发上游、模型探测、版本检查、安装包下载都从这里取。
+///
+/// 代理设置（设置弹窗里的「网络代理」开关 + 地址）就挂在这个客户端上，所以它是可重建的：
+/// 缓存里记着「当初是按哪个代理建的」，开关一拨、地址一改就重建，旧客户端留给在途请求跑完。
+/// 网关不必跟着重启——服务端每次请求都要重新取一次客户端。
+pub fn http_client() -> reqwest::Client {
+    // 开关关着就按直连建（地址仍留在设置里，下次打开接着用）。
+    let proxy = active_proxy().unwrap_or_default();
+    let cache = CLIENT.get_or_init(|| RwLock::new(None));
+
+    if let Some((cached_proxy, client)) = cache.read().expect("http client lock poisoned").as_ref()
+    {
+        if *cached_proxy == proxy {
+            return client.clone();
+        }
+    }
+
+    let client = build_client(&proxy);
+    *cache.write().expect("http client lock poisoned") = Some((proxy, client.clone()));
+    client
+}
+
+fn build_client(proxy_url: &str) -> reqwest::Client {
+    let mut builder =
+        reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(20));
+
+    if !proxy_url.is_empty() {
+        match reqwest::Proxy::all(proxy_url) {
+            Ok(proxy) => {
+                // 回环地址不走代理：本机上跑的 Ollama 之类上游，代理软件多半也转发不了它自己，
+                // 「给远端上游配代理」不该顺手把本地链路也挡在外面。
+                let bypass = reqwest::NoProxy::from_string("localhost,127.0.0.1,::1");
+                builder = builder.proxy(proxy.no_proxy(bypass));
+            }
+            // 地址在保存设置时已经校验过，走到这里说明库里的值是被手改过的：
+            // 报个事件存证，然后按直连处理，总比整个应用发不出请求强。
+            Err(error) => crate::events::log(
+                "system",
+                None,
+                "settings.proxy_invalid",
+                None,
+                None,
+                Some(serde_json::json!({ "proxyUrl": proxy_url, "message": error.to_string() })),
+            ),
+        }
+    }
+
+    builder.build().expect("failed to build reqwest client")
+}
+
+/// 校验设置里的代理地址，返回归一化后写回库里的字符串（`None` = 直连）。
+///
+/// 拦在保存这一步，而不是等第一次发请求才炸：地址写错了，用户当场就该知道。
+pub fn validate_proxy(raw: &str) -> AppResult<Option<String>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    // 常见写法是直接粘 `127.0.0.1:7890`（没有协议头），补成 http 再判断。
+    let normalized = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    };
+
+    let parsed = reqwest::Url::parse(&normalized)
+        .map_err(|error| AppError::InvalidConfig(format!("代理地址无法解析: {error}")))?;
+
+    match parsed.scheme() {
+        "http" | "https" => {}
+        // reqwest 的 socks 支持要单独开特性，本项目没开：与其让它在建客户端时才失败，
+        // 不如在这里说清楚该怎么办。
+        scheme if scheme.starts_with("socks") => {
+            return Err(AppError::InvalidConfig(
+                "暂不支持 socks 代理，请填写代理工具的 HTTP 端口（如 http://127.0.0.1:7890）"
+                    .into(),
+            ))
+        }
+        scheme => {
+            return Err(AppError::InvalidConfig(format!(
+                "不支持的代理协议 {scheme}，只支持 http/https"
+            )))
+        }
+    }
+
+    if parsed.host_str().unwrap_or_default().is_empty() {
+        return Err(AppError::InvalidConfig("代理地址缺少主机名".into()));
+    }
+
+    reqwest::Proxy::all(&normalized)
+        .map_err(|error| AppError::InvalidConfig(format!("代理地址无效: {error}")))?;
+
+    Ok(Some(normalized))
 }

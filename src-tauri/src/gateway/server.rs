@@ -14,10 +14,10 @@ use tower_http::cors::CorsLayer;
 
 use crate::domain::canonical::CanonicalRequest;
 use crate::domain::model::{ModelConfig, ModelFormat};
-use crate::error::AppError;
+use crate::error::{AppError, AppResult};
 use crate::events;
 use crate::providers::{
-    http_client, provider_for, ResponseAssembler, SseEvent, StreamState, WireState,
+    active_proxy, http_client, provider_for, ResponseAssembler, SseEvent, StreamState, WireState,
 };
 
 use super::sse::{encode_channel_event, parse_sse_stream};
@@ -146,6 +146,8 @@ fn record_usage(
             source_app: source_app.to_string(),
             upstream_url: provider_for(config.format).endpoint(config),
             upstream_model: config.model.clone(),
+            // 能走到这里说明上游请求已经发出去了：这次出站是不是走代理，问当时的代理设置。
+            proxied: active_proxy().is_some(),
             inbound_protocol: inbound.as_str().to_string(),
             upstream_protocol: config.format.as_str().to_string(),
             input_tokens,
@@ -270,6 +272,8 @@ async fn route(
                 .map(|model| model.name.clone())
                 .unwrap_or_default();
             let source_app = source_app_for(token.as_deref().unwrap_or_default());
+            // 只有真发起了上游请求才谈得上「走了代理」：缺 Key、没启用模型这类失败压根没出网。
+            let proxied = !upstream_url.is_empty() && active_proxy().is_some();
             let (timestamp, date) = crate::usage::current_timestamp();
             crate::usage::record_with_payload(
                 &crate::usage::UsageRecord {
@@ -281,6 +285,7 @@ async fn route(
                     source_app,
                     upstream_url,
                     upstream_model,
+                    proxied,
                     inbound_protocol: inbound.as_str().to_string(),
                     upstream_protocol: String::new(),
                     input_tokens: 0,
@@ -338,16 +343,32 @@ impl From<AppError> for RouteFailure {
     }
 }
 
+/// 选定真正发往上游的报文：入站协议与上游协议相同时走免转换快路（以客户端原文为底，
+/// 只改模型名与被过滤字段），不同协议才经规范层重建。provider 没有快路时（返回 None）回退重建。
+pub(crate) fn encode_upstream_request(
+    inbound: ModelFormat,
+    config: &ModelConfig,
+    request: &CanonicalRequest,
+) -> AppResult<Value> {
+    let provider = provider_for(config.format);
+    if config.format == inbound {
+        if let Some(payload) = provider.encode_request_passthrough(config, request)? {
+            return Ok(payload);
+        }
+    }
+    provider.encode_request(config, request)
+}
+
 /// 把规范请求编码成上游协议原生报文并发起请求；成功时一并返回编码后的请求体（供落库展示）。
 async fn dispatch(
+    inbound: ModelFormat,
     request: &CanonicalRequest,
     headers: &HeaderMap,
     config: &ModelConfig,
 ) -> Result<(reqwest::Response, Value), UpstreamFailure> {
     let provider = provider_for(config.format);
-    let payload = provider
-        .encode_request(config, request)
-        .map_err(|error| UpstreamFailure {
+    let payload =
+        encode_upstream_request(inbound, config, request).map_err(|error| UpstreamFailure {
             error,
             retryable: false,
             raw_response: None,
@@ -416,7 +437,11 @@ async fn handle(
     let raw: Value = serde_json::from_slice(&body)
         .map_err(|error| AppError::InvalidConfig(format!("请求体不是合法 JSON: {error}")))?;
     let inbound_provider = provider_for(inbound);
-    let request = inbound_provider.decode_request(raw)?;
+    // 保留客户端原文：OpenAI 系的 decode_request 会把报文重建成规范形状，原文只留在这里，
+    // 同协议转发（入站协议 == 上游协议）才能免转换直通，不丢客户端的字段名与扩展键。
+    let request = inbound_provider
+        .decode_request(raw.clone())?
+        .retain_client_raw(raw);
     // 规范级校验：无法保真转换的请求直接拒掉，别转一半。
     request.validate()?;
     // 过滤器：在转发前按规则改写规范请求。放在自动切换循环之外，
@@ -446,7 +471,7 @@ async fn handle(
             provider_for(candidate.format).endpoint(candidate),
             candidate.model.clone(),
         ));
-        match dispatch(&request, &headers, candidate).await {
+        match dispatch(inbound, &request, &headers, candidate).await {
             Ok((response, payload)) => {
                 if index > 0 {
                     stats.record_failover(&primary, &candidate.name);

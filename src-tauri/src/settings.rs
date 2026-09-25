@@ -15,6 +15,13 @@ pub struct Settings {
     pub active_model_id: Option<i64>,
     pub gateway_port: u16,
     pub auto_failover: bool,
+    /// 开机自启（写入 HKCU Run 注册表项，见 platform::autostart）。
+    pub launch_at_login: bool,
+    /// 出站代理是否启用。关掉 = 直连，地址保留（重新打开即恢复，不用重填）。
+    pub proxy_enabled: bool,
+    /// 出站代理地址（如 `http://127.0.0.1:7890`）。
+    /// 生效点是 providers::http_client()，所有出站流量共用。
+    pub proxy_url: String,
     /// app_kind -> model_id
     pub applied: BTreeMap<String, i64>,
     /// app_kind -> 应用专属网关 Key（固定可读，= app_kind）
@@ -32,6 +39,11 @@ impl Default for Settings {
             active_model_id: None,
             gateway_port: default_port(),
             auto_failover: false,
+            // 默认开机启动：首次运行就写注册表，用户不想要再关。
+            launch_at_login: true,
+            // 代理默认关：地址都没有，开了也没用。
+            proxy_enabled: false,
+            proxy_url: String::new(),
             applied: BTreeMap::new(),
             app_tokens: BTreeMap::new(),
         }
@@ -184,6 +196,9 @@ fn load() -> AppResult<Settings> {
                     }
                 }
                 "auto_failover" => settings.auto_failover = value.trim() == "1",
+                "launch_at_login" => settings.launch_at_login = value.trim() == "1",
+                "proxy_enabled" => settings.proxy_enabled = value.trim() == "1",
+                "proxy_url" => settings.proxy_url = value.trim().to_string(),
                 _ => {}
             }
         }
@@ -272,6 +287,15 @@ fn setting_pairs(settings: &Settings) -> Vec<(&'static str, String)> {
             "auto_failover",
             if settings.auto_failover { "1" } else { "0" }.to_string(),
         ),
+        (
+            "launch_at_login",
+            if settings.launch_at_login { "1" } else { "0" }.to_string(),
+        ),
+        (
+            "proxy_enabled",
+            if settings.proxy_enabled { "1" } else { "0" }.to_string(),
+        ),
+        ("proxy_url", settings.proxy_url.clone()),
     ]
 }
 
@@ -327,6 +351,13 @@ pub fn persist() -> AppResult<()> {
 
 pub fn snapshot() -> Settings {
     store().read().expect("settings lock poisoned").clone()
+}
+
+/// 只取「代理开关 + 地址」。出站客户端每次请求前都要问一遍，
+/// 不值得为此克隆整个 Settings（还带模型列表）。
+pub fn proxy_settings() -> (bool, String) {
+    let guard = store().read().expect("settings lock poisoned");
+    (guard.proxy_enabled, guard.proxy_url.clone())
 }
 
 pub fn mutate<T>(f: impl FnOnce(&mut Settings) -> T) -> AppResult<T> {

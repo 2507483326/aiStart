@@ -993,6 +993,170 @@ fn canonical_fields_are_forwarded_per_protocol() {
     }
 }
 
+/// 取某协议的同协议直通报文（测试辅助）。
+fn passthrough(format: ModelFormat, request: &CanonicalRequest) -> Value {
+    provider_for(format)
+        .encode_request_passthrough(&model(format, "https://example.com/v1"), request)
+        .expect("直通编码不该失败")
+        .expect("该协议应该有直通快路")
+}
+
+/// 同协议免转换直通：客户端原文为底，协议扩展键、字段名、消息结构原样带给上游。
+#[test]
+fn same_protocol_passthrough_keeps_the_client_payload_intact() {
+    let client = json!({
+        "model": "gpt-4o",
+        "messages": [
+            { "role": "system", "content": "be brief" },
+            { "role": "user", "name": "alice", "content": "hi" }
+        ],
+        "stop": "END",
+        "logit_bias": { "50256": -100 },
+        "max_completion_tokens": 256,
+        "provider": { "order": ["openai"] },
+        "stream_options": { "include_usage": true },
+        "stream": false
+    });
+    let request = provider_for(ModelFormat::OpenaiCompletions)
+        .decode_request(client.clone())
+        .expect("Completions 请求应该能解析")
+        .retain_client_raw(client);
+
+    let encoded = passthrough(ModelFormat::OpenaiCompletions, &request);
+
+    // 只换模型名
+    assert_eq!(encoded["model"], "upstream-model");
+    // 重建路径会丢的键、会被改写的字段名，直通全部保真
+    assert_eq!(encoded["stop"], "END");
+    assert_eq!(encoded["logit_bias"]["50256"], json!(-100));
+    assert_eq!(encoded["provider"]["order"][0], "openai");
+    assert_eq!(encoded["max_completion_tokens"], json!(256));
+    assert!(encoded.get("max_tokens").is_none());
+    assert_eq!(encoded["stream_options"]["include_usage"], true);
+    assert_eq!(encoded["messages"][0]["role"], "system");
+    assert_eq!(encoded["messages"][1]["name"], "alice");
+    assert!(encoded.get("_canonical").is_none());
+}
+
+/// 网关选报文：同协议走免转换快路（客户端原文保真），跨协议仍走规范层重建。
+#[test]
+fn gateway_keeps_same_protocol_payloads_and_rebuilds_across_protocols() {
+    use crate::gateway::server::encode_upstream_request;
+
+    let client = json!({
+        "model": "gpt-4o",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "logit_bias": { "50256": -100 }
+    });
+    let request = provider_for(ModelFormat::OpenaiCompletions)
+        .decode_request(client.clone())
+        .expect("Completions 请求应该能解析")
+        .retain_client_raw(client);
+    let config = model(ModelFormat::OpenaiCompletions, "https://api.openai.com/v1");
+
+    // 入站 Completions → 上游 Completions：客户端原文 + 换模型名
+    let same = encode_upstream_request(ModelFormat::OpenaiCompletions, &config, &request).unwrap();
+    assert_eq!(same["model"], "upstream-model");
+    assert_eq!(same["logit_bias"]["50256"], json!(-100));
+
+    // 入站 Responses → 上游 Completions：跨协议，仍走规范层重建（私有扩展键落在规范之外，带不过去）
+    let cross = encode_upstream_request(ModelFormat::OpenaiResponses, &config, &request).unwrap();
+    assert_eq!(cross["model"], "upstream-model");
+    assert_eq!(cross["messages"][0]["content"], "hi");
+    assert!(cross.get("logit_bias").is_none());
+}
+
+/// 系统提示词注入在直通路径上也要落地：过滤器改过 system 才重写，没改过一字不动。
+#[test]
+fn passthrough_rewrites_system_only_after_a_filter_changed_it() {
+    let client = json!({
+        "model": "gpt-4o",
+        "messages": [
+            { "role": "system", "content": "旧提示" },
+            { "role": "developer", "content": "老规矩" },
+            { "role": "user", "content": "hi" }
+        ]
+    });
+    let request = provider_for(ModelFormat::OpenaiCompletions)
+        .decode_request(client.clone())
+        .expect("Completions 请求应该能解析")
+        .retain_client_raw(client);
+
+    // 没有过滤器：客户端的多条 system / developer 消息原样保留
+    // （重建路径会把它们并成一条并挪到队首）。
+    let untouched = passthrough(ModelFormat::OpenaiCompletions, &request);
+    let messages = untouched["messages"].as_array().expect("messages 是数组");
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0]["content"], "旧提示");
+    assert_eq!(messages[1]["role"], "developer");
+
+    // 有过滤器注入：system 由网关接管，合并成一条放在队首。
+    let filtered = crate::filters::apply(
+        &[filter(
+            true,
+            FilterRule::SystemPrompt {
+                mode: PromptMode::Append,
+                text: "新提示".into(),
+            },
+        )],
+        request,
+    )
+    .expect("过滤器套用不该失败");
+    assert!(filtered.is_dirty("system"));
+
+    let payload = passthrough(ModelFormat::OpenaiCompletions, &filtered);
+    let messages = payload["messages"].as_array().expect("messages 是数组");
+    assert_eq!(messages.len(), 2, "system / developer 合并成一条 system");
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[0]["content"], "旧提示\n老规矩\n新提示");
+    assert_eq!(messages[1]["role"], "user");
+}
+
+/// Responses 同协议直通：多轮会话指针与客户端扩展键不再被丢掉。
+#[test]
+fn responses_passthrough_keeps_client_extensions() {
+    let client = json!({
+        "model": "gpt-5",
+        "input": "hi",
+        "previous_response_id": "resp_abc",
+        "include": ["reasoning.encrypted_content"],
+        "truncation": "auto",
+        "store": false
+    });
+    let request = provider_for(ModelFormat::OpenaiResponses)
+        .decode_request(client.clone())
+        .expect("Responses 请求应该能解析")
+        .retain_client_raw(client);
+
+    let encoded = passthrough(ModelFormat::OpenaiResponses, &request);
+    assert_eq!(encoded["model"], "upstream-model");
+    assert_eq!(encoded["previous_response_id"], "resp_abc");
+    assert_eq!(encoded["include"][0], "reasoning.encrypted_content");
+    assert_eq!(encoded["truncation"], "auto");
+    assert_eq!(encoded["input"], "hi");
+    assert_eq!(
+        encoded["max_output_tokens"],
+        json!(crate::domain::model::DEFAULT_MAX_TOKENS)
+    );
+    assert!(encoded.get("_canonical").is_none());
+}
+
+/// 没有保留客户端原文（内部构造的请求）时快路不参与，也不会有协议提供快路给非本协议形状的报文。
+#[test]
+fn passthrough_falls_back_without_a_retained_client_payload() {
+    let request = request(json!({ "model": "m", "messages": [], "max_tokens": 8 }));
+    for format in ModelFormat::ALL {
+        assert!(
+            provider_for(format)
+                .encode_request_passthrough(&model(format, "https://example.com/v1"), &request)
+                .expect("快路判定不该失败")
+                .is_none(),
+            "{} 在没有客户端原文时不该给出直通报文",
+            format.as_str()
+        );
+    }
+}
+
 /// 停止原因双向表（文档里的取值都要能对上）。
 #[test]
 fn stop_reasons_round_trip_per_protocol() {
@@ -1183,8 +1347,13 @@ fn sqlite_persistence_round_trips() {
     settings::init(&dir).expect("database should initialize");
 
     let seeded = settings::snapshot();
-    assert_eq!(seeded.models.len(), 2);
-    assert!(seeded.active_model_id.is_some());
+    // 空库启动：示例模型（seed_default_models）已在 1a28cb0 移除，模型由用户自己添加。
+    assert!(seeded.models.is_empty());
+    assert_eq!(seeded.active_model_id, None);
+    // 三个新设置项的默认值：开机启动默认开，代理默认关、地址为空（直连）。
+    assert!(seeded.launch_at_login);
+    assert!(!seeded.proxy_enabled);
+    assert!(seeded.proxy_url.is_empty());
 
     let saved = settings::mutate(|store| {
         store.upsert(ModelInput {
@@ -1198,7 +1367,8 @@ fn sqlite_persistence_round_trips() {
         })
     })
     .expect("model should save");
-    assert_eq!(saved.id, 3);
+    // 空库里的第一个模型就是 1 号（不再有预置模型占位）
+    assert_eq!(saved.id, 1);
 
     settings::mutate(|store| {
         store.applied.insert("claude-desktop".into(), saved.id);
@@ -1225,6 +1395,7 @@ fn sqlite_persistence_round_trips() {
             source_app: "claude-desktop".into(),
             upstream_url: "https://example.com/v1/responses".into(),
             upstream_model: "temp-model".into(),
+            proxied: true,
             inbound_protocol: "anthropic-messages".into(),
             upstream_protocol: "openai-responses".into(),
             input_tokens: 10,
@@ -1249,6 +1420,7 @@ fn sqlite_persistence_round_trips() {
         "https://example.com/v1/responses"
     );
     assert_eq!(records[0].upstream_model, "temp-model");
+    assert!(records[0].proxied, "经代理出站的标记要能落库读回");
     let summary = usage::summary(365);
     assert_eq!(summary.total_requests, 1);
     assert_eq!(summary.today_tokens, 15);
@@ -1280,6 +1452,7 @@ fn sqlite_persistence_round_trips() {
             source_app: "claude-desktop".into(),
             upstream_url: "https://example.com/v1/responses".into(),
             upstream_model: "temp-model".into(),
+            proxied: true,
             inbound_protocol: "anthropic-messages".into(),
             upstream_protocol: "openai-responses".into(),
             input_tokens: 3,
@@ -1327,6 +1500,7 @@ fn sqlite_persistence_round_trips() {
             source_app: "claude-desktop".into(),
             upstream_url: String::new(),
             upstream_model: String::new(),
+            proxied: false,
             inbound_protocol: "anthropic-messages".into(),
             upstream_protocol: "openai-responses".into(),
             input_tokens: 1,
@@ -1365,6 +1539,7 @@ fn sqlite_persistence_round_trips() {
             source_app: "claude-desktop".into(),
             upstream_url: String::new(),
             upstream_model: String::new(),
+            proxied: false,
             inbound_protocol: "anthropic-messages".into(),
             upstream_protocol: "openai-responses".into(),
             input_tokens: 1,
@@ -1403,6 +1578,7 @@ fn sqlite_persistence_round_trips() {
                 source_app: "claude-desktop".into(),
                 upstream_url: String::new(),
                 upstream_model: String::new(),
+                proxied: false,
                 inbound_protocol: "anthropic-messages".into(),
                 upstream_protocol: "openai-responses".into(),
                 input_tokens: 1,
@@ -1480,6 +1656,27 @@ fn sqlite_persistence_round_trips() {
     assert_eq!(loaded[0].name, "注入");
     assert!(loaded[0].enabled);
     assert_eq!(loaded[0].rule.kind(), "system-prompt");
+
+    // 设置项：改过的三个键落库后，重新从库里读回来仍在
+    settings::mutate(|store| {
+        store.launch_at_login = false;
+        store.proxy_enabled = true;
+        store.proxy_url = "http://127.0.0.1:7890".into();
+    })
+    .expect("settings should save");
+
+    settings::init(&dir).expect("settings should reload");
+    let restored = settings::snapshot();
+    assert!(!restored.launch_at_login);
+    assert!(restored.proxy_enabled);
+    assert_eq!(restored.proxy_url, "http://127.0.0.1:7890");
+
+    // 关掉代理不该丢地址：下次打开开关还是它（settings 层只管存，不参与判断）
+    settings::mutate(|store| store.proxy_enabled = false).expect("settings should save");
+    settings::init(&dir).expect("settings should reload");
+    let off = settings::snapshot();
+    assert!(!off.proxy_enabled);
+    assert_eq!(off.proxy_url, "http://127.0.0.1:7890");
 
     // 分页：总数一致、倒序、翻页与越界（此时明细已很多）
     let all = usage::page(0, 100_000);
@@ -1649,4 +1846,62 @@ fn filter_skips_disabled_and_stacks_in_order() {
     )
     .unwrap();
     assert_eq!(stacked.raw()["system"], "C\nA\nB");
+}
+
+#[test]
+fn proxy_url_is_validated_before_it_reaches_the_network() {
+    use crate::providers::validate_proxy;
+
+    // 留空 = 直连：用户得能把代理清掉
+    assert_eq!(validate_proxy("").unwrap(), None);
+    assert_eq!(validate_proxy("   ").unwrap(), None);
+
+    // 带协议头、不带协议头（补 http://）、带账号密码：都归一化后再存库
+    assert_eq!(
+        validate_proxy("http://127.0.0.1:7890").unwrap().as_deref(),
+        Some("http://127.0.0.1:7890")
+    );
+    assert_eq!(
+        validate_proxy(" 127.0.0.1:7890 ").unwrap().as_deref(),
+        Some("http://127.0.0.1:7890")
+    );
+    assert!(validate_proxy("http://user:pw@127.0.0.1:7890").is_ok());
+
+    // socks 要 reqwest 的 socks 特性（本项目没开）：保存时就拦住，别等发请求才失败
+    assert!(validate_proxy("socks5://127.0.0.1:1080").is_err());
+    assert!(validate_proxy("ftp://127.0.0.1:21").is_err());
+    assert!(validate_proxy("http://").is_err());
+    assert!(validate_proxy("not a url").is_err());
+}
+
+#[test]
+fn turning_the_proxy_on_requires_an_address() {
+    use crate::commands::system::resolve_proxy;
+
+    // 开着却没地址 = 实际在直连，用户以为走了代理：保存就该拦下来
+    assert!(resolve_proxy(Some(true), None, false, "").is_err());
+    assert!(resolve_proxy(Some(true), Some("   "), false, "").is_err());
+    // 已经开着、这次把地址清掉（没带开关字段）：同样是偷偷变直连，一样拦
+    assert!(resolve_proxy(None, Some(""), true, "http://127.0.0.1:7890").is_err());
+
+    // 开着且这次填了地址 / 库里已有地址：放行
+    assert!(resolve_proxy(Some(true), Some("http://127.0.0.1:7890"), false, "").is_ok());
+    assert!(resolve_proxy(Some(true), None, false, "http://127.0.0.1:7890").is_ok());
+
+    // 关掉：地址留着下次用，清掉也行，两种都放行
+    assert!(!resolve_proxy(Some(false), Some(""), true, "http://127.0.0.1:7890").unwrap());
+    assert!(!resolve_proxy(None, None, false, "").unwrap());
+}
+
+#[test]
+#[cfg(windows)]
+fn autostart_quotes_the_executable_path() {
+    use crate::autostart::command_line;
+    use std::path::Path;
+
+    // 带空格的路径必须加引号，否则 Windows 只认第一个空格之前的那一段。
+    assert_eq!(
+        command_line(Path::new(r"C:\Program Files\AI Start\ai-start.exe")),
+        r#""C:\Program Files\AI Start\ai-start.exe""#
+    );
 }

@@ -96,6 +96,9 @@ function cacheHit(record: UsageRecord): string {
             <Badge v-if="record.failover" variant="outline" class="ml-1.5">
               自动切换
             </Badge>
+            <Badge v-if="record.proxied" variant="outline" class="ml-1.5" title="经代理出站">
+              代理
+            </Badge>
           </td>
           <td class="py-2 pr-3 whitespace-nowrap text-muted-foreground">
             {{ protocolLabel(record.inboundProtocol) }}

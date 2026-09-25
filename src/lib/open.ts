@@ -20,3 +20,12 @@ export async function openDownloadDir(): Promise<void> {
     notifyError(error, "打开下载文件夹失败");
   }
 }
+
+/// 在资源管理器里打开应用数据目录（配置与数据库都在这里）。
+export async function openDataDir(): Promise<void> {
+  try {
+    await systemApi.openDataDir();
+  } catch (error) {
+    notifyError(error, "打开数据目录失败");
+  }
+}

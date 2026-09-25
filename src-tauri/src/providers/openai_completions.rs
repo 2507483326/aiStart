@@ -1,7 +1,7 @@
 use serde_json::{json, Map, Value};
 
 use crate::domain::canonical::{
-    blocks_to_text, content_to_text, CanonicalRequest, ContentBlock, MaxTokensField,
+    blocks_to_text, content_to_text, CanonicalRequest, ContentBlock, MaxTokensField, SystemPrompt,
 };
 use crate::domain::model::{ModelConfig, ModelFormat};
 use crate::error::{AppError, AppResult};
@@ -111,6 +111,32 @@ fn encode_tool_choice(choice: &Value) -> Option<Value> {
         }
         _ => Value::String("auto".into()),
     })
+}
+
+/// 客户端有没有给出输出上限（`max_tokens` / `max_completion_tokens`；`null` 或非法值都算没给）。
+fn has_output_limit(payload: &Map<String, Value>) -> bool {
+    ["max_tokens", "max_completion_tokens"]
+        .iter()
+        .any(|key| payload.get(*key).is_some_and(|value| value.as_u64().is_some()))
+}
+
+/// 把规范里的 system 写成 completions 的 system 消息：清掉客户端原有的 system/developer 消息，
+/// 在队首放一条（位置与重建路径一致）。只在过滤器改写过后调用——此时 system 是网关接管的字段，
+/// 与重建路径一样按纯文本落地。
+fn write_system_message(payload: &mut Map<String, Value>, system: Option<&SystemPrompt>) {
+    let text = system.map(SystemPrompt::plain_text).unwrap_or_default();
+    let Some(messages) = payload.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    messages.retain(|message| {
+        !matches!(
+            message.get("role").and_then(Value::as_str),
+            Some("system" | "developer")
+        )
+    });
+    if !text.is_empty() {
+        messages.insert(0, json!({ "role": "system", "content": text }));
+    }
 }
 
 impl ModelProvider for OpenaiCompletionsProvider {
@@ -621,6 +647,37 @@ impl ModelProvider for OpenaiCompletionsProvider {
         }
 
         CanonicalRequest::parse(Value::Object(canonical))
+    }
+
+    /// 同协议（Completions → Completions）免转换快路：以客户端原文为底，只改必须改的三处——
+    /// 上游模型名、被过滤器改写的 system、规范内部字段。客户端的扩展键（OpenRouter 的
+    /// `provider`/`route`、message 的 `name`、`logit_bias`、`stop` 的原字段名……）原样带给上游。
+    fn encode_request_passthrough(
+        &self,
+        cfg: &ModelConfig,
+        req: &CanonicalRequest,
+    ) -> AppResult<Option<Value>> {
+        let Some(client) = req.client_raw().and_then(Value::as_object) else {
+            return Ok(None);
+        };
+        let mut payload = client.clone();
+
+        payload.insert("model".into(), Value::String(cfg.model.clone()));
+        // 客户端两个上限字段都没给时补默认值（与重建路径一致，否则同协议请求会变成不限长）。
+        if !has_output_limit(&payload) {
+            payload.insert(
+                "max_tokens".into(),
+                json!(crate::domain::model::DEFAULT_MAX_TOKENS),
+            );
+        }
+        // 只有过滤器注入过系统提示词才重写 system 消息；没注入过就完全保留客户端的原有写法
+        // （多条 system 消息、developer 角色、块数组里的 cache_control 都不动）。
+        if req.is_dirty("system") {
+            write_system_message(&mut payload, req.body().system.as_ref());
+        }
+        // 规范内部字段不属于任何线上协议：客户端碰巧带了同名键也删掉。
+        payload.remove(wire::CANONICAL_ONLY_KEY);
+        Ok(Some(Value::Object(payload)))
     }
 
     fn encode_response(&self, cfg: &ModelConfig, canonical: &Value) -> AppResult<Value> {

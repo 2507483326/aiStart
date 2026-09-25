@@ -70,6 +70,8 @@ export interface UsageRecord {
   sourceApp: string;
   upstreamUrl: string;
   upstreamModel: string;
+  /// 这次请求是否经代理出站（未发起上游请求的失败算直连）。
+  proxied: boolean;
   inboundProtocol: string;
   upstreamProtocol: string;
   inputTokens: number;
@@ -213,6 +215,12 @@ export interface GatewayStatus {
 export interface SettingsView {
   gatewayPort: number;
   autoFailover: boolean;
+  /// 开机自启（默认开启，落在 Windows 登录启动项上）。
+  launchAtLogin: boolean;
+  /// 出站代理是否启用（关掉即直连，proxyUrl 保留）。
+  proxyEnabled: boolean;
+  /// 出站代理地址，空串 = 直连。
+  proxyUrl: string;
   activeModelId: number | null;
   applied: Record<string, number>;
 }
@@ -220,6 +228,9 @@ export interface SettingsView {
 export interface SettingsInput {
   gatewayPort?: number;
   autoFailover?: boolean;
+  launchAtLogin?: boolean;
+  proxyEnabled?: boolean;
+  proxyUrl?: string;
 }
 
 export interface AppInfo {
@@ -228,7 +239,6 @@ export interface AppInfo {
   platform: string;
   arch: string;
   configDir: string;
-  downloadDir: string;
 }
 
 export interface DownloadProgress {

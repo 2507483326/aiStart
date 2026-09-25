@@ -99,6 +99,13 @@ fn parse_latest(body: &str, url: &str) -> Option<String> {
             .as_str()?;
         return extract_version(raw);
     }
+    if url.contains("zcode.z.ai") {
+        // ZCode 更新日志页（Next.js SSR 的 HTML）：版本按新→旧排列，正文里第一条
+        // `Release vX.Y.Z` 即当前最新版本。页面没有可用的 JSON 版本接口，
+        // electron-builder 的 latest.yml 也只有带版本号的路径（`.../releases/{version}/...`），
+        // 拿不到版本号就拼不出地址，故只能解析这一页。
+        return extract_version(body.split("Release v").nth(1)?);
+    }
     extract_version(body.trim().lines().next()?)
 }
 
@@ -138,6 +145,7 @@ fn segments(version: &str) -> Vec<u64> {
         .collect()
 }
 
+/// 写入/更新某个应用的版本检查快照（每个应用一行；重复刷新只覆盖这一行）。
 #[allow(clippy::too_many_arguments)]
 pub fn record_check(
     kind: AppKind,
@@ -153,7 +161,13 @@ pub fn record_check(
         connection.execute(
             "INSERT INTO app_version_records (app_kind, action, installed_version, target_version, latest_version, \
              update_available, source_url, status, message, event_time, created_time, update_time) \
-             VALUES (?1, 'check', ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8)",
+             VALUES (?1, 'check', ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8) \
+             ON CONFLICT(app_kind) DO UPDATE SET \
+             action = excluded.action, installed_version = excluded.installed_version, \
+             target_version = excluded.target_version, latest_version = excluded.latest_version, \
+             update_available = excluded.update_available, source_url = excluded.source_url, \
+             status = excluded.status, message = excluded.message, \
+             event_time = excluded.event_time, update_time = excluded.update_time",
             params![
                 kind.as_str(),
                 installed,
@@ -169,6 +183,9 @@ pub fn record_check(
     });
 }
 
+/// 写入/更新某个应用的安装更新动作记录。与 check 共用该应用唯一的那一行：
+/// 只覆盖动作相关字段，保留最近一次检查得到的 latest_version / target_version /
+/// source_url / update_available（一次安装不改变「是否有新版本」的判定，等下次刷新再更新）。
 pub fn record_action(
     kind: AppKind,
     action: &str,
@@ -182,7 +199,11 @@ pub fn record_action(
         connection.execute(
             "INSERT INTO app_version_records (app_kind, action, installed_version, target_version, \
              update_available, status, message, event_time, created_time, update_time) \
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?7, ?7)",
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?7, ?7) \
+             ON CONFLICT(app_kind) DO UPDATE SET \
+             action = excluded.action, installed_version = excluded.installed_version, \
+             status = excluded.status, message = excluded.message, \
+             event_time = excluded.event_time, update_time = excluded.update_time",
             params![
                 kind.as_str(),
                 action,
@@ -197,19 +218,11 @@ pub fn record_action(
     });
 }
 
-/// 最近一次「有效」check 结果（按应用），用于重启后立刻显示徽标而不必等联网。
-/// 只认能真正比较出结果的检查（status = found / up-to-date）；早期落下的
-/// unreachable 行一律忽略，避免它们把已知的「有新版本」盖掉。
+/// 每个应用最近一次的检查快照（一行 = 一个应用），用于重启后立刻显示徽标而不必等联网。
 pub fn latest_checks() -> BTreeMap<AppKind, CheckSnapshot> {
     db::with_conn(|connection| {
-        let mut statement = connection.prepare(
-            "SELECT r.app_kind, r.latest_version, r.update_available \
-             FROM app_version_records r \
-             JOIN (SELECT app_kind, MAX(event_time) AS newest FROM app_version_records \
-                   WHERE action = 'check' AND status <> 'unreachable' GROUP BY app_kind) m \
-               ON r.app_kind = m.app_kind AND r.event_time = m.newest \
-             WHERE r.action = 'check' AND r.status <> 'unreachable'",
-        )?;
+        let mut statement = connection
+            .prepare("SELECT app_kind, latest_version, update_available FROM app_version_records")?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -247,6 +260,7 @@ mod tests {
         "https://copilot.tencent.com/v2/update?platform=workbuddy-win32-x64-user&version={version}";
     const WORKBUDDY_URL: &str =
         "https://copilot.tencent.com/v2/update?platform=workbuddy-win32-x64-user&version=5.3.5";
+    const ZCODE_URL: &str = "https://zcode.z.ai/cn/changelog";
 
     #[test]
     fn reads_newest_asset_from_squirrel_releases() {
@@ -263,6 +277,17 @@ mod tests {
         let body =
             r#"{ "tag_name": "claude-app-v2.7032.0", "name": "Claude App Mirror 2.7032.0" }"#;
         assert_eq!(parse_latest(body, MIRROR_URL).as_deref(), Some("2.7032.0"));
+    }
+
+    #[test]
+    fn reads_latest_version_from_zcode_changelog() {
+        // 更新日志页把最新版本排在最前：正文里第一条 `Release vX.Y.Z` 就是当前最新版本。
+        // 前面故意放一个带点号的 CSS 哈希，证明这条 URL 走的是专用分支而不是通用兜底
+        // （通用兜底只看首行，会从 `95d975...css` 里读出一段垃圾）。
+        let body = "<!DOCTYPE html><html><link href=\"/_next/static/css/95d975bdaa94e289.css\">\
+                    <h2 class=\"text-3xl\">Release v3.14.3</h2>\
+                    <h2 class=\"text-3xl\">Release v3.14.1</h2>";
+        assert_eq!(parse_latest(body, ZCODE_URL).as_deref(), Some("3.14.3"));
     }
 
     #[test]

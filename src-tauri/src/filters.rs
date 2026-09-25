@@ -109,10 +109,14 @@ pub fn apply(rules: &[RequestFilter], request: CanonicalRequest) -> AppResult<Ca
 
 fn apply_rule(request: CanonicalRequest, rule: &FilterRule) -> AppResult<CanonicalRequest> {
     let FilterRule::SystemPrompt { mode, text } = rule;
-    request.map_raw(|raw| {
+    let mut request = request.map_raw(|raw| {
         apply_system_prompt(raw, *mode, text);
         Ok(())
-    })
+    })?;
+    // 记下「system 被改过」：同协议直通以客户端原文为底，只覆盖改过的规范字段，
+    // 不标记的话注入的提示词会被客户端原文盖回去。
+    request.mark_dirty("system");
+    Ok(request)
 }
 
 fn apply_system_prompt(raw: &mut Value, mode: PromptMode, text: &str) {
