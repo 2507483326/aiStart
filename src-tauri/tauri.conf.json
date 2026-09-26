@@ -44,7 +44,9 @@
       "allowDowngrades": false,
       "nsis": {
         "installMode": "currentUser",
-        "languages": ["SimpChinese", "English"]
+        "languages": ["SimpChinese", "English"],
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico"
       },
       "wix": {
         "upgradeCode": "5f99eafa-a6b0-548a-b8dd-62f1d31f5c09",

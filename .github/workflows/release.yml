@@ -69,6 +69,15 @@ jobs:
       - name: 构建安装包
         run: pnpm tauri build
 
+      # 把整个 bundle 目录留档为构建产物。draft Release 只有仓库协作者可见，
+      # 一旦某个格式没打出来（或要核对产物名），从外部没有任何办法确认 CI 产了什么。
+      - name: 上传安装包为构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundles-${{ steps.version.outputs.value }}
+          path: src-tauri/target/release/bundle/**
+          if-no-files-found: error
+
       - name: 发布到 GitHub Release
         uses: softprops/action-gh-release@v2
         with:
