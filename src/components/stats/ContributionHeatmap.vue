@@ -169,7 +169,10 @@ const todayTokens = computed(() => usageByDate.value.get(iso(today))?.totalToken
       <div class="flex items-center gap-3">
         <span>
           {{ year }} 年
-          <span class="font-medium text-foreground tabular-nums">{{ formatNumber(yearTokens) }}</span>
+          <span
+            class="font-medium text-foreground tabular-nums"
+            :title="`${formatNumber(yearTokens)} tokens`"
+          >{{ formatCompact(yearTokens) }}</span>
           <span class="ml-0.5">tokens</span>
         </span>
         <span>
@@ -179,7 +182,10 @@ const todayTokens = computed(() => usageByDate.value.get(iso(today))?.totalToken
         </span>
         <span>
           今日
-          <span class="font-medium text-foreground tabular-nums">{{ formatNumber(todayTokens) }}</span>
+          <span
+            class="font-medium text-foreground tabular-nums"
+            :title="`${formatNumber(todayTokens)} tokens`"
+          >{{ formatCompact(todayTokens) }}</span>
           <span class="ml-0.5">tokens</span>
         </span>
       </div>
