@@ -329,7 +329,85 @@ cargo check --manifest-path src-tauri/Cargo.toml
 前端 dev server 使用 `16271`（HMR `16272`），可在 `vite.config.ts` 中调整；
 本地网关默认监听 `127.0.0.1:8931`，可在应用「设置」中修改。
 
-配置与模型数据保存在 `%APPDATA%\com.aistart.toolbox\settings.json`（路径见应用「设置」对话框）。
+配置、模型与用量都存在 SQLite 里：`%APPDATA%\com.aistart.toolbox\ai-start.db3`
+（SQLite 与网关分离见 `src-tauri/src/db/`；路径可在应用「设置」对话框里直接打开）。
+
+## 打包与分发
+
+```bash
+pnpm tauri build        # 产物在 src-tauri/target/release/bundle/
+```
+
+同时打出两种安装包：
+
+| 目标 | 产物 | 安装位置 | 是否需要管理员 |
+| --- | --- | --- | --- |
+| NSIS | `bundle/nsis/AI Start_<版本>_x64-setup.exe` | `%LOCALAPPDATA%\AI Start` | 不需要 |
+| MSI (WiX) | `bundle/msi/AI Start_<版本>_x64_zh-CN.msi` | `C:\Program Files\AI Start` | 需要 |
+
+**二选一安装，不要混装。** 两者是各自独立的安装记录，混装会得到两份副本；而它们写的是同一个
+HKCU 自启值名（`AI Start`）和同一个网关端口（默认 8931），后启动的那份还会因为单实例锁直接退出、
+转去激活先启动的那份 —— 现象是「装了新的，打开还是旧的」。MSI 这一路是留给企业用组策略 / Intune
+分发的，普通用户用 NSIS。
+
+发版走 `.github/workflows/release.yml`：推一个 `v<major>.<minor>.<patch>` 形式的 tag 即触发构建，
+版本号从 tag 取，产物以 draft Release 形式挂出。**tag 不能带 `-beta` 这类预发布后缀** —— MSI 的
+`ProductVersion` 只接受纯数字，带了会让 WiX 直接构建失败。
+
+三处版本号（`tauri.conf.json` / `package.json` / `Cargo.toml`）彼此独立，产物版本只认
+`tauri.conf.json`；CI 会用 tag 覆盖它，本地构建需要自己对齐。
+
+### 本地构建需要能访问 GitHub
+
+首次 `pnpm tauri build` 会联网下载两套打包工具链到 `%LOCALAPPDATA%\tauri\`：NSIS 3.11
+（`tauri-apps/binary-releases`）与 WiX 3.14（`wixtoolset/wix3`），之后一直复用（删掉该目录会重新下载）。
+
+**Tauri bundler 只读 `HTTPS_PROXY` / `ALL_PROXY` 这类环境变量，不读 Windows 的 IE/WinINET 代理设置。**
+所以即使系统代理是开着的（`HKCU\...\Internet Settings` 里有 `ProxyServer`），工具链下载仍然是直连，
+国际链路一慢就会直接报 `failed to bundle project: timeout: global`。需要显式给构建进程设代理：
+
+```powershell
+$env:HTTPS_PROXY = "http://127.0.0.1:7890"   # 换成你自己的代理地址
+pnpm tauri build
+```
+
+也可以改用 Tauri 官方支持的镜像开关（见 `crates/tauri-bundler/src/utils/http_utils.rs`），
+它会把 GitHub 的下载地址改写成镜像地址：
+
+```powershell
+# 模板形式，占位符为 <owner> <repo> <version> <asset>
+$env:TAURI_BUNDLER_TOOLS_GITHUB_MIRROR_TEMPLATE = "https://<镜像>/<owner>/<repo>/releases/download/<version>/<asset>"
+# 或者 CDN 前缀形式：完整 GitHub 路径会拼在镜像地址之后
+$env:TAURI_BUNDLER_TOOLS_GITHUB_MIRROR = "https://<镜像>"
+```
+
+CI（GitHub runner）不受此影响，无需设置。
+
+### 两个刻意写死的配置
+
+- **`bundle.windows.wix.upgradeCode`** 固定为 `5f99eafa-a6b0-548a-b8dd-62f1d31f5c09`。
+  Tauri 默认按 `<productName>.exe.app.x64` 派生这个值，所以**改 `productName` 会让 upgrade code
+  跟着变**，Windows 会把新包当成另一个应用，老用户升级后出现重复安装。写死即可免疫。
+- **`bundle.windows.allowDowngrades`** 为 `false`。数据库 schema 只能向前迁移（见 `db/mod.rs` 的
+  `SCHEMA_VERSION`），装回旧版会拿旧代码读新库。这个开关同时也是同版本覆盖安装能正常替换的前提
+  —— 关掉它时 Tauri 会额外加上 `AllowSameVersionUpgrades="yes"`。
+
+### 卸载时的自启项残留
+
+「开机启动」是应用直接写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`（见 `autostart.rs`），
+安装器并不感知它，两侧表现不同：
+
+- **NSIS**：Tauri 的卸载脚本已内置这条清理（`DeleteRegValue`），并在升级时用 `$UpdateMode <> 1`
+  跳过，所以升级不会丢自启。**前提是 `tauri.conf.json` 的 `productName` 与 `autostart.rs` 里的
+  `VALUE_NAME` 一致**（当前两者都是 `AI Start`）—— 名字对不上，清理会静默失效。
+- **MSI**：**卸载后会残留**一条指向已被删除的 exe 的自启项，在任务管理器的「启动」页可见。
+  WiX v3 没有「卸载时只删某一个注册表值」的声明式写法：`RemoveRegistryValue` 是**安装时**删除
+  （拿它做清理反而会在升级时删掉自启项），`RemoveRegistryKey` 则会删掉整个 `Run` 键、波及其它所有
+  软件。要清干净只能 fork 整份 WiX 模板加自定义动作。这是已知取舍。
+
+应用数据默认不随卸载删除，分布在两处：`%APPDATA%\com.aistart.toolbox`（`ai-start.db3`，设置、模型、
+绑定关系与用量都在库里）和 `%LOCALAPPDATA%\com.aistart.toolbox`（WebView2 数据与安装包下载缓存）。
+NSIS 的卸载脚本里另有一段清理逻辑，只有勾选「同时删除应用数据」时才会连这两处一起清。
 
 ## 已知边界
 

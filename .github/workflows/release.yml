@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+# 创建 Release 需要写权限，其余一律不给。
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 校验 tag 并取出版本号
+        id: version
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          # WiX 写的 ProductVersion 只接受纯数字的 major.minor.patch[.build]，
+          # 带 -beta.1 / -rc 这类预发布后缀会让 MSI 直接构建失败，所以在这里就拦下来。
+          if ($version -notmatch "^\d+\.\d+\.\d+$") {
+            throw "tag 必须是 v<major>.<minor>.<patch> 形式（MSI 不接受预发布后缀），当前是 ${{ github.ref_name }}"
+          }
+          "value=$version" >> $env:GITHUB_OUTPUT
+
+      # 放在 setup-node 之前：setup-node 的 pnpm 缓存需要先有 pnpm，
+      # 而版本号由 package.json 的 packageManager 字段决定。
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # WiX 与 NSIS 工具链是首次打包时联网下载到用户目录的，runner 每次都是干净环境，
+      # 不缓存的话每轮都要重下。路径用 `~` 展开而不是 ${{ env.LOCALAPPDATA }}：
+      # GitHub 的 env 上下文不包含 runner 注入的系统环境变量，那里会解析成空字符串。
+      #
+      # key 带锁文件哈希：Tauri 自己会按内置哈希表校验缓存、只补下不匹配的文件（NSIS），
+      # WiX 的目录名也带版本（WixTools314），所以静态 key 其实也能用。绑上哈希只是为了让
+      # 升级 @tauri-apps/cli 时直接换一把新 key、从干净状态下载，不去依赖那条自愈路径。
+      - name: 缓存 WiX / NSIS 工具链
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\tauri
+          key: tauri-bundler-tools-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      # 产物版本只认 tauri.conf.json。三处版本号（tauri.conf.json / package.json /
+      # Cargo.toml）各自独立，不覆盖的话产物会一直停在文件里写死的那个版本，
+      # 产物名与 Release 版本号对不上，MSI 的 ProductVersion 也不会前进。
+      # 用 JSON.parse/stringify 而不是改文本，避免把文件改坏。
+      - name: 把 tag 版本写进 tauri.conf.json
+        shell: pwsh
+        run: |
+          node -e "const fs=require('fs');const p='src-tauri/tauri.conf.json';const c=JSON.parse(fs.readFileSync(p,'utf8'));c.version=process.argv[1];fs.writeFileSync(p,JSON.stringify(c,null,2)+'\n');" '${{ steps.version.outputs.value }}'
+
+      - name: 构建安装包
+        run: pnpm tauri build
+
+      - name: 发布到 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          fail_on_unmatched_files: true
+          files: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/msi/*.msi

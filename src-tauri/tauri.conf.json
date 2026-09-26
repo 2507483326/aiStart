@@ -26,13 +26,30 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["nsis", "msi"],
+    "publisher": "AI Start",
+    "copyright": "Copyright (c) 2026 AI Start",
+    "homepage": "https://github.com/2507483326/aiStart",
+    "category": "DeveloperTool",
+    "shortDescription": "管理开发者工具的桌面工具箱",
+    "longDescription": "一键安装、一键更新、一键把任意模型接入桌面客户端。内置只监听 127.0.0.1 的本地网关，在 Anthropic Messages 与 OpenAI 两种协议之间双向翻译。",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "allowDowngrades": false,
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["SimpChinese", "English"]
+      },
+      "wix": {
+        "upgradeCode": "5f99eafa-a6b0-548a-b8dd-62f1d31f5c09",
+        "language": "zh-CN"
+      }
+    }
   }
 }
