@@ -4,7 +4,7 @@
 
 **管理开发者工具的桌面工具箱**
 
-一键安装 · 一键更新 · 一键把任意模型接入桌面客户端
+一个 Windows AI 代理工具 · 一键把任意模型接入桌面客户端
 
 [![Release](https://img.shields.io/github/v/release/2507483326/aiStart?label=release&color=blue)](https://github.com/2507483326/aiStart/releases/latest)
 [![Build](https://img.shields.io/github/actions/workflow/status/2507483326/aiStart/release.yml?label=build)](https://github.com/2507483326/aiStart/actions/workflows/release.yml)
@@ -13,7 +13,6 @@
 [![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white)](https://tauri.app)
 [![Vue](https://img.shields.io/badge/Vue-3-42B883?logo=vuedotjs&logoColor=white)](https://vuejs.org)
 [![Rust](https://img.shields.io/badge/Rust-Axum-000000?logo=rust&logoColor=white)](https://www.rust-lang.org)
-[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 </div>
 
@@ -24,27 +23,27 @@
 
 ## 功能
 
-![面板]('./pic/面板.png')
+![面板](./pic/面板.png)
 
 **面板** —— 网关运行状态、调用统计、自动切换记录，以及模型概览。
 
-![应用]('./pic/应用.png')
+![应用](./pic/应用.png)
 
 **应用** —— 一键帮你将 AI 接口应用到桌面端当中。
 
-![模型]('./pic/模型.png')
+![模型](./pic/模型.png)
 
 **模型** —— 管理模型，并支持自动路由
 
-![提示词注入]('./pic/提示词注入.png')
+![提示词注入](./pic/提示词注入.png)
 
 **提示词注入** —— 还可以给请求追加或前置系统提示词。用来统一提示词
 
-![统计]('./pic/统计.png')
+![统计](./pic/统计.png)
 
 **统计** —— 在这里可以看到每次请求的详情和消耗
 
-![设置]('./pic/设置.png')
+![设置](./pic/设置.png)
 
 **统计** —— 在这里可以配置请求保存的时间，以及请求代理
 
@@ -62,8 +61,4 @@ cargo check --manifest-path src-tauri/Cargo.toml
 
 pnpm tauri build    # 打包，产物在 src-tauri/target/release/bundle/
 ```
-
-## 许可
-
-[MIT](LICENSE) © 2026 AI Start
 
