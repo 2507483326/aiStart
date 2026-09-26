@@ -69,8 +69,9 @@ jobs:
       - name: 构建安装包
         run: pnpm tauri build
 
-      # 把整个 bundle 目录留档为构建产物。draft Release 只有仓库协作者可见，
-      # 一旦某个格式没打出来（或要核对产物名），从外部没有任何办法确认 CI 产了什么。
+      # 把整个 bundle 目录留档为构建产物。挂到 Release 的资产是靠 glob 匹配的
+      # （nsis/*.exe、msi/*.msi），只能证明「匹配上的都在」，证明不了「该有的都打了」，
+      # 产物名也要靠这里核对，所以整份 bundle 一并留档。
       - name: 上传安装包为构建产物
         uses: actions/upload-artifact@v4
         with:
@@ -81,7 +82,9 @@ jobs:
       - name: 发布到 GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          draft: true
+          # 直接公开发布。draft 只有仓库协作者可见，匿名 API 拉不到，
+          # README 的 release / downloads 徽章会一直显示 no releases。
+          draft: false
           fail_on_unmatched_files: true
           files: |
             src-tauri/target/release/bundle/nsis/*.exe
