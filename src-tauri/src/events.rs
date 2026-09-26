@@ -19,7 +19,7 @@ pub struct EventView {
     pub payload: Option<String>,
 }
 
-/// 审计事件只插不改；写入失败只丢弃该事件，不影响主流程。
+/// 审计事件只插不改；写入失败只丢弃该事件，不影响主流程（异步投递到写线程）。
 pub fn log(
     actor_kind: &str,
     actor_name: Option<&str>,
@@ -29,8 +29,13 @@ pub fn log(
     payload: Option<Value>,
 ) {
     let now = db::now_ms();
+    let actor_kind = actor_kind.to_string();
+    let actor_name = actor_name.map(str::to_string);
+    let event_type = event_type.to_string();
+    let target_kind = target_kind.map(str::to_string);
+    let target_id = target_id.map(str::to_string);
     let payload = payload.map(|value| value.to_string());
-    let _ = db::with_conn(|connection| {
+    db::submit(move |connection| {
         connection.execute(
             "INSERT INTO events (event_time, actor_kind, actor_name, type, target_kind, target_id, payload, created_time, update_time) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?1, ?1)",

@@ -157,7 +157,13 @@ pub fn record_check(
     message: Option<&str>,
 ) {
     let now = db::now_ms();
-    let _ = db::with_conn(|connection| {
+    let app_kind = kind.as_str().to_string();
+    let installed = installed.map(str::to_string);
+    let latest_version = latest_version.map(str::to_string);
+    let source_url = source_url.map(str::to_string);
+    let status = status.to_string();
+    let message = message.map(str::to_string);
+    db::submit(move |connection| {
         connection.execute(
             "INSERT INTO app_version_records (app_kind, action, installed_version, target_version, latest_version, \
              update_available, source_url, status, message, event_time, created_time, update_time) \
@@ -169,7 +175,7 @@ pub fn record_check(
              status = excluded.status, message = excluded.message, \
              event_time = excluded.event_time, update_time = excluded.update_time",
             params![
-                kind.as_str(),
+                app_kind,
                 installed,
                 latest_version,
                 i64::from(update_available),
@@ -195,7 +201,13 @@ pub fn record_action(
     message: Option<&str>,
 ) {
     let now = db::now_ms();
-    let _ = db::with_conn(|connection| {
+    let app_kind = kind.as_str().to_string();
+    let action = action.to_string();
+    let installed = installed.map(str::to_string);
+    let target_version = target_version.map(str::to_string);
+    let status = status.to_string();
+    let message = message.map(str::to_string);
+    db::submit(move |connection| {
         connection.execute(
             "INSERT INTO app_version_records (app_kind, action, installed_version, target_version, \
              update_available, status, message, event_time, created_time, update_time) \
@@ -205,7 +217,7 @@ pub fn record_action(
              status = excluded.status, message = excluded.message, \
              event_time = excluded.event_time, update_time = excluded.update_time",
             params![
-                kind.as_str(),
+                app_kind,
                 action,
                 installed,
                 target_version,

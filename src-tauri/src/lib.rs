@@ -105,7 +105,11 @@ fn init_tray(app: &App) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => show_main_window(app),
-            "quit" => app.exit(0),
+            "quit" => {
+                // 退出前把写线程的队列排空，别丢最后几条记录。
+                crate::db::flush();
+                app.exit(0)
+            }
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {

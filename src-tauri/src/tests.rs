@@ -1687,7 +1687,7 @@ fn sqlite_persistence_round_trips() {
     );
 
     let (timestamp, date) = usage::current_timestamp();
-    usage::record_with_payload(
+    usage::submit(
         &UsageRecord {
             id: 0,
             timestamp: timestamp.clone(),
@@ -1713,6 +1713,8 @@ fn sqlite_persistence_round_trips() {
         None,
     );
 
+    // 落库已改为异步投递：读之前先等写线程排空。
+    crate::db::flush();
     let records = usage::recent(10);
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].total_tokens(), 15);
@@ -1744,7 +1746,7 @@ fn sqlite_persistence_round_trips() {
     assert!(offset_page.items.is_empty());
 
     // 报文捕获：入站请求 + 上游响应可回读
-    usage::record_with_payload(
+    usage::submit(
         &UsageRecord {
             id: 0,
             timestamp: timestamp.clone(),
@@ -1776,6 +1778,7 @@ fn sqlite_persistence_round_trips() {
         }),
     );
 
+    crate::db::flush();
     let latest = usage::recent(1);
     let detail = usage::payload_detail(latest[0].id).expect("payload should load");
     assert_eq!(detail.inbound_request.as_deref(), Some("{\"hello\":1}"));
@@ -1793,7 +1796,7 @@ fn sqlite_persistence_round_trips() {
 
     // 某天首次写入时 usage_daily_total 会新建行，报文仍须挂到正确的明细行
     // （回归：last_insert_rowid 若在 daily upsert 之后取，会被覆盖成 daily 的行号）
-    usage::record_with_payload(
+    usage::submit(
         &UsageRecord {
             id: 0,
             timestamp: timestamp.clone(),
@@ -1824,6 +1827,7 @@ fn sqlite_persistence_round_trips() {
             stream: false,
         }),
     );
+    crate::db::flush();
     let latest = usage::recent(1);
     let detail =
         usage::payload_detail(latest[0].id).expect("payload should link to its own detail");
@@ -1833,7 +1837,7 @@ fn sqlite_persistence_round_trips() {
     );
 
     // 超限报文被截断并置标记
-    usage::record_with_payload(
+    usage::submit(
         &UsageRecord {
             id: 0,
             timestamp: timestamp.clone(),
@@ -1865,6 +1869,7 @@ fn sqlite_persistence_round_trips() {
         }),
     );
 
+    crate::db::flush();
     let latest = usage::recent(1);
     let detail = usage::payload_detail(latest[0].id).expect("payload should load");
     assert!(detail.request_truncated);
@@ -1873,7 +1878,7 @@ fn sqlite_persistence_round_trips() {
 
     // 报文不再做条数保留清理：写入多少就留多少（此时已有 3 条，再补 1001 条后应为 1004 条）
     for _ in 0..1001 {
-        usage::record_with_payload(
+        usage::submit(
             &UsageRecord {
                 id: 0,
                 timestamp: timestamp.clone(),
@@ -1905,6 +1910,7 @@ fn sqlite_persistence_round_trips() {
             }),
         );
     }
+    crate::db::flush();
     let payload_count: i64 = crate::db::with_conn(|connection| {
         Ok(connection.query_row("SELECT COUNT(*) FROM usage_payload", [], |row| row.get(0))?)
     })
@@ -1919,6 +1925,7 @@ fn sqlite_persistence_round_trips() {
         Some("claude-desktop"),
         None,
     );
+    crate::db::flush();
     let logged = events::list(10).expect("events should load");
     assert_eq!(logged.len(), 1);
     assert_eq!(logged[0].event_type, "test.event");
@@ -1932,6 +1939,7 @@ fn sqlite_persistence_round_trips() {
         "found",
         None,
     );
+    crate::db::flush();
     let checks = updates::latest_checks();
     let snapshot = checks
         .get(&AppKind::ClaudeDesktop)
@@ -1956,6 +1964,7 @@ fn sqlite_persistence_round_trips() {
     })
     .expect("filter should save");
 
+    crate::db::flush();
     crate::filters::load().expect("filters should load");
     let loaded = crate::filters::snapshot();
     assert_eq!(loaded.len(), 1);
@@ -1971,6 +1980,7 @@ fn sqlite_persistence_round_trips() {
     })
     .expect("settings should save");
 
+    crate::db::flush();
     settings::init(&dir).expect("settings should reload");
     let restored = settings::snapshot();
     assert!(!restored.launch_at_login);
@@ -1979,12 +1989,14 @@ fn sqlite_persistence_round_trips() {
 
     // 关掉代理不该丢地址：下次打开开关还是它（settings 层只管存，不参与判断）
     settings::mutate(|store| store.proxy_enabled = false).expect("settings should save");
+    crate::db::flush();
     settings::init(&dir).expect("settings should reload");
     let off = settings::snapshot();
     assert!(!off.proxy_enabled);
     assert_eq!(off.proxy_url, "http://127.0.0.1:7890");
 
     // 分页：总数一致、倒序、翻页与越界（此时明细已很多）
+    crate::db::flush();
     let all = usage::page(0, 100_000);
     assert_eq!(all.total as usize, all.items.len());
     assert!(all.total > 50, "expected many rows, got {}", all.total);
@@ -1997,6 +2009,25 @@ fn sqlite_persistence_round_trips() {
     assert_eq!(past_end.total, all.total);
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 落库已改为异步投递：写失败没有调用方可以返回错误，必须能被观测到（面板/排查用）。
+#[test]
+fn database_write_failures_are_observable() {
+    let _settings_db = lock_settings_db();
+    let dir = std::env::temp_dir().join(format!(
+        "ai-start-test-write-fail-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    crate::settings::init(&dir).expect("database should initialize");
+
+    let before = crate::db::write_failures();
+    crate::db::submit(|_connection| Err(crate::error::AppError::Message("write-boom".into())));
+    crate::db::flush();
+
+    assert!(crate::db::write_failures() > before, "失败的写要被计数");
+    assert_eq!(crate::db::last_write_error().as_deref(), Some("write-boom"));
 }
 
 #[test]

@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use rusqlite::params;
@@ -192,14 +191,18 @@ fn cap_bytes(text: &str, limit: usize) -> (String, bool) {
     (text[..end].to_string(), true)
 }
 
-/// 明细 INSERT + 每日总和增量 upsert +（可选）报文 INSERT，单事务。
-/// 写入失败只丢弃记录，不影响调用方。
-pub fn record_with_payload(entry: &UsageRecord, payload: Option<&UsagePayload>) {
-    let event_time = db::ms_from_iso(&entry.timestamp).unwrap_or_else(db::now_ms);
-    let total = entry.total_tokens() as i64;
-    let failed = i64::from(!entry.ok);
+/// 投递一条调用记录（明细 + 每日汇总 + 可选报文）给写线程，单事务。
+///
+/// **非阻塞**（队列未满时立即返回）：网关请求结束只做一次投递，不再等这次 SQLite 事务
+/// （含 commit / fsync）。写入失败由写线程记进 [`db::write_failures`] / [`db::last_write_error`]。
+pub fn submit(entry: &UsageRecord, payload: Option<&UsagePayload>) {
+    let entry = entry.clone();
+    let payload = payload.cloned();
+    db::submit(move |connection| {
+        let transaction = connection.transaction()?;
+        let event_time = db::ms_from_iso(&entry.timestamp).unwrap_or_else(db::now_ms);
+        let total = entry.total_tokens() as i64;
 
-    let _ = db::with_tx(|transaction| {
         transaction.execute(
             "INSERT INTO usage_detail (day, event_time, model_name, served_by, inbound_protocol, upstream_protocol, \
              input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens, \
@@ -232,59 +235,76 @@ pub fn record_with_payload(entry: &UsageRecord, payload: Option<&UsagePayload>) 
         // 必须在 usage_daily_total 的 upsert 之前取：该 upsert 在当天首次插入时会新建行，
         // 从而把 last_insert_rowid() 覆盖成 usage_daily_total 的行号（走 UPDATE 分支则不会）。
         let detail_id = transaction.last_insert_rowid();
+        upsert_daily_total(&transaction, &entry, event_time)?;
 
-        transaction.execute(
-            "INSERT INTO usage_daily_total (day, input_tokens, output_tokens, total_tokens, calls, failed_calls, created_time, update_time) \
-             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?6) \
-             ON CONFLICT(day) DO UPDATE SET \
-               input_tokens = input_tokens + excluded.input_tokens, \
-               output_tokens = output_tokens + excluded.output_tokens, \
-               total_tokens = total_tokens + excluded.total_tokens, \
-               calls = calls + 1, \
-               failed_calls = failed_calls + excluded.failed_calls, \
-               update_time = excluded.update_time",
-            params![
-                entry.date,
-                entry.input_tokens as i64,
-                entry.output_tokens as i64,
-                total,
-                failed,
-                event_time,
-            ],
-        )?;
+        if let Some(payload) = &payload {
+            let (inbound_request, request_truncated) =
+                cap_optional(payload.inbound_request.as_deref());
+            // header 通常很小，同一上限截断即可，不单设 truncated 标记列。
+            let (inbound_headers, _) = cap_optional(payload.inbound_headers.as_deref());
+            let (upstream_request, upstream_request_truncated) =
+                cap_optional(payload.upstream_request.as_deref());
+            let (upstream_response, response_truncated) =
+                cap_optional(payload.upstream_response.as_deref());
 
-        let Some(payload) = payload else {
-            return Ok(());
-        };
+            transaction.execute(
+                "INSERT INTO usage_payload (usage_detail_id, inbound_request, inbound_headers, upstream_request, upstream_response, \
+                 request_truncated, upstream_request_truncated, response_truncated, is_stream, created_time, update_time) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+                params![
+                    detail_id,
+                    inbound_request,
+                    inbound_headers,
+                    upstream_request,
+                    upstream_response,
+                    i64::from(request_truncated),
+                    i64::from(upstream_request_truncated),
+                    i64::from(response_truncated),
+                    i64::from(payload.stream),
+                    event_time,
+                ],
+            )?;
+        }
 
-        let (inbound_request, request_truncated) = cap_optional(payload.inbound_request.as_deref());
-        // header 通常很小，同一上限截断即可，不单设 truncated 标记列。
-        let (inbound_headers, _) = cap_optional(payload.inbound_headers.as_deref());
-        let (upstream_request, upstream_request_truncated) =
-            cap_optional(payload.upstream_request.as_deref());
-        let (upstream_response, response_truncated) =
-            cap_optional(payload.upstream_response.as_deref());
-
-        transaction.execute(
-            "INSERT INTO usage_payload (usage_detail_id, inbound_request, inbound_headers, upstream_request, upstream_response, \
-             request_truncated, upstream_request_truncated, response_truncated, is_stream, created_time, update_time) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
-            params![
-                detail_id,
-                inbound_request,
-                inbound_headers,
-                upstream_request,
-                upstream_response,
-                i64::from(request_truncated),
-                i64::from(upstream_request_truncated),
-                i64::from(response_truncated),
-                i64::from(payload.stream),
-                event_time,
-            ],
-        )?;
-
+        transaction.commit()?;
         Ok(())
     });
+}
+
+/// 每日汇总的增量 upsert（一行 = 一天）。写入时就维护好，汇总查询只读它、不再扫明细。
+/// 抽出来是为了能对内存库单测写入侧（缓存 / 切换 / total 三列）。
+fn upsert_daily_total(
+    connection: &rusqlite::Connection,
+    entry: &UsageRecord,
+    event_time: i64,
+) -> AppResult<()> {
+    connection.execute(
+        "INSERT INTO usage_daily_total (day, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, \
+         total_tokens, calls, failed_calls, failovers, created_time, update_time) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8, ?9, ?9) \
+         ON CONFLICT(day) DO UPDATE SET \
+           input_tokens = input_tokens + excluded.input_tokens, \
+           output_tokens = output_tokens + excluded.output_tokens, \
+           cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens, \
+           cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens, \
+           total_tokens = total_tokens + excluded.total_tokens, \
+           calls = calls + 1, \
+           failed_calls = failed_calls + excluded.failed_calls, \
+           failovers = failovers + excluded.failovers, \
+           update_time = excluded.update_time",
+        params![
+            entry.date,
+            entry.input_tokens as i64,
+            entry.output_tokens as i64,
+            entry.cache_read_tokens.unwrap_or(0) as i64,
+            entry.cache_write_tokens.unwrap_or(0) as i64,
+            entry.total_tokens() as i64,
+            i64::from(!entry.ok),
+            i64::from(entry.failover),
+            event_time,
+        ],
+    )?;
+    Ok(())
 }
 
 fn cap_optional(text: Option<&str>) -> (Option<String>, bool) {
@@ -330,12 +350,12 @@ pub fn payload_detail(usage_detail_id: i64) -> Option<UsagePayloadDetail> {
 
 /// 按「请求保存时间」清理过期报文快照。只删 usage_payload（入站/上游请求与响应），
 /// usage_detail 明细与 usage_daily_total 汇总保留；`retention_days <= 0`（永久保留）不动任何行。
-/// 返回删除行数，失败按 0 计（清理失败不该影响调用方）。
-pub fn cleanup_expired_payloads(retention_days: i64) -> usize {
+/// 走写线程（读连接是 `query_only`，删除只能交给写线程）；异步投递，行数不再返回。
+pub fn cleanup_expired_payloads(retention_days: i64) {
     let Some(cutoff) = retention_cutoff(retention_days, db::now_ms()) else {
-        return 0;
+        return;
     };
-    db::with_conn(|connection| prune_payloads(connection, cutoff)).unwrap_or(0)
+    db::submit(move |connection| prune_payloads(connection, cutoff).map(|_| ()));
 }
 
 /// 保留天数换算成「早于它即过期」的截止时刻；`retention_days <= 0`（永久保留）返回 None。
@@ -422,29 +442,42 @@ pub fn page(offset: usize, limit: usize) -> UsagePage {
     })
 }
 
-fn read_since(cutoff: &str) -> Vec<UsageRecord> {
-    let sql = format!(
-        "SELECT {SELECT_COLUMNS} FROM usage_detail WHERE day >= ?1 ORDER BY usage_detail_id"
-    );
-    db::with_conn(|connection| {
-        let mut statement = connection.prepare(&sql)?;
-        let rows = statement.query_map(params![cutoff], row_to_record)?;
-        let mut records = Vec::new();
-        for row in rows {
-            records.push(row?);
-        }
-        Ok(records)
-    })
-    .unwrap_or_default()
+/// 读每日汇总（`day >= cutoff`，按天升序）。抽出来是为了能对内存库单测，不必碰进程级 usage 库。
+fn read_daily_totals(connection: &rusqlite::Connection, cutoff: &str) -> AppResult<Vec<DailyUsage>> {
+    let mut statement = connection.prepare(
+        "SELECT day, calls, failed_calls, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens \
+         FROM usage_daily_total WHERE day >= ?1 ORDER BY day",
+    )?;
+    let rows = statement.query_map(params![cutoff], |row| {
+        Ok(DailyUsage {
+            date: row.get(0)?,
+            requests: row.get::<_, i64>(1)? as u64,
+            failed: row.get::<_, i64>(2)? as u64,
+            input_tokens: row.get::<_, i64>(3)? as u64,
+            output_tokens: row.get::<_, i64>(4)? as u64,
+            cache_read_tokens: row.get::<_, i64>(5)? as u64,
+            cache_write_tokens: row.get::<_, i64>(6)? as u64,
+            total_tokens: row.get::<_, i64>(7)? as u64,
+        })
+    })?;
+    let mut collected = Vec::new();
+    for row in rows {
+        collected.push(row?);
+    }
+    Ok(collected)
 }
 
 pub fn summary(days: u32) -> UsageSummary {
     let today = chrono::Local::now().date_naive();
     let cutoff = today - chrono::Duration::days(i64::from(days.saturating_sub(1)));
-    let records = read_since(&cutoff.format("%Y-%m-%d").to_string());
+    let cutoff_text = cutoff.format("%Y-%m-%d").to_string();
 
-    let mut daily: BTreeMap<String, DailyUsage> = BTreeMap::new();
-    let mut by_model: BTreeMap<String, ModelUsage> = BTreeMap::new();
+    // 只读每日汇总表（O(天数)）：明细表只供「请求明细」列表，不再参与任何聚合。
+    // 每行的 calls / failed_calls / total_tokens 都是写入时增量累加好的，这里只做求和。
+    let rows = db::with_conn(|connection| read_daily_totals(connection, &cutoff_text))
+        .unwrap_or_default();
+
+    let today_text = today.format("%Y-%m-%d").to_string();
     let mut summary = UsageSummary {
         total_requests: 0,
         failed_requests: 0,
@@ -456,78 +489,29 @@ pub fn summary(days: u32) -> UsageSummary {
         today_tokens: 0,
         streak_days: 0,
         daily: Vec::new(),
+        // by_model 前端没有任何地方渲染（只在 types.ts 里声明过），不再从明细聚合；
+        // 真要用时另开一张 usage_daily_model，别把明细扫描塞回这条查询。
         by_model: Vec::new(),
     };
 
-    for entry in records {
-        let Ok(date) = chrono::NaiveDate::parse_from_str(&entry.date, "%Y-%m-%d") else {
-            continue;
-        };
-        if date < cutoff {
-            continue;
+    let mut active: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for row in rows {
+        summary.total_requests += row.requests;
+        summary.failed_requests += row.failed;
+        summary.input_tokens += row.input_tokens;
+        summary.output_tokens += row.output_tokens;
+        summary.cache_read_tokens += row.cache_read_tokens;
+        summary.cache_write_tokens += row.cache_write_tokens;
+        summary.total_tokens += row.total_tokens;
+        if row.date == today_text {
+            summary.today_tokens = row.total_tokens;
         }
-
-        summary.total_requests += 1;
-        if !entry.ok {
-            summary.failed_requests += 1;
+        if row.requests > 0 {
+            active.insert(row.date.clone());
         }
-        summary.input_tokens += entry.input_tokens;
-        summary.output_tokens += entry.output_tokens;
-        summary.cache_read_tokens += entry.cache_read_tokens.unwrap_or(0);
-        summary.cache_write_tokens += entry.cache_write_tokens.unwrap_or(0);
-        if date == today {
-            summary.today_tokens += entry.total_tokens();
-        }
-
-        let bucket = daily
-            .entry(entry.date.clone())
-            .or_insert_with(|| DailyUsage {
-                date: entry.date.clone(),
-                requests: 0,
-                failed: 0,
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-                total_tokens: 0,
-            });
-        bucket.requests += 1;
-        if !entry.ok {
-            bucket.failed += 1;
-        }
-        bucket.input_tokens += entry.input_tokens;
-        bucket.output_tokens += entry.output_tokens;
-        bucket.cache_read_tokens += entry.cache_read_tokens.unwrap_or(0);
-        bucket.cache_write_tokens += entry.cache_write_tokens.unwrap_or(0);
-        bucket.total_tokens += entry.total_tokens();
-
-        let model = by_model
-            .entry(entry.served_by.clone())
-            .or_insert_with(|| ModelUsage {
-                model_name: entry.served_by.clone(),
-                requests: 0,
-                input_tokens: 0,
-                output_tokens: 0,
-            });
-        model.requests += 1;
-        model.input_tokens += entry.input_tokens;
-        model.output_tokens += entry.output_tokens;
+        summary.daily.push(row);
     }
 
-    summary.total_tokens = summary.input_tokens
-        + summary.output_tokens
-        + summary.cache_read_tokens
-        + summary.cache_write_tokens;
-    summary.daily = daily.into_values().collect();
-    summary.by_model = by_model.into_values().collect();
-    summary.by_model.sort_by(|a, b| b.requests.cmp(&a.requests));
-
-    let active: std::collections::BTreeSet<&str> = summary
-        .daily
-        .iter()
-        .filter(|day| day.requests > 0)
-        .map(|day| day.date.as_str())
-        .collect();
     let mut streak = 0;
     let mut cursor = today;
     while active.contains(cursor.format("%Y-%m-%d").to_string().as_str()) {
@@ -549,15 +533,16 @@ pub struct UsageTotals {
 }
 
 /// 全量累计口径（不限日期），供网关面板等需要跨重启保留的累计值使用。
+/// 从每日汇总表求和（O(天数)），不再扫 usage_detail 全表。
 pub fn totals() -> UsageTotals {
     db::with_conn(|connection| {
         let totals = connection.query_row(
-            "SELECT COUNT(*), \
-                    COALESCE(SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END), 0), \
+            "SELECT COALESCE(SUM(calls), 0), \
+                    COALESCE(SUM(failed_calls), 0), \
                     COALESCE(SUM(input_tokens), 0), \
                     COALESCE(SUM(output_tokens), 0), \
-                    COALESCE(SUM(CASE WHEN failover = 1 THEN 1 ELSE 0 END), 0) \
-             FROM usage_detail",
+                    COALESCE(SUM(failovers), 0) \
+             FROM usage_daily_total",
             [],
             |row| {
                 Ok(UsageTotals {
@@ -619,5 +604,58 @@ mod tests {
             .filter_map(Result::ok)
             .collect();
         assert_eq!(remaining, vec![300]);
+    }
+
+    /// v10：每日汇总表由写入侧增量维护（含缓存与切换两列），汇总查询只读它。
+    /// 用内存库，不碰进程级 usage 库。
+    #[test]
+    fn daily_rollup_tracks_cache_failovers_and_totals() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(db::SCHEMA_SQL).unwrap();
+
+        let entry = |ok: bool, failover: bool, cache_read: u64, cache_write: u64| UsageRecord {
+            id: 0,
+            timestamp: String::new(),
+            date: "2026-01-01".into(),
+            model_name: "M".into(),
+            served_by: "M".into(),
+            source_app: String::new(),
+            upstream_url: String::new(),
+            upstream_model: String::new(),
+            proxied: false,
+            inbound_protocol: "anthropic-messages".into(),
+            upstream_protocol: "openai-responses".into(),
+            input_tokens: 100,
+            output_tokens: 40,
+            cache_read_tokens: (cache_read > 0).then_some(cache_read),
+            cache_write_tokens: (cache_write > 0).then_some(cache_write),
+            reasoning_tokens: None,
+            duration_ms: 1,
+            ok,
+            failover,
+            error: None,
+        };
+
+        upsert_daily_total(&connection, &entry(false, true, 11, 7), 111).unwrap();
+        upsert_daily_total(&connection, &entry(true, false, 0, 0), 222).unwrap();
+
+        let rows = read_daily_totals(&connection, "2026-01-01").unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.date, "2026-01-01");
+        assert_eq!(row.requests, 2);
+        assert_eq!(row.failed, 1, "ok=false 那条计入失败");
+        assert_eq!(row.input_tokens, 200);
+        assert_eq!(row.output_tokens, 80);
+        assert_eq!(row.cache_read_tokens, 11);
+        assert_eq!(row.cache_write_tokens, 7);
+        assert_eq!(
+            row.total_tokens,
+            2 * (100 + 40) + 11 + 7,
+            "total 累加 input+output+缓存（缺省按 0）"
+        );
+
+        // 截止日过滤：更晚的 cutoff 排掉它。
+        assert!(read_daily_totals(&connection, "2026-01-02").unwrap().is_empty());
     }
 }

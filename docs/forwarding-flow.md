@@ -11,7 +11,7 @@
 >   （第 8 节带 🆕 标记）。
 >
 > **基线**：`HEAD = 73f8b3b`（工作区含未提交改动：H2 / L1 / L3 已落地、单实例插件已加、文档已同步）。
-> `cargo test` = **144 passed / 1 ignored**（实测，见 §9）。
+> `cargo test` = **149 passed / 1 ignored**（实测，见 §9）。A5（落库解耦）已于本轮落地，见 §5 与 §8-A5。
 > 依赖版本以 `Cargo.lock` 为准：reqwest 0.13.5、axum 0.8.9、tower-http 0.7.1、rusqlite 0.32。
 
 ---
@@ -232,11 +232,22 @@ events = first_frame_timeout(parse_sse_stream(upstream.bytes_stream()), 300s)
 
 ## 5. 落库与统计
 
-两条路径都把「决定记什么」和「写库」分开，判定部分可单测：
+**落库已解耦（A5 已修，2026-09-26）**：所有写库都交给一个**专用写线程**（`db::submit`），
+网关只做一次**非阻塞投递**——`usage` / `settings` / `filters` / `events` / `updates` 全部走它。
+写线程独占**写连接**（`synchronous=NORMAL`），读走另一条**只读连接**（`query_only=ON`），
+WAL 下读不挡写。投递队列有界（4096），只有积压超过容量时才会按背压阻塞（选定「不丢数据」的代价）。
+`db::flush()` 是屏障（测试 / 退出前用）；写失败没有调用方可以返回，记在 `db::write_failures()` /
+`db::last_write_error()`，并在 `/health` 暴露。
 
-- **非流式 / 失败**：`route()` 里 `record_with_payload`（`usage.rs:194`）一次事务写
-  `usage_detail` + `usage_daily_total` upsert +（可选）`usage_payload`。
-- **流式**：`StreamAccounting::record`（生成器尾部）与 `DisconnectGuard::drop` 共用同一份统计与落库。
+两条路径都把「决定记什么」和「写库」分开：
+
+- **非流式 / 失败**：`route()` 里 `usage::submit`（`usage.rs`）投递一条记录（明细 + 每日汇总 + 可选报文）——
+  投递**在返回响应之前**，但不再等这次事务（含 commit/fsync）；客户端的响应延迟因此不再含 DB 时间。
+- **流式**：`StreamAccounting::record`（生成器尾部）与 `DisconnectGuard::drop` 共用同一份投递。
+
+**汇总查询只读每日表（rollup）**：`usage_daily_total`（一行 = 一天）在写入时就增量维护，
+`summary()` / `totals()` 只读它（O(天数)），**不再扫 `usage_detail` 全表**——
+统计页每 5 秒轮询也不会再与转发争用。
 
 明细字段（`usage_detail`）：时间、模型名、`served_by`、来源应用、入站/上游协议、上游地址与模型、
 是否走代理、input/output/cache_read/cache_write/reasoning tokens、耗时、`ok`、`failover`、错误文案。
@@ -365,15 +376,23 @@ Completions 入站是 `finish_reason:"stop"` + `usage` + `[DONE]`，Responses �
 `passthrough && !emitted` 时按入站协议发错误事件。
 （`transport-review.md` M2。）
 
-**A5｜同步 SQLite 跑在 tokio worker 上，且全进程单连接（中）**
-`db::with_conn`/`with_tx`（`db/mod.rs:157-168`）是**同步** rusqlite，锁 `OnceLock<Mutex<Connection>>`
+**A5｜同步 SQLite 跑在 tokio worker 上，且全进程单连接（中）✅ 已修（2026-09-26）**
+
+> **落地结果**：不再用 `with_tx` / 单把 `Mutex<Connection>`。改为**专用写线程 + 有界 channel**
+> （`db::submit` / `db::flush` / `write_failures` / `last_write_error`）：所有写库都是非阻塞投递，
+> 只有积压超容量（4096）才按背压阻塞。读走单独的**只读连接**（`PRAGMA query_only=ON`，不用
+> `SQLITE_OPEN_READ_ONLY`——WAL 下真正的只读连接会卡在 `-shm`）；写连接 `synchronous=NORMAL`。
+> `summary()` / `totals()` 改为**读每日汇总表 `usage_daily_total`**（写入时增量维护，O(天数)），
+> 不再扫 `usage_detail`。`DisconnectGuard::drop` 与其它写点一样只做投递——**没有用 `spawn_blocking`**：
+> 因为运行时关闭期 `spawn_blocking` 会 panic，而 Drop 里入队只是内存操作（仅在队列满时阻塞）。
+> 新增守护测试：`daily_rollup_tracks_cache_failovers_and_totals`、`v10_backfill_fills_daily_rollup_from_detail`、
+> `database_write_failures_are_observable`；`sqlite_persistence_round_trips` 插入了 `db::flush()` 同步点。
+
+原始问题（修复前）：`db::with_conn`/`with_tx` 是**同步** rusqlite，锁 `OnceLock<Mutex<Connection>>`
 ——全进程一把锁。调用点全在异步上下文：失败落库、流末 `StreamAccounting::record`（跑在 SSE 生成器
-所在 worker）、以及 **`DisconnectGuard::drop`**。工程里已有 `spawn_blocking` 用法，只是没用在落库上。
-反过来 `summary()`（`usage.rs:398-401`）走 `read_since`（`usage.rs:382-396`）：`SELECT … WHERE day >= ?1`
+所在 worker）、以及 **`DisconnectGuard::drop`**。反过来 `summary()` 走 `read_since`：`SELECT … WHERE day >= ?1`
 把窗口内**所有行**读进内存再在 Rust 里累加。**影响**：一次前端大查询握锁时，网关落库全部排队；
 落库的 fsync 又占住一个 worker。「面板一刷新，转发就卡顿」的机制就在这里。
-**修法**：落库改走 `spawn_blocking`（drop 路径直接丢出去，不 await）；读写分两个连接（读连接
-`SQLITE_OPEN_READ_ONLY`）；`summary()` 改 SQL `GROUP BY` 聚合；WAL 下 `PRAGMA synchronous = NORMAL`。
 （`transport-review.md` M3。）
 
 **A6｜三处无上限缓冲（中）**
@@ -466,7 +485,7 @@ Completions 入站是 `finish_reason:"stop"` + `usage` + `[DONE]`，Responses �
 | 1 | **A2** `Policy::none()` | 一行，堵住 Key 泄漏给重定向目标 |
 | 2 | **A1** `read_timeout(300s)` | 一行，堵住半开连接永久挂起 + 漏记 |
 | 3 | **A3 + A3+ + A4** 判罚先于尾巴 + 直通首帧失败补错误事件 | 都在流末/错误分支，一起改，三协议各加守护测试 |
-| 4 | **A5 + A7** 落库 `spawn_blocking` / 只读连接 / SQL 聚合 + 报文保留 | 都在 `usage.rs` + `db/mod.rs`，一次改完一起测 |
+| 4 | **A5** ✅ 已修（写线程 + rollup）；**A7** 的报文保留一半已修（`cleanup_expired_payloads` 每日清理），`events` 页面未做 | A5 见 §8-A5；都在 `usage.rs` + `db/mod.rs` |
 | 5 | **A6** 三处缓冲上限 | 收尾健壮性 |
 | 6 | **A8–A11** | 低优先，择机 |
 
@@ -476,7 +495,7 @@ Completions 入站是 `finish_reason:"stop"` + `usage` + `[DONE]`，Responses �
 
 ---
 
-## 10. 守护测试现状（144 passed, 1 ignored）
+## 10. 守护测试现状（149 passed, 1 ignored）
 
 | 守护点 | 测试 |
 | --- | --- |
@@ -498,6 +517,9 @@ Completions 入站是 `finish_reason:"stop"` + `usage` + `[DONE]`，Responses �
 | 超大入站请求被拒且落库（**默认忽略**） | `gateway::server::tests::h2_oversize_request_is_rejected_and_recorded` |
 | SSE 帧名回落（两个来源） | `responses_frames_fall_back_to_the_body_type_when_the_envelope_is_unknown`、`anthropic_frames_fall_back_to_the_body_type_when_the_envelope_is_unknown` |
 | 绕行名单语义与只覆盖回环 | `loopback_bypass_matches_reqwest_rules`、`no_proxy_list_only_covers_loopback` |
+| 每日汇总增量维护（缓存/切换/total 三列） | `usage::tests::daily_rollup_tracks_cache_failovers_and_totals` |
+| v10 回填（旧库补列后按明细回填每日表） | `db::tests::v10_backfill_fills_daily_rollup_from_detail` |
+| 异步写失败可观测（计数 + 最近错误） | `database_write_failures_are_observable` |
 
 唯一 `#[ignore]` 的那条要单独跑（它写进程级 usage 库，全量跑会顶掉 `sqlite_persistence_round_trips`
 的条数断言）：

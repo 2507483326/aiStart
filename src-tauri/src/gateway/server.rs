@@ -219,7 +219,7 @@ fn record_usage(
     error: Option<String>,
     payload: crate::usage::UsagePayload,
 ) {
-    crate::usage::record_with_payload(
+    crate::usage::submit(
         &build_usage_record(
             active_model_name,
             config,
@@ -252,7 +252,10 @@ async fn health(State(stats): State<Arc<GatewayStats>>) -> Response {
             "autoFailover": settings.auto_failover,
             "requests": requests,
             "errors": errors,
-            "failovers": failovers
+            "failovers": failovers,
+            // 落库是异步投递：写失败没有调用方可返回，只能在这里暴露给面板/排查。
+            "dbWriteFailures": crate::db::write_failures(),
+            "lastDbWriteError": crate::db::last_write_error()
         }),
     )
 }
@@ -370,7 +373,7 @@ async fn route(
                     super::failover::qualifies(settings.auto_failover, trigger.named, trigger.retryable)
                 });
             let (timestamp, date) = crate::usage::current_timestamp();
-            crate::usage::record_with_payload(
+            crate::usage::submit(
                 &crate::usage::UsageRecord {
                     id: 0,
                     timestamp,
@@ -715,7 +718,7 @@ impl StreamAccounting {
         if let Some(message) = error.as_deref() {
             stats.record_error(message);
         }
-        crate::usage::record_with_payload(&self.usage_record(ok, error), Some(&self.payload()));
+        crate::usage::submit(&self.usage_record(ok, error), Some(&self.payload()));
     }
 }
 
@@ -1325,6 +1328,7 @@ mod tests {
         let body: Value = serde_json::from_slice(&raw).expect("JSON");
         assert_eq!(body["error"]["type"], "request_too_large");
 
+        crate::db::flush();
         let record = crate::usage::recent(20)
             .into_iter()
             .find(|record| {

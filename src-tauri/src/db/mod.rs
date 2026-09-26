@@ -1,7 +1,9 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Mutex, OnceLock};
 
-use rusqlite::{Connection, Transaction};
+use rusqlite::Connection;
 
 use crate::error::{AppError, AppResult};
 
@@ -11,7 +13,29 @@ pub const SCHEMA_SQL: &str = include_str!("schema.sql");
 /// 当前 schema 版本号，写入 schema_meta.db_schema_version。
 const SCHEMA_VERSION: i64 = 10;
 
+/// **读连接**：所有查询都走它（`with_conn`）。迁移跑完后置 `query_only = ON`，此后只能读。
+/// 写全部交给下面的写线程——两个连接各司其职，WAL 下读不挡写。
 static DB: OnceLock<Mutex<Connection>> = OnceLock::new();
+
+/// 一次写任务：在写线程上执行的一段同步 SQLite 操作。拿到独占的写连接，自己开事务。
+type WriteJob = Box<dyn FnOnce(&mut Connection) -> AppResult<()> + Send + 'static>;
+
+enum Msg {
+    Write(WriteJob),
+    /// 屏障：写线程处理到它时回信，`flush()` 据此确认此前所有写都已落库。
+    Flush(SyncSender<()>),
+}
+
+/// 写线程的投递端（`db::init` 建立）；所有写库都经过它。
+static WRITER: OnceLock<SyncSender<Msg>> = OnceLock::new();
+
+/// 写失败计数与最近一次错误：异步写没有调用方可以返回错误，只能记下来供面板/排查。
+static WRITE_FAILURES: AtomicU64 = AtomicU64::new(0);
+static LAST_WRITE_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+/// 队列容量。正常使用永远碰不到——只有 DB 长时间跟不上请求速率、积压超过它时，
+/// 投递才会按背压阻塞（「不丢数据」的必然代价）。
+const WRITER_QUEUE: usize = 4096;
 
 pub fn init(dir: &Path) -> AppResult<()> {
     std::fs::create_dir_all(dir)?;
@@ -105,8 +129,96 @@ pub fn init(dir: &Path) -> AppResult<()> {
         rusqlite::params![SCHEMA_VERSION.to_string(), now],
     )?;
 
+    // 迁移到此结束。把这条连接降为只读：此后任何写都会在这里报错，写全部走下面的写线程。
+    // 顺序很重要——迁移与回填都需要写权限，必须跑完再设 query_only。
+    connection.execute_batch("PRAGMA query_only = ON")?;
     let _ = DB.set(Mutex::new(connection));
+
+    // 写线程（只建一次）：独占另一条写连接，串行执行所有写任务。
+    spawn_writer(&path)?;
     Ok(())
+}
+
+/// 建立专用写线程。只有第一次 `db::init` 真正建起来——重复 init 时 `WRITER` 已占用，
+/// 新开的 channel 连同 receiver 一起丢弃，不会再起第二个写线程。
+fn spawn_writer(path: &Path) -> AppResult<()> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<Msg>(WRITER_QUEUE);
+    if WRITER.set(sender).is_err() {
+        return Ok(());
+    }
+
+    let connection = Connection::open(path)?;
+    connection.execute_batch(
+        // WAL 下 synchronous=NORMAL 是通行做法：崩溃最多丢最后几条已提交记录，不损坏库，
+        // 省掉每次 commit 的 fsync——落库延迟显著下降。
+        "PRAGMA journal_mode = WAL;\nPRAGMA foreign_keys = OFF;\nPRAGMA busy_timeout = 5000;\nPRAGMA synchronous = NORMAL;",
+    )?;
+
+    std::thread::Builder::new()
+        .name("ai-start-db-writer".into())
+        .spawn(move || writer_loop(connection, receiver))
+        .map_err(|error| AppError::Message(format!("启动数据库写线程失败: {error}")))?;
+    Ok(())
+}
+
+/// 写线程主循环：串行执行写任务；`Flush` 任务回信（屏障）。投递端全部消失即退出。
+fn writer_loop(mut connection: Connection, receiver: Receiver<Msg>) {
+    while let Ok(msg) = receiver.recv() {
+        match msg {
+            Msg::Write(job) => {
+                if let Err(error) = job(&mut connection) {
+                    record_write_failure(&error.to_string());
+                }
+            }
+            Msg::Flush(ack) => {
+                let _ = ack.send(());
+            }
+        }
+    }
+}
+
+/// 把一次写交给写线程。队列未满时**立即返回**，满了才阻塞（背压语义，不丢数据）。
+/// 未初始化时静默丢弃——与旧实现「写失败只丢弃、不影响主流程」口径一致。
+pub fn submit(job: impl FnOnce(&mut Connection) -> AppResult<()> + Send + 'static) {
+    let Some(sender) = WRITER.get() else {
+        return;
+    };
+    if sender.send(Msg::Write(Box::new(job))).is_err() {
+        record_write_failure("数据库写线程已退出");
+    }
+}
+
+/// 屏障：等写线程把此前投递的所有写任务落库后再返回。测试与退出前用。
+pub fn flush() {
+    let Some(sender) = WRITER.get() else {
+        return;
+    };
+    // 1 容量 channel 做一次性回信；阻塞 send 保证屏障一定会排进队列。
+    let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+    if sender.send(Msg::Flush(ack_tx)).is_ok() {
+        let _ = ack_rx.recv();
+    }
+}
+
+/// 写线程累计的失败次数（异步写没有返回值可传，只能这样暴露给面板/排查）。
+pub fn write_failures() -> u64 {
+    WRITE_FAILURES.load(Ordering::Relaxed)
+}
+
+/// 最近一次写失败的原因。
+pub fn last_write_error() -> Option<String> {
+    LAST_WRITE_ERROR
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+fn record_write_failure(message: &str) {
+    WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut guard) = LAST_WRITE_ERROR.get_or_init(|| Mutex::new(None)).lock() {
+        *guard = Some(message.to_string());
+    }
 }
 
 /// 幂等补列：旧库缺列时执行 ALTER TABLE ADD COLUMN（SQLite 无 ADD COLUMN IF NOT EXISTS）。
@@ -176,22 +288,28 @@ fn copy_legacy_app_version_records(connection: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+/// v10 回填：把 usage_detail 的历史累计补进 usage_daily_total 的三个新列。
+/// 只在补列那一次跑（一次性迁移）；`usage_detail(day)` 有索引，逐天子查询走索引。
+fn backfill_daily_totals(connection: &Connection) -> AppResult<()> {
+    connection.execute_batch(
+        "UPDATE usage_daily_total SET \
+           cache_read_tokens  = COALESCE((SELECT SUM(cache_read_tokens)  FROM usage_detail d WHERE d.day = usage_daily_total.day), 0), \
+           cache_write_tokens = COALESCE((SELECT SUM(cache_write_tokens) FROM usage_detail d WHERE d.day = usage_daily_total.day), 0), \
+           failovers          = COALESCE((SELECT SUM(CASE WHEN failover = 1 THEN 1 ELSE 0 END) FROM usage_detail d WHERE d.day = usage_daily_total.day), 0)",
+    )?;
+    Ok(())
+}
+
 fn connection() -> AppResult<&'static Mutex<Connection>> {
     DB.get()
         .ok_or_else(|| AppError::Message("数据库尚未初始化".into()))
 }
 
+/// 读：所有查询都走只读的读连接（`PRAGMA query_only = ON`）。
+/// 写一律走 [`submit`]——在读连接上写会直接报错，这是刻意的（让漏迁的写点立刻暴露）。
 pub fn with_conn<T>(f: impl FnOnce(&Connection) -> AppResult<T>) -> AppResult<T> {
     let guard = connection()?.lock().expect("database lock poisoned");
     f(&guard)
-}
-
-pub fn with_tx<T>(f: impl FnOnce(&Transaction) -> AppResult<T>) -> AppResult<T> {
-    let mut guard = connection()?.lock().expect("database lock poisoned");
-    let transaction = guard.transaction()?;
-    let value = f(&transaction)?;
-    transaction.commit()?;
-    Ok(value)
 }
 
 pub fn now_ms() -> i64 {
@@ -274,5 +392,67 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM app_version_records", [], |row| row.get(0))
             .unwrap();
         assert_eq!(rows, 0);
+    }
+
+    /// v10：旧库的 usage_daily_total 没有缓存/切换三列，补列后要按 usage_detail 回填一次。
+    #[test]
+    fn v10_backfill_fills_daily_rollup_from_detail() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE usage_detail (day TEXT, cache_read_tokens INTEGER, cache_write_tokens INTEGER, failover INTEGER);\
+                 CREATE TABLE usage_daily_total (\
+                   day TEXT PRIMARY KEY, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,\
+                   total_tokens INTEGER NOT NULL DEFAULT 0, calls INTEGER NOT NULL DEFAULT 0, failed_calls INTEGER NOT NULL DEFAULT 0,\
+                   created_time INTEGER NOT NULL DEFAULT 0, update_time INTEGER NOT NULL DEFAULT 0);\
+                 INSERT INTO usage_detail (day, cache_read_tokens, cache_write_tokens, failover) VALUES \
+                   ('2026-01-01', 10, 2, 1), ('2026-01-01', 5, 0, 0), ('2026-01-02', NULL, NULL, 1);\
+                 INSERT INTO usage_daily_total (day) VALUES ('2026-01-01'), ('2026-01-02');",
+            )
+            .unwrap();
+
+        // 三列都是这次新加的 → 应该触发回填。
+        assert!(ensure_column(
+            &connection,
+            "usage_daily_total",
+            "cache_read_tokens",
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+        .unwrap());
+        assert!(ensure_column(
+            &connection,
+            "usage_daily_total",
+            "cache_write_tokens",
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+        .unwrap());
+        assert!(ensure_column(
+            &connection,
+            "usage_daily_total",
+            "failovers",
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+        .unwrap());
+        backfill_daily_totals(&connection).unwrap();
+
+        let rollups: Vec<(String, i64, i64, i64)> = connection
+            .prepare(
+                "SELECT day, cache_read_tokens, cache_write_tokens, failovers FROM usage_daily_total ORDER BY day",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(
+            rollups,
+            vec![
+                ("2026-01-01".to_string(), 15, 2, 1),
+                // NULL 缓存求和为 NULL → COALESCE 归 0。
+                ("2026-01-02".to_string(), 0, 0, 1),
+            ]
+        );
     }
 }

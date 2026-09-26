@@ -57,8 +57,10 @@ const cacheHit = computed(() =>
 
 onMounted(() => refresh(rangeDays, PREVIEW_LIMIT));
 
-// 有新请求时自动刷新（组件卸载自动停止）
-useIntervalFn(() => refresh(rangeDays, PREVIEW_LIMIT), 5000);
+// 有新请求时自动刷新（组件卸载自动停止）；页面不可见时不查，省掉后台无谓的汇总查询。
+useIntervalFn(() => {
+  if (document.visibilityState === "visible") refresh(rangeDays, PREVIEW_LIMIT);
+}, 5000);
 
 function openAll(): void {
   router.push({ name: "requests" });

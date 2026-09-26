@@ -23,7 +23,7 @@
 | H3 | 中高 | 出站跟随重定向（默认 ≤10 跳），跨主机只剥离 5 个 header，`x-api-key` 不在其中 → Anthropic 上游的 Key 会被送到重定向目标 | 读码确认（reqwest 源码） | 一行 |
 | M1 | 中高 | 被截断的流给客户端补的是**正常结束**（`message_stop` / `finish_reason:"stop"` / `response.completed`）：库里写着 Truncated，客户端以为答完了 | 读码确认 | 中 |
 | M2 | 中 | 同协议直通 + 上游在首帧前失败：客户端收到一个**空的 200**，没有错误事件也没有可读原因（非直通路径会给错误事件） | 读码确认 | 小 |
-| M3 | 中 | 同步 SQLite 直接跑在 tokio worker 上（含 `DisconnectGuard::drop`），全局单连接互斥；`summary()` 把窗口内所有行拉进内存再在 Rust 里聚合 | 读码确认 | 中 |
+| M3 ✅ | 中 | 同步 SQLite 直接跑在 tokio worker 上（含 `DisconnectGuard::drop`），全局单连接互斥；`summary()` 把窗口内所有行拉进内存再在 Rust 里聚合 | 读码确认 | 中 |
 | M4 | 中 | 三处无上限缓冲：非流式响应体 `upstream.json()`、上游错误体 `response.text()`、SSE 行/帧缓冲 | 读码确认 | 中 |
 | M5 | 中 | 报文永不清理：单请求最坏 4 × 256KB；`payload_detail` 的注释已经写着「已被保留策略清理」，而清理并不存在 | 读码确认 | 中 |
 | L1 ✅ | 低 | Anthropic / Responses 解码：`event:` 非空时完全压过 `data.type`，名字对不上就静默丢帧（Completions 不看 `event`，不受影响） | 读码确认 | 一行 |
@@ -235,7 +235,15 @@ Err(error) => {
 
 **验证状态**：`读码确认`（代码路径清晰，但未构造直通失败场景跑过）。
 
-### M3｜同步 SQLite 跑在 tokio worker 上，且是单连接
+### M3｜同步 SQLite 跑在 tokio worker 上，且是单连接 ✅ 已修（2026-09-26）
+
+> **落地结果**（与下方「建议」的差异已注明）：改为**专用写线程 + 有界 channel**——
+> 所有写库走 `db::submit`（非阻塞投递，队列 4096，满了才按背压阻塞，**不丢数据**），写线程独占写连接；
+> 读走单独连接并 `PRAGMA query_only = ON`（**没用 `SQLITE_OPEN_READ_ONLY`**：WAL 下真正的只读连接
+> 会卡在 `-shm`）；写连接 `synchronous = NORMAL`。汇总改为**读每日汇总表 `usage_daily_total`**
+> （写入时增量维护，O(天数)），**不是** SQL `GROUP BY` 扫明细——比原建议更省。
+> `DisconnectGuard::drop` **没有用 `spawn_blocking`**：Drop 里只做入队（内存操作），
+> 因为运行时关闭期 `spawn_blocking` 会 panic。`with_tx` 已删除；`db::flush()` 作为测试/退出同步点。
 
 **现象**三件事叠在一起：
 
@@ -422,6 +430,10 @@ worker 数量 = 核数，几条长事务就够把网关的吞吐压到零。这�
 
 **本轮的进度**（2026-09-25）：只做了 5b 的 H2 与 5e 里的 L1 / L3（见 §8）；5a（H1 / H3）与
 5c / 5d、以及 M4 与 L 组的其余条目都没动，批次顺序照旧。
+
+**追加**（2026-09-26）：**5d 的 M3 已落地**——专用写线程 + 有界 channel（`db::submit` / `flush`）+
+每日汇总表 rollup（`summary` / `totals` 不再扫明细），见 M3 标题下的 ✅ 注。H1 / H3、M1 / M2 /
+M4 / M5 仍未做。
 
 ## 8. 本轮落地记录（2026-09-25）：H2 / L1 / L3
 

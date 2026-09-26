@@ -61,11 +61,14 @@ pub fn snapshot() -> Vec<RequestFilter> {
     store().read().expect("filters lock poisoned").clone()
 }
 
-fn persist(filters: &[RequestFilter]) -> AppResult<()> {
-    db::with_tx(|transaction| {
+/// 把过滤器整体落库（**异步投递**；读连接只读，写只能走写线程）。
+fn persist(filters: &[RequestFilter]) {
+    let snapshot = filters.to_vec();
+    db::submit(move |connection| {
+        let transaction = connection.transaction()?;
         let now = db::now_ms();
         transaction.execute("DELETE FROM request_filters", [])?;
-        for (index, filter) in filters.iter().enumerate() {
+        for (index, filter) in snapshot.iter().enumerate() {
             let rule_config = serde_json::to_string(&filter.rule)?;
             transaction.execute(
                 "INSERT INTO request_filters \
@@ -83,8 +86,9 @@ fn persist(filters: &[RequestFilter]) -> AppResult<()> {
                 ],
             )?;
         }
+        transaction.commit()?;
         Ok(())
-    })
+    });
 }
 
 /// 在写锁内变更缓存并整体落库（落库用变更后的快照）。
@@ -94,7 +98,7 @@ pub fn mutate<T>(f: impl FnOnce(&mut Vec<RequestFilter>) -> T) -> AppResult<T> {
         let value = f(&mut guard);
         (value, guard.clone())
     };
-    persist(&snapshot)?;
+    persist(&snapshot);
     Ok(value)
 }
 

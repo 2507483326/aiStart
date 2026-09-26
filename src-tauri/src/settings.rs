@@ -190,7 +190,8 @@ pub fn init(dir: &Path) -> AppResult<()> {
     let settings = load()?;
 
     *store().write().expect("settings lock poisoned") = settings;
-    persist()
+    persist();
+    Ok(())
 }
 
 fn load() -> AppResult<Settings> {
@@ -323,9 +324,12 @@ fn setting_pairs(settings: &Settings) -> Vec<(&'static str, String)> {
     ]
 }
 
-pub fn persist() -> AppResult<()> {
+/// 把整份设置落库（**异步投递**；读连接只读，写只能走写线程）。
+/// 进程内的内存快照是运行时的唯一真相，落盘只用于重启后恢复；写失败由写线程记下来。
+pub fn persist() {
     let snapshot = store().read().expect("settings lock poisoned").clone();
-    db::with_tx(|transaction| {
+    db::submit(move |connection| {
+        let transaction = connection.transaction()?;
         let now = db::now_ms();
 
         for (key, value) in setting_pairs(&snapshot) {
@@ -369,8 +373,9 @@ pub fn persist() -> AppResult<()> {
             )?;
         }
 
+        transaction.commit()?;
         Ok(())
-    })
+    });
 }
 
 pub fn snapshot() -> Settings {
@@ -389,7 +394,7 @@ pub fn mutate<T>(f: impl FnOnce(&mut Settings) -> T) -> AppResult<T> {
         let mut guard = store().write().expect("settings lock poisoned");
         f(&mut guard)
     };
-    persist()?;
+    persist();
     Ok(value)
 }
 
