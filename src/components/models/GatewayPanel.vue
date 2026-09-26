@@ -39,14 +39,7 @@ const phaseView = computed(() => {
 });
 
 const baseUrl = computed(() => status.value?.baseUrl ?? "http://127.0.0.1:8931");
-
-const endpoints = [
-  { path: "/v1/messages", label: "Messages" },
-  { path: "/v1/chat/completions", label: "Completions" },
-  { path: "/v1/responses", label: "Responses" },
-];
-const selectedEndpoint = ref(endpoints[0]);
-const endpointUrl = computed(() => `${baseUrl.value}${selectedEndpoint.value.path}`);
+const apiUrl = computed(() => `${baseUrl.value}/v1`);
 
 // 面板只展示当日用量：直读 usage_total 的今日行，读时不做 SUM。
 const today = ref<DailyUsage | null>(null);
@@ -155,46 +148,26 @@ onMounted(loadToday);
       <div class="space-y-2">
         <p class="text-sm text-muted-foreground">对接说明</p>
         <div class="divide-y rounded-md border bg-muted/40 text-sm">
-          <div class="space-y-2 px-3 py-2.5 transition-colors duration-150 hover:bg-accent/30">
-            <div class="flex flex-wrap items-center gap-2">
-              <span class="text-muted-foreground">接口地址</span>
-              <div class="flex gap-0.5 rounded-md border bg-background p-0.5">
-                <button
-                  v-for="endpoint in endpoints"
-                  :key="endpoint.path"
-                  type="button"
-                  class="rounded px-2 py-0.5 text-xs transition-colors"
-                  :class="
-                    endpoint.path === selectedEndpoint.path
-                      ? 'bg-primary text-primary-foreground'
-                      : 'text-muted-foreground hover:bg-accent'
-                  "
-                  @click="selectedEndpoint = endpoint"
-                >
-                  {{ endpoint.label }}
-                </button>
-              </div>
-            </div>
-            <div class="flex items-center gap-2">
-              <span class="min-w-0 flex-1 break-all font-mono text-foreground">
-                {{ endpointUrl }}
-              </span>
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                class="shrink-0 text-muted-foreground"
-                aria-label="复制接口地址"
-                @click="copyText(endpointUrl, '接口地址已复制')"
-              >
-                <MorphIconBox :icon="Copy" :size="14" />
-              </Button>
-            </div>
+          <div class="flex items-center gap-2 px-3 py-2.5 transition-colors duration-150 hover:bg-accent/30">
+            <span class="shrink-0 text-muted-foreground">接口地址</span>
+            <span class="min-w-0 flex-1 break-all font-mono text-foreground">
+              {{ apiUrl }}
+            </span>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              class="shrink-0 text-muted-foreground"
+              aria-label="复制接口地址"
+              @click="copyText(apiUrl, '接口地址已复制')"
+            >
+              <MorphIconBox :icon="Copy" :size="14" />
+            </Button>
           </div>
 
           <div class="flex items-center gap-2 px-3 py-2.5 transition-colors duration-150 hover:bg-accent/30">
             <span class="shrink-0 text-muted-foreground">API Key</span>
             <span class="min-w-0 flex-1 break-all font-mono text-foreground">
-              aiStart<span class="text-muted-foreground">[应用名称]</span>
+              aiStart<span class="text-muted-foreground"> 或 [应用名称]</span>
             </span>
             <Button
               variant="ghost"
