@@ -11,7 +11,7 @@ use crate::error::{AppError, AppResult};
 pub const SCHEMA_SQL: &str = include_str!("schema.sql");
 
 /// 当前 schema 版本号，写入 schema_meta.db_schema_version。
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 /// **读连接**：所有查询都走它（`with_conn`）。迁移跑完后置 `query_only = ON`，此后只能读。
 /// 写全部交给下面的写线程——两个连接各司其职，WAL 下读不挡写。
@@ -117,9 +117,15 @@ pub fn init(dir: &Path) -> AppResult<()> {
     // 建出新结构，数据在 DDL 之后搬运（见 copy_legacy_app_version_records）。
     rename_legacy_app_version_records(&connection)?;
 
+    // v11：usage_daily_total 由「day 作主键」改为「自增主键的 usage_total」，每日行与全量行共用一张表。
+    // 同样先改名让 schema.sql 建出新表，数据在 DDL 之后搬运（见 copy_legacy_daily_total）。
+    rename_legacy_daily_total(&connection)?;
+
     connection.execute_batch(SCHEMA_SQL)?;
 
     copy_legacy_app_version_records(&connection)?;
+
+    copy_legacy_daily_total(&connection)?;
 
     let now = now_ms();
     connection.execute(
@@ -288,7 +294,49 @@ fn copy_legacy_app_version_records(connection: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+/// v11 迁移第一步：旧的 usage_daily_total（day 作主键）改名为 legacy，
+/// 让 schema.sql 建出自增主键的新表 usage_total。
+fn rename_legacy_daily_total(connection: &Connection) -> AppResult<()> {
+    if table_exists(connection, "usage_daily_total")? {
+        connection.execute_batch("ALTER TABLE usage_daily_total RENAME TO usage_daily_total_legacy")?;
+    }
+    Ok(())
+}
+
+/// v11 迁移第二步：把 legacy 的每日行搬进 usage_total，再补一行全量累计（day = ''），
+/// 最后丢弃旧表。整体一个事务：中途失败则旧表还在，下次启动重跑，不会搬出重复行。
+fn copy_legacy_daily_total(connection: &Connection) -> AppResult<()> {
+    if !table_exists(connection, "usage_daily_total_legacy")? {
+        return Ok(());
+    }
+    let now = now_ms();
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(
+        "INSERT INTO usage_total \
+           (day, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens, \
+            calls, failed_calls, failovers, created_time, update_time) \
+         SELECT day, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens, \
+                calls, failed_calls, failovers, created_time, update_time \
+         FROM usage_daily_total_legacy",
+    )?;
+    transaction.execute(
+        "INSERT INTO usage_total \
+           (day, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens, \
+            calls, failed_calls, failovers, created_time, update_time) \
+         SELECT '', COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), \
+                COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0), \
+                COALESCE(SUM(total_tokens), 0), COALESCE(SUM(calls), 0), \
+                COALESCE(SUM(failed_calls), 0), COALESCE(SUM(failovers), 0), ?1, ?1 \
+         FROM usage_daily_total_legacy",
+        rusqlite::params![now],
+    )?;
+    transaction.execute_batch("DROP TABLE usage_daily_total_legacy")?;
+    transaction.commit()?;
+    Ok(())
+}
+
 /// v10 回填：把 usage_detail 的历史累计补进 usage_daily_total 的三个新列。
+/// （v11 起该表改名为 usage_total，本回填必须在改名之前跑，见 db::init 的顺序。）
 /// 只在补列那一次跑（一次性迁移）；`usage_detail(day)` 有索引，逐天子查询走索引。
 fn backfill_daily_totals(connection: &Connection) -> AppResult<()> {
     connection.execute_batch(
@@ -342,8 +390,10 @@ mod tests {
 
     fn migrate(connection: &Connection) -> AppResult<()> {
         rename_legacy_app_version_records(connection)?;
+        rename_legacy_daily_total(connection)?;
         connection.execute_batch(SCHEMA_SQL)?;
-        copy_legacy_app_version_records(connection)
+        copy_legacy_app_version_records(connection)?;
+        copy_legacy_daily_total(connection)
     }
 
     #[test]
@@ -454,5 +504,74 @@ mod tests {
                 ("2026-01-02".to_string(), 0, 0, 1),
             ]
         );
+    }
+
+    /// v11：旧的 usage_daily_total（day 作主键）整表搬进 usage_total，并补一行全量累计（day = ''），
+    /// 旧表随后丢弃；重复迁移不产生重复行。
+    #[test]
+    fn v11_moves_daily_rollup_into_usage_total_and_adds_grand_total() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE usage_daily_total (\
+                   day TEXT PRIMARY KEY, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,\
+                   cache_read_tokens INTEGER NOT NULL DEFAULT 0, cache_write_tokens INTEGER NOT NULL DEFAULT 0,\
+                   total_tokens INTEGER NOT NULL DEFAULT 0, calls INTEGER NOT NULL DEFAULT 0,\
+                   failed_calls INTEGER NOT NULL DEFAULT 0, failovers INTEGER NOT NULL DEFAULT 0,\
+                   created_time INTEGER NOT NULL DEFAULT 0, update_time INTEGER NOT NULL DEFAULT 0);\
+                 INSERT INTO usage_daily_total \
+                   (day, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens, calls, failed_calls, failovers) \
+                 VALUES ('2026-01-01', 100, 40, 10, 5, 155, 2, 1, 1),\
+                        ('2026-01-02', 200, 80, 0, 0, 280, 1, 0, 0);",
+            )
+            .unwrap();
+
+        migrate(&connection).unwrap();
+
+        assert!(!table_exists(&connection, "usage_daily_total").unwrap());
+        assert!(!table_exists(&connection, "usage_daily_total_legacy").unwrap());
+
+        // 每日行原样搬过来（自增主键由新表分配）。
+        let days: Vec<(String, i64, i64)> = connection
+            .prepare("SELECT day, calls, total_tokens FROM usage_total WHERE day <> '' ORDER BY day")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(
+            days,
+            vec![
+                ("2026-01-01".to_string(), 2, 155),
+                ("2026-01-02".to_string(), 1, 280),
+            ]
+        );
+
+        // 全量行 = 每日行之和。
+        let grand: (i64, i64, i64, i64, i64, i64) = connection
+            .query_row(
+                "SELECT calls, failed_calls, input_tokens, output_tokens, total_tokens, failovers \
+                 FROM usage_total WHERE day = ''",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(grand, (3, 1, 300, 120, 435, 1));
+
+        // 幂等：旧表已丢弃，再跑一次不新增行。
+        migrate(&connection).unwrap();
+        let rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM usage_total", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 3);
     }
 }

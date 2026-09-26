@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::db;
@@ -103,7 +103,7 @@ pub struct UsagePage {
     pub items: Vec<UsageRecord>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DailyUsage {
     pub date: String,
@@ -116,30 +116,26 @@ pub struct DailyUsage {
     pub total_tokens: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 全量累计：`usage_total` 里 `day = ''` 的那一行。读 = 单行直读，不做 SUM。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ModelUsage {
-    pub model_name: String,
+pub struct UsageTotals {
     pub requests: u64,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UsageSummary {
-    pub total_requests: u64,
-    pub failed_requests: u64,
+    pub failed: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub total_tokens: u64,
-    pub today_tokens: u64,
-    pub streak_days: u64,
-    pub daily: Vec<DailyUsage>,
-    pub by_model: Vec<ModelUsage>,
+    pub failovers: u64,
 }
+
+/// `usage_total` 里除 `day` 外的计数列（每日行与全量行共用同一组列）。
+const USAGE_TOTAL_COLUMNS: &str = "calls, failed_calls, input_tokens, output_tokens, \
+     cache_read_tokens, cache_write_tokens, total_tokens";
+
+/// 全量累计行的 day 取值：空串。每日行用 'yyyy-MM-dd'，全表至多一行空串。
+const GRAND_TOTAL_DAY: &str = "";
 
 const SELECT_COLUMNS: &str = "usage_detail_id, day, event_time, model_name, served_by, inbound_protocol, \
      upstream_protocol, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, duration_ms, ok, failover, error, source_app, \
@@ -232,10 +228,11 @@ pub fn submit(entry: &UsageRecord, payload: Option<&UsagePayload>) {
                 event_time,
             ],
         )?;
-        // 必须在 usage_daily_total 的 upsert 之前取：该 upsert 在当天首次插入时会新建行，
-        // 从而把 last_insert_rowid() 覆盖成 usage_daily_total 的行号（走 UPDATE 分支则不会）。
+        // 必须在 usage_total 的 upsert 之前取：每日行 / 全量行在当天首次写入时走 INSERT，
+        // 会把 last_insert_rowid() 覆盖成汇总行的行号（走 UPDATE 分支则不会）。
         let detail_id = transaction.last_insert_rowid();
-        upsert_daily_total(&transaction, &entry, event_time)?;
+        upsert_usage_total(&transaction, &entry.date, &entry, event_time)?;
+        upsert_usage_total(&transaction, GRAND_TOTAL_DAY, &entry, event_time)?;
 
         if let Some(payload) = &payload {
             let (inbound_request, request_truncated) =
@@ -271,39 +268,51 @@ pub fn submit(entry: &UsageRecord, payload: Option<&UsagePayload>) {
     });
 }
 
-/// 每日汇总的增量 upsert（一行 = 一天）。写入时就维护好，汇总查询只读它、不再扫明细。
-/// 抽出来是为了能对内存库单测写入侧（缓存 / 切换 / total 三列）。
-fn upsert_daily_total(
+/// `usage_total` 的增量 upsert：`day` 传 'yyyy-MM-dd' 累加当天行，传 [`GRAND_TOTAL_DAY`] 累加全量行。
+/// 累加全在写入侧完成——读取侧只按 day 取行，不做 SUM。
+/// 本表按 schema 规范不建 UNIQUE，用不了 `ON CONFLICT`，所以先 UPDATE、没命中再 INSERT；
+/// 写线程串行执行，不存在并发竞态。抽出来是为了能对内存库单测写入侧。
+fn upsert_usage_total(
     connection: &rusqlite::Connection,
+    day: &str,
     entry: &UsageRecord,
     event_time: i64,
 ) -> AppResult<()> {
-    connection.execute(
-        "INSERT INTO usage_daily_total (day, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, \
-         total_tokens, calls, failed_calls, failovers, created_time, update_time) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8, ?9, ?9) \
-         ON CONFLICT(day) DO UPDATE SET \
-           input_tokens = input_tokens + excluded.input_tokens, \
-           output_tokens = output_tokens + excluded.output_tokens, \
-           cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens, \
-           cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens, \
-           total_tokens = total_tokens + excluded.total_tokens, \
+    let input = entry.input_tokens as i64;
+    let output = entry.output_tokens as i64;
+    let cache_read = entry.cache_read_tokens.unwrap_or(0) as i64;
+    let cache_write = entry.cache_write_tokens.unwrap_or(0) as i64;
+    let total = entry.total_tokens() as i64;
+    let failed = i64::from(!entry.ok);
+    let failover = i64::from(entry.failover);
+
+    let updated = connection.execute(
+        "UPDATE usage_total SET \
+           input_tokens = input_tokens + ?2, \
+           output_tokens = output_tokens + ?3, \
+           cache_read_tokens = cache_read_tokens + ?4, \
+           cache_write_tokens = cache_write_tokens + ?5, \
+           total_tokens = total_tokens + ?6, \
            calls = calls + 1, \
-           failed_calls = failed_calls + excluded.failed_calls, \
-           failovers = failovers + excluded.failovers, \
-           update_time = excluded.update_time",
+           failed_calls = failed_calls + ?7, \
+           failovers = failovers + ?8, \
+           update_time = ?9 \
+         WHERE day = ?1",
         params![
-            entry.date,
-            entry.input_tokens as i64,
-            entry.output_tokens as i64,
-            entry.cache_read_tokens.unwrap_or(0) as i64,
-            entry.cache_write_tokens.unwrap_or(0) as i64,
-            entry.total_tokens() as i64,
-            i64::from(!entry.ok),
-            i64::from(entry.failover),
-            event_time,
+            day, input, output, cache_read, cache_write, total, failed, failover, event_time
         ],
     )?;
+
+    if updated == 0 {
+        connection.execute(
+            "INSERT INTO usage_total (day, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, \
+             total_tokens, calls, failed_calls, failovers, created_time, update_time) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8, ?9, ?9)",
+            params![
+                day, input, output, cache_read, cache_write, total, failed, failover, event_time
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -349,7 +358,7 @@ pub fn payload_detail(usage_detail_id: i64) -> Option<UsagePayloadDetail> {
 }
 
 /// 按「请求保存时间」清理过期报文快照。只删 usage_payload（入站/上游请求与响应），
-/// usage_detail 明细与 usage_daily_total 汇总保留；`retention_days <= 0`（永久保留）不动任何行。
+/// usage_detail 明细与 usage_total 汇总保留；`retention_days <= 0`（永久保留）不动任何行。
 /// 走写线程（读连接是 `query_only`，删除只能交给写线程）；异步投递，行数不再返回。
 pub fn cleanup_expired_payloads(retention_days: i64) {
     let Some(cutoff) = retention_cutoff(retention_days, db::now_ms()) else {
@@ -442,24 +451,29 @@ pub fn page(offset: usize, limit: usize) -> UsagePage {
     })
 }
 
-/// 读每日汇总（`day >= cutoff`，按天升序）。抽出来是为了能对内存库单测，不必碰进程级 usage 库。
-fn read_daily_totals(connection: &rusqlite::Connection, cutoff: &str) -> AppResult<Vec<DailyUsage>> {
-    let mut statement = connection.prepare(
-        "SELECT day, calls, failed_calls, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens \
-         FROM usage_daily_total WHERE day >= ?1 ORDER BY day",
-    )?;
-    let rows = statement.query_map(params![cutoff], |row| {
-        Ok(DailyUsage {
-            date: row.get(0)?,
-            requests: row.get::<_, i64>(1)? as u64,
-            failed: row.get::<_, i64>(2)? as u64,
-            input_tokens: row.get::<_, i64>(3)? as u64,
-            output_tokens: row.get::<_, i64>(4)? as u64,
-            cache_read_tokens: row.get::<_, i64>(5)? as u64,
-            cache_write_tokens: row.get::<_, i64>(6)? as u64,
-            total_tokens: row.get::<_, i64>(7)? as u64,
-        })
-    })?;
+/// 计数列取自当前行（`day` 已占第 0 列）。每日行与全量行共用这套列。
+fn row_to_daily(row: &rusqlite::Row<'_>) -> rusqlite::Result<DailyUsage> {
+    Ok(DailyUsage {
+        date: row.get(0)?,
+        requests: row.get::<_, i64>(1)? as u64,
+        failed: row.get::<_, i64>(2)? as u64,
+        input_tokens: row.get::<_, i64>(3)? as u64,
+        output_tokens: row.get::<_, i64>(4)? as u64,
+        cache_read_tokens: row.get::<_, i64>(5)? as u64,
+        cache_write_tokens: row.get::<_, i64>(6)? as u64,
+        total_tokens: row.get::<_, i64>(7)? as u64,
+    })
+}
+
+/// 读每日汇总行（`day <> ''` 且 `day >= cutoff`，按天升序）。直读行本身，不做 SUM。
+/// 抽出来是为了能对内存库单测，不必碰进程级 usage 库。
+fn read_daily_usage(connection: &rusqlite::Connection, cutoff: &str) -> AppResult<Vec<DailyUsage>> {
+    let sql = format!(
+        "SELECT day, {USAGE_TOTAL_COLUMNS} FROM usage_total \
+         WHERE day <> '{GRAND_TOTAL_DAY}' AND day >= ?1 ORDER BY day"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(params![cutoff], row_to_daily)?;
     let mut collected = Vec::new();
     for row in rows {
         collected.push(row?);
@@ -467,94 +481,59 @@ fn read_daily_totals(connection: &rusqlite::Connection, cutoff: &str) -> AppResu
     Ok(collected)
 }
 
-pub fn summary(days: u32) -> UsageSummary {
+/// 天数换算成每日行的起始日（含当天）：`days = 1` 就是今天。
+fn daily_cutoff(days: u32) -> String {
     let today = chrono::Local::now().date_naive();
-    let cutoff = today - chrono::Duration::days(i64::from(days.saturating_sub(1)));
-    let cutoff_text = cutoff.format("%Y-%m-%d").to_string();
-
-    // 只读每日汇总表（O(天数)）：明细表只供「请求明细」列表，不再参与任何聚合。
-    // 每行的 calls / failed_calls / total_tokens 都是写入时增量累加好的，这里只做求和。
-    let rows = db::with_conn(|connection| read_daily_totals(connection, &cutoff_text))
-        .unwrap_or_default();
-
-    let today_text = today.format("%Y-%m-%d").to_string();
-    let mut summary = UsageSummary {
-        total_requests: 0,
-        failed_requests: 0,
-        input_tokens: 0,
-        output_tokens: 0,
-        cache_read_tokens: 0,
-        cache_write_tokens: 0,
-        total_tokens: 0,
-        today_tokens: 0,
-        streak_days: 0,
-        daily: Vec::new(),
-        // by_model 前端没有任何地方渲染（只在 types.ts 里声明过），不再从明细聚合；
-        // 真要用时另开一张 usage_daily_model，别把明细扫描塞回这条查询。
-        by_model: Vec::new(),
-    };
-
-    let mut active: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for row in rows {
-        summary.total_requests += row.requests;
-        summary.failed_requests += row.failed;
-        summary.input_tokens += row.input_tokens;
-        summary.output_tokens += row.output_tokens;
-        summary.cache_read_tokens += row.cache_read_tokens;
-        summary.cache_write_tokens += row.cache_write_tokens;
-        summary.total_tokens += row.total_tokens;
-        if row.date == today_text {
-            summary.today_tokens = row.total_tokens;
-        }
-        if row.requests > 0 {
-            active.insert(row.date.clone());
-        }
-        summary.daily.push(row);
-    }
-
-    let mut streak = 0;
-    let mut cursor = today;
-    while active.contains(cursor.format("%Y-%m-%d").to_string().as_str()) {
-        streak += 1;
-        cursor -= chrono::Duration::days(1);
-    }
-    summary.streak_days = streak;
-
-    summary
+    (today - chrono::Duration::days(i64::from(days.saturating_sub(1))))
+        .format("%Y-%m-%d")
+        .to_string()
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct UsageTotals {
-    pub requests: u64,
-    pub failed: u64,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub failovers: u64,
+/// 每日汇总（直读 `usage_total` 的每日行区间，不做 SUM）。供热力图与连续活跃。
+pub fn daily(days: u32) -> Vec<DailyUsage> {
+    let cutoff = daily_cutoff(days);
+    db::with_conn(|connection| read_daily_usage(connection, &cutoff)).unwrap_or_default()
 }
 
-/// 全量累计口径（不限日期），供网关面板等需要跨重启保留的累计值使用。
-/// 从每日汇总表求和（O(天数)），不再扫 usage_detail 全表。
+/// 今日一天（直读 `usage_total` 的当日行）。当天还没有记录时返回零值行，便于直接渲染。
+pub fn today() -> DailyUsage {
+    let date = daily_cutoff(1);
+    let sql = format!("SELECT day, {USAGE_TOTAL_COLUMNS} FROM usage_total WHERE day = ?1");
+    let found = db::with_conn(|connection| {
+        Ok(connection
+            .query_row(&sql, params![&date], row_to_daily)
+            .optional()?)
+    })
+    .ok()
+    .flatten();
+    found.unwrap_or(DailyUsage {
+        date,
+        ..Default::default()
+    })
+}
+
+/// 全量累计（直读 `usage_total` 里 `day = ''` 的那一行，不做 SUM）。
+/// 供网关启动 [`crate::gateway::hydrate`] 与统计页「总」牌使用。
 pub fn totals() -> UsageTotals {
+    let sql = format!(
+        "SELECT {USAGE_TOTAL_COLUMNS}, failovers FROM usage_total WHERE day = '{GRAND_TOTAL_DAY}'"
+    );
     db::with_conn(|connection| {
-        let totals = connection.query_row(
-            "SELECT COALESCE(SUM(calls), 0), \
-                    COALESCE(SUM(failed_calls), 0), \
-                    COALESCE(SUM(input_tokens), 0), \
-                    COALESCE(SUM(output_tokens), 0), \
-                    COALESCE(SUM(failovers), 0) \
-             FROM usage_daily_total",
-            [],
-            |row| {
+        Ok(connection
+            .query_row(&sql, [], |row| {
                 Ok(UsageTotals {
                     requests: row.get::<_, i64>(0)? as u64,
                     failed: row.get::<_, i64>(1)? as u64,
                     input_tokens: row.get::<_, i64>(2)? as u64,
                     output_tokens: row.get::<_, i64>(3)? as u64,
-                    failovers: row.get::<_, i64>(4)? as u64,
+                    cache_read_tokens: row.get::<_, i64>(4)? as u64,
+                    cache_write_tokens: row.get::<_, i64>(5)? as u64,
+                    total_tokens: row.get::<_, i64>(6)? as u64,
+                    failovers: row.get::<_, i64>(7)? as u64,
                 })
-            },
-        )?;
-        Ok(totals)
+            })
+            .optional()?
+            .unwrap_or_default())
     })
     .unwrap_or_default()
 }
@@ -606,10 +585,10 @@ mod tests {
         assert_eq!(remaining, vec![300]);
     }
 
-    /// v10：每日汇总表由写入侧增量维护（含缓存与切换两列），汇总查询只读它。
+    /// v11：usage_total 由写入侧增量累加（每日行 + 全量行共用一张表），读取侧只按 day 取行。
     /// 用内存库，不碰进程级 usage 库。
     #[test]
-    fn daily_rollup_tracks_cache_failovers_and_totals() {
+    fn usage_total_rollup_tracks_day_and_grand_total_rows() {
         let connection = Connection::open_in_memory().unwrap();
         connection.execute_batch(db::SCHEMA_SQL).unwrap();
 
@@ -636,11 +615,17 @@ mod tests {
             error: None,
         };
 
-        upsert_daily_total(&connection, &entry(false, true, 11, 7), 111).unwrap();
-        upsert_daily_total(&connection, &entry(true, false, 0, 0), 222).unwrap();
+        // 每次写入都同时落到「当日行」和「全量行」——与 submit 里的双写一致。
+        for (entry, event_time) in [
+            (entry(false, true, 11, 7), 111),
+            (entry(true, false, 0, 0), 222),
+        ] {
+            upsert_usage_total(&connection, &entry.date, &entry, event_time).unwrap();
+            upsert_usage_total(&connection, GRAND_TOTAL_DAY, &entry, event_time).unwrap();
+        }
 
-        let rows = read_daily_totals(&connection, "2026-01-01").unwrap();
-        assert_eq!(rows.len(), 1);
+        let rows = read_daily_usage(&connection, "2026-01-01").unwrap();
+        assert_eq!(rows.len(), 1, "全量行（day = ''）不能混进每日行");
         let row = &rows[0];
         assert_eq!(row.date, "2026-01-01");
         assert_eq!(row.requests, 2);
@@ -655,7 +640,29 @@ mod tests {
             "total 累加 input+output+缓存（缺省按 0）"
         );
 
+        // 全量行 = 同一批写入的累计。
+        let grand: (i64, i64, i64, i64, i64, i64) = connection
+            .query_row(
+                &format!(
+                    "SELECT calls, failed_calls, input_tokens, output_tokens, total_tokens, failovers \
+                     FROM usage_total WHERE day = '{GRAND_TOTAL_DAY}'"
+                ),
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(grand, (2, 1, 200, 80, 298, 1));
+
         // 截止日过滤：更晚的 cutoff 排掉它。
-        assert!(read_daily_totals(&connection, "2026-01-02").unwrap().is_empty());
+        assert!(read_daily_usage(&connection, "2026-01-02").unwrap().is_empty());
     }
 }

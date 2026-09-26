@@ -1725,9 +1725,10 @@ fn sqlite_persistence_round_trips() {
     );
     assert_eq!(records[0].upstream_model, "temp-model");
     assert!(records[0].proxied, "经代理出站的标记要能落库读回");
-    let summary = usage::summary(365);
-    assert_eq!(summary.total_requests, 1);
-    assert_eq!(summary.today_tokens, 15);
+    let totals = usage::totals();
+    assert_eq!(totals.requests, 1);
+    assert_eq!(totals.total_tokens, 15);
+    assert_eq!(usage::today().total_tokens, 15);
 
     // 详情页按 id 单独取记录
     assert_eq!(
@@ -1794,8 +1795,8 @@ fn sqlite_persistence_round_trips() {
             && !detail.response_truncated
     );
 
-    // 某天首次写入时 usage_daily_total 会新建行，报文仍须挂到正确的明细行
-    // （回归：last_insert_rowid 若在 daily upsert 之后取，会被覆盖成 daily 的行号）
+    // 某天首次写入时 usage_total 会新建当日行，报文仍须挂到正确的明细行
+    // （回归：last_insert_rowid 若在汇总 upsert 之后取，会被覆盖成汇总行的行号）
     usage::submit(
         &UsageRecord {
             id: 0,

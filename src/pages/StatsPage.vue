@@ -27,7 +27,7 @@ import { useUsage } from "@/composables/useUsage";
 import { cacheHitRate, formatCompact, formatNumber, formatPercent } from "@/lib/format";
 
 const router = useRouter();
-const { summary, records, refresh } = useUsage();
+const { daily, today, total, records, refresh } = useUsage();
 
 // 统计页只预览最新若干条，完整列表在「请求明细」页
 const PREVIEW_LIMIT = 50;
@@ -48,12 +48,44 @@ function selectYear(value: unknown): void {
 const cacheHit = computed(() =>
   formatPercent(
     cacheHitRate({
-      inputTokens: summary.value?.inputTokens ?? 0,
-      cacheReadTokens: summary.value?.cacheReadTokens ?? 0,
-      cacheWriteTokens: summary.value?.cacheWriteTokens ?? 0,
+      inputTokens: total.value?.inputTokens ?? 0,
+      cacheReadTokens: total.value?.cacheReadTokens ?? 0,
+      cacheWriteTokens: total.value?.cacheWriteTokens ?? 0,
     }),
   ),
 );
+
+const todayCacheHit = computed(() =>
+  formatPercent(
+    cacheHitRate({
+      inputTokens: today.value?.inputTokens ?? 0,
+      cacheReadTokens: today.value?.cacheReadTokens ?? 0,
+      cacheWriteTokens: today.value?.cacheWriteTokens ?? 0,
+    }),
+  ),
+);
+
+function iso(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+// 连续活跃天数：从今天往回数「有请求」的连续日。数据来自每日行，无需后端再算。
+const streakDays = computed(() => {
+  const active = new Set(
+    daily.value.filter((entry) => entry.requests > 0).map((entry) => entry.date),
+  );
+  let streak = 0;
+  const cursor = new Date();
+  cursor.setHours(0, 0, 0, 0);
+  while (active.has(iso(cursor))) {
+    streak += 1;
+    cursor.setDate(cursor.getDate() - 1);
+  }
+  return streak;
+});
 
 onMounted(() => refresh(rangeDays, PREVIEW_LIMIT));
 
@@ -69,25 +101,44 @@ function openAll(): void {
 
 <template>
   <div class="w-full space-y-5">
-    <div class="grid grid-cols-4 gap-3 xl:grid-cols-7">
-      <StatTile label="总请求" :value="formatNumber(summary?.totalRequests ?? 0)" />
+    <div class="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-7">
       <StatTile
-        label="失败请求"
-        :value="formatNumber(summary?.failedRequests ?? 0)"
-        :tone="(summary?.failedRequests ?? 0) > 0 ? 'danger' : 'default'"
+        label="总请求"
+        :value="formatNumber(total?.requests ?? 0)"
+        :hint="`今日请求 ${formatNumber(today?.requests ?? 0)}`"
       />
-      <StatTile label="输入 Token" :value="formatCompact(summary?.inputTokens ?? 0)" />
-      <StatTile label="输出 Token" :value="formatCompact(summary?.outputTokens ?? 0)" />
       <StatTile
-        label="缓存命中"
+        label="总 Token"
+        :value="formatCompact(total?.outputTokens ?? 0)"
+        :hint="`输入 ${formatCompact(total?.inputTokens ?? 0)}`"
+      />
+      <StatTile
+        label="今日 Token"
+        :value="formatCompact(today?.outputTokens ?? 0)"
+        :hint="`输入 ${formatCompact(today?.inputTokens ?? 0)}`"
+      />
+      <StatTile
+        label="总缓存命中"
         :value="cacheHit"
-        :tone="(summary?.cacheReadTokens ?? 0) > 0 ? 'success' : 'default'"
+        :hint="`缓存读 ${formatCompact(total?.cacheReadTokens ?? 0)}`"
+        :tone="(total?.cacheReadTokens ?? 0) > 0 ? 'success' : 'default'"
       />
-      <StatTile label="今日 Token" :value="formatCompact(summary?.todayTokens ?? 0)" />
       <StatTile
-        label="连续活跃"
-        :value="`${summary?.streakDays ?? 0} 天`"
-        :tone="(summary?.streakDays ?? 0) > 0 ? 'success' : 'default'"
+        label="今日缓存命中"
+        :value="todayCacheHit"
+        :hint="`缓存读 ${formatCompact(today?.cacheReadTokens ?? 0)}`"
+        :tone="(today?.cacheReadTokens ?? 0) > 0 ? 'success' : 'default'"
+      />
+      <StatTile
+        label="总失败请求"
+        :value="formatNumber(total?.failed ?? 0)"
+        :hint="`今日失败 ${formatNumber(today?.failed ?? 0)}`"
+        :tone="(total?.failed ?? 0) > 0 ? 'danger' : 'default'"
+      />
+      <StatTile
+        label="活跃天数"
+        :value="`${streakDays} 天`"
+        :tone="streakDays > 0 ? 'success' : 'default'"
       />
     </div>
 
@@ -110,7 +161,7 @@ function openAll(): void {
         </div>
       </CardHeader>
       <CardContent>
-        <ContributionHeatmap :daily="summary?.daily ?? []" :year="year" />
+        <ContributionHeatmap :daily="daily" :year="year" />
       </CardContent>
     </Card>
 

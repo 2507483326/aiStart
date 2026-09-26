@@ -1,9 +1,19 @@
 use crate::error::AppResult;
-use crate::usage::{self, RequestDetail, UsagePage, UsageRecord, UsageSummary};
+use crate::usage::{self, DailyUsage, RequestDetail, UsagePage, UsageRecord, UsageTotals};
 
 #[tauri::command]
-pub fn usage_summary(days: u32) -> UsageSummary {
-    usage::summary(days)
+pub fn usage_daily(days: u32) -> Vec<DailyUsage> {
+    usage::daily(days)
+}
+
+#[tauri::command]
+pub fn usage_today() -> DailyUsage {
+    usage::today()
+}
+
+#[tauri::command]
+pub fn usage_total() -> UsageTotals {
+    usage::totals()
 }
 
 #[tauri::command]

@@ -17,7 +17,7 @@ import {
 } from "@/lib/format";
 import { usageApi } from "@/lib/ipc";
 import { notifySuccess } from "@/lib/notify";
-import type { UsageSummary } from "@/lib/types";
+import type { DailyUsage } from "@/lib/types";
 
 const { status, busy, phase, transitioning, restart } = useGateway();
 
@@ -48,8 +48,8 @@ const endpoints = [
 const selectedEndpoint = ref(endpoints[0]);
 const endpointUrl = computed(() => `${baseUrl.value}${selectedEndpoint.value.path}`);
 
-// 面板只展示当日用量，口径与「统计」页一致。
-const today = ref<UsageSummary | null>(null);
+// 面板只展示当日用量：直读 usage_total 的今日行，读时不做 SUM。
+const today = ref<DailyUsage | null>(null);
 
 const cacheRead = computed(() => today.value?.cacheReadTokens ?? 0);
 const cacheHit = computed(() =>
@@ -63,7 +63,7 @@ const cacheHit = computed(() =>
 );
 
 async function loadToday() {
-  today.value = await usageApi.summary(1);
+  today.value = await usageApi.today();
 }
 
 async function handleRestart() {
@@ -123,22 +123,22 @@ onMounted(loadToday);
     <CardContent class="space-y-4">
       <div class="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-5">
         <StatTile label="监听地址" :value="baseUrl" value-class="text-sm" />
-        <StatTile label="今日请求" :value="formatNumber(today?.totalRequests ?? 0)" />
+        <StatTile label="今日请求" :value="formatNumber(today?.requests ?? 0)" />
         <StatTile
           label="今日错误"
-          :value="formatNumber(today?.failedRequests ?? 0)"
-          :tone="(today?.failedRequests ?? 0) > 0 ? 'danger' : 'default'"
+          :value="formatNumber(today?.failed ?? 0)"
+          :tone="(today?.failed ?? 0) > 0 ? 'danger' : 'default'"
         />
         <StatTile
-          label="缓存命中"
+          label="今日缓存命中"
           :value="cacheHit"
           :hint="`缓存读 ${formatCompact(cacheRead)}`"
           :tone="cacheRead > 0 ? 'success' : 'default'"
         />
         <StatTile
-          label="输出 Token"
+          label="今日输出 Token"
           :value="formatCompact(today?.outputTokens ?? 0)"
-          :hint="`输入 ${formatCompact(today?.inputTokens ?? 0)}`"
+          :hint="`今日输入 ${formatCompact(today?.inputTokens ?? 0)}`"
         />
       </div>
 

@@ -1,5 +1,5 @@
 -- =====================================================================
--- AI Start SQLite schema v10（db_schema_version = 10）
+-- AI Start SQLite schema v11（db_schema_version = 11）
 -- v1 首次落库：app_settings / models / app_model_bindings（配置与模型，取代 settings.json）、
 -- usage_detail / usage_daily_total（token 消耗，取代 usage.jsonl）、events（审计事件）、
 -- app_version_records（应用版本检查与更新记录）。
@@ -14,10 +14,13 @@
 -- v9 新增：usage_payload.inbound_headers（客户端入站 HTTP header，原样保存不脱敏）。
 -- v10 新增：usage_daily_total 补 cache_read_tokens / cache_write_tokens / failovers 三列——
 --           汇总查询（summary / totals）改为只读这张每日表，不再扫 usage_detail 全表。
+-- v11 变更：usage_daily_total 改名为 usage_total 并改为自增主键；每日行（day = 'yyyy-MM-dd'）
+--           与全量累计行（day = ''）共用这一张表，写入时增量累加，读时不做 SUM；
+--           老库的 usage_daily_total 在 db::init 里搬运进 usage_total 后整表丢弃。
 --
 -- 规范（对齐 eTeam：C:\eTeam\src\host\state\schema.sql）：
 --   主键 = 每张表自己的编号列，统一 INTEGER 自增（仅 schema_meta / app_settings 以 key 为主键，
---          usage_daily_total 以 day 为主键，app_version_records 以 app_kind 为主键）
+--          app_version_records 以 app_kind 为主键）
 --   时间列一律以 *_time 结尾（Unix 毫秒）；每张表末尾固定 created_time / update_time
 --   枚举 = TEXT（合法取值写在列注释里）；JSON = TEXT 存 JSON 字符串
 --   表上不建外键、CHECK、UNIQUE、触发器——规则全部由写入代码保证
@@ -39,7 +42,7 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 
 -- ---------------------------------------------------------------------
 -- 1. usage_detail —— Token 消耗明细（一行 = 一次网关请求/模型回复）
---    DB 即唯一存储（取代原 usage.jsonl）；写入 = 本表 INSERT + usage_daily_total 增量 upsert（单事务）
+--    DB 即唯一存储（取代原 usage.jsonl）；写入 = 本表 INSERT + usage_total 增量 upsert（单事务）
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS usage_detail (
   usage_detail_id   INTEGER PRIMARY KEY AUTOINCREMENT,  -- 明细行号，自增
@@ -74,22 +77,27 @@ CREATE INDEX IF NOT EXISTS idx_usage_detail_source ON usage_detail (source_app);
 CREATE INDEX IF NOT EXISTS idx_usage_detail_failed ON usage_detail (day, ok) WHERE ok = 0;
 
 -- ---------------------------------------------------------------------
--- 2. usage_daily_total —— 每日消耗总和（一行 = 一天，全应用口径）
---    写入按事件增量 upsert（非强一致：精确口径可随时按 day 重查 usage_detail）
+-- 2. usage_total —— Token 消耗总和（每日一行 + 全量一行，共用本表，全应用口径）
+--    day = 'yyyy-MM-dd' 为当日行；day = ''（空串）为全量累计行，全表至多一行空串。
+--    写入按事件增量累加（读时不做 SUM，也不扫 usage_detail）；每日行/全量行的唯一性
+--    由写入代码保证（本设计不建 UNIQUE，同 eTeam 口径）。
 -- ---------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS usage_daily_total (
-  day                TEXT PRIMARY KEY,      -- 消耗日 'yyyy-MM-dd'（行即主键）
-  input_tokens       INTEGER NOT NULL DEFAULT 0,
-  output_tokens      INTEGER NOT NULL DEFAULT 0,
-  cache_read_tokens  INTEGER NOT NULL DEFAULT 0,  -- 缓存读之和（v10；旧库由 db::init 回填）
-  cache_write_tokens INTEGER NOT NULL DEFAULT 0,  -- 缓存写之和（v10；旧库由 db::init 回填）
-  total_tokens       INTEGER NOT NULL DEFAULT 0,  -- 明细 total_tokens 之和（增量累计）
-  calls              INTEGER NOT NULL DEFAULT 0,  -- 明细行数 = 调用次数
-  failed_calls       INTEGER NOT NULL DEFAULT 0,  -- 其中失败次数（ok = 0）
-  failovers          INTEGER NOT NULL DEFAULT 0,  -- 其中触发切换探测次数（failover = 1，v10）
-  created_time       INTEGER NOT NULL,      -- 首次写入该日行
+CREATE TABLE IF NOT EXISTS usage_total (
+  usage_total_id     INTEGER PRIMARY KEY AUTOINCREMENT,  -- 汇总行号，自增
+  day                TEXT NOT NULL DEFAULT '',  -- 消耗日 'yyyy-MM-dd'；'' = 全量累计行
+  input_tokens       INTEGER NOT NULL DEFAULT 0,   -- 不含缓存的输入
+  output_tokens      INTEGER NOT NULL DEFAULT 0,   -- 输出
+  cache_read_tokens  INTEGER NOT NULL DEFAULT 0,   -- 缓存读之和
+  cache_write_tokens INTEGER NOT NULL DEFAULT 0,   -- 缓存写之和
+  total_tokens       INTEGER NOT NULL DEFAULT 0,   -- 真实消耗 = input + output + cache_read + cache_write
+  calls              INTEGER NOT NULL DEFAULT 0,   -- 调用次数（明细行数）
+  failed_calls       INTEGER NOT NULL DEFAULT 0,   -- 其中失败次数（ok = 0）
+  failovers          INTEGER NOT NULL DEFAULT 0,   -- 其中触发切换探测次数（failover = 1）
+  created_time       INTEGER NOT NULL,      -- 首次写入该行
   update_time        INTEGER NOT NULL       -- 最近一次增量
 );
+
+CREATE INDEX IF NOT EXISTS idx_usage_total_day ON usage_total (day);
 
 -- ---------------------------------------------------------------------
 -- 3. events —— 审计事件（只插入，不修改）

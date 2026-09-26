@@ -118,25 +118,16 @@ export interface DailyUsage {
   totalTokens: number;
 }
 
-export interface ModelUsage {
-  modelName: string;
+/** 全量累计：对应 usage_total 里 day = '' 的那一行（读时直读，不做 SUM）。 */
+export interface UsageTotals {
   requests: number;
-  inputTokens: number;
-  outputTokens: number;
-}
-
-export interface UsageSummary {
-  totalRequests: number;
-  failedRequests: number;
+  failed: number;
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
   totalTokens: number;
-  todayTokens: number;
-  streakDays: number;
-  daily: DailyUsage[];
-  byModel: ModelUsage[];
+  failovers: number;
 }
 
 export interface ToolApp {

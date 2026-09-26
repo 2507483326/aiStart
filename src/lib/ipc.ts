@@ -5,6 +5,7 @@ import type {
   AppKind,
   ApplyReport,
   AppUpdate,
+  DailyUsage,
   EventRecord,
   FilterInput,
   FormatInfo,
@@ -21,7 +22,7 @@ import type {
   ToolApp,
   UsagePage,
   UsageRecord,
-  UsageSummary,
+  UsageTotals,
 } from "@/lib/types";
 
 export const appApi = {
@@ -54,7 +55,9 @@ export const gatewayApi = {
 };
 
 export const usageApi = {
-  summary: (days: number) => invoke<UsageSummary>("usage_summary", { days }),
+  daily: (days: number) => invoke<DailyUsage[]>("usage_daily", { days }),
+  today: () => invoke<DailyUsage>("usage_today"),
+  total: () => invoke<UsageTotals>("usage_total"),
   records: (limit: number) => invoke<UsageRecord[]>("usage_records", { limit }),
   page: (offset: number, limit: number) =>
     invoke<UsagePage>("usage_page", { offset, limit }),
