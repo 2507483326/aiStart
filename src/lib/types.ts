@@ -224,6 +224,8 @@ export interface SettingsView {
   proxyEnabled: boolean;
   /// 出站代理地址，空串 = 直连。
   proxyUrl: string;
+  /// 请求报文保留天数：7 / 30 / 100，0 = 永久保留。
+  requestRetentionDays: number;
   activeModelId: number | null;
   applied: Record<string, number>;
 }
@@ -234,6 +236,7 @@ export interface SettingsInput {
   launchAtLogin?: boolean;
   proxyEnabled?: boolean;
   proxyUrl?: string;
+  requestRetentionDays?: number;
 }
 
 export interface AppInfo {

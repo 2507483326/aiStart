@@ -9,7 +9,7 @@ use crate::error::{AppError, AppResult};
 pub const SCHEMA_SQL: &str = include_str!("schema.sql");
 
 /// 当前 schema 版本号，写入 schema_meta.db_schema_version。
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 static DB: OnceLock<Mutex<Connection>> = OnceLock::new();
 
@@ -24,45 +24,70 @@ pub fn init(dir: &Path) -> AppResult<()> {
 
     // CREATE TABLE IF NOT EXISTS 只建新表，不会给已存在的旧库补列；schema.sql 里的索引又引用了新列，
     // 所以必须在执行 DDL 之前对「已存在的表」补列（新库由 schema.sql 直接建出带列的表，这里跳过）。
-    ensure_column(
+    // 这些补列的结果不用：只为让旧库跟上当前列集合。
+    let _ = ensure_column(
         &connection,
         "usage_detail",
         "source_app",
         "TEXT NOT NULL DEFAULT ''",
     )?;
-    ensure_column(
+    let _ = ensure_column(
         &connection,
         "usage_detail",
         "upstream_url",
         "TEXT NOT NULL DEFAULT ''",
     )?;
-    ensure_column(
+    let _ = ensure_column(
         &connection,
         "usage_detail",
         "upstream_model",
         "TEXT NOT NULL DEFAULT ''",
     )?;
-    ensure_column(
+    let _ = ensure_column(
         &connection,
         "usage_detail",
         "proxied",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
-    ensure_column(
+    let _ = ensure_column(
         &connection,
         "app_model_bindings",
         "token",
         "TEXT NOT NULL DEFAULT ''",
     )?;
-    ensure_column(&connection, "usage_payload", "upstream_request", "TEXT")?;
-    ensure_column(
+    let _ = ensure_column(&connection, "usage_payload", "upstream_request", "TEXT")?;
+    let _ = ensure_column(
         &connection,
         "usage_payload",
         "upstream_request_truncated",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     // v9：入站 HTTP header 原样入库（用户确认不脱敏）。
-    ensure_column(&connection, "usage_payload", "inbound_headers", "TEXT")?;
+    let _ = ensure_column(&connection, "usage_payload", "inbound_headers", "TEXT")?;
+
+    // v10：每日汇总表补三列。只要有一列是这次新加的，就把历史回填一次——汇总查询此后只读这张表，
+    // 不再依赖「每次重查 usage_detail」，所以旧库必须先补齐它漏掉的历史累计值。
+    let added_cache_read = ensure_column(
+        &connection,
+        "usage_daily_total",
+        "cache_read_tokens",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    let added_cache_write = ensure_column(
+        &connection,
+        "usage_daily_total",
+        "cache_write_tokens",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    let added_failovers = ensure_column(
+        &connection,
+        "usage_daily_total",
+        "failovers",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    if added_cache_read || added_cache_write || added_failovers {
+        backfill_daily_totals(&connection)?;
+    }
 
     // v7：app_version_records 由「追加式历史」改为「每个应用一行」。旧表先改名让 schema.sql
     // 建出新结构，数据在 DDL 之后搬运（见 copy_legacy_app_version_records）。
@@ -86,14 +111,16 @@ pub fn init(dir: &Path) -> AppResult<()> {
 
 /// 幂等补列：旧库缺列时执行 ALTER TABLE ADD COLUMN（SQLite 无 ADD COLUMN IF NOT EXISTS）。
 /// 表尚不存在（全新库）时直接跳过——由 schema.sql 建出带该列的表。
-fn ensure_column(connection: &Connection, table: &str, column: &str, decl: &str) -> AppResult<()> {
+/// 返回**这次是否真的补了列**：迁移需要据此判断要不要顺带回填历史数据（v10）。
+fn ensure_column(connection: &Connection, table: &str, column: &str, decl: &str) -> AppResult<bool> {
     if !table_exists(connection, table)? {
-        return Ok(());
+        return Ok(false);
     }
     if !table_has_column(connection, table, column)? {
         connection.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 fn table_exists(connection: &Connection, table: &str) -> AppResult<bool> {

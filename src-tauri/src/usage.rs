@@ -1,9 +1,12 @@
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
 use crate::db;
+use crate::error::AppResult;
+use crate::settings;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -325,6 +328,46 @@ pub fn payload_detail(usage_detail_id: i64) -> Option<UsagePayloadDetail> {
     .unwrap_or(None)
 }
 
+/// 按「请求保存时间」清理过期报文快照。只删 usage_payload（入站/上游请求与响应），
+/// usage_detail 明细与 usage_daily_total 汇总保留；`retention_days <= 0`（永久保留）不动任何行。
+/// 返回删除行数，失败按 0 计（清理失败不该影响调用方）。
+pub fn cleanup_expired_payloads(retention_days: i64) -> usize {
+    let Some(cutoff) = retention_cutoff(retention_days, db::now_ms()) else {
+        return 0;
+    };
+    db::with_conn(|connection| prune_payloads(connection, cutoff)).unwrap_or(0)
+}
+
+/// 保留天数换算成「早于它即过期」的截止时刻；`retention_days <= 0`（永久保留）返回 None。
+fn retention_cutoff(retention_days: i64, now_ms: i64) -> Option<i64> {
+    if retention_days <= 0 {
+        return None;
+    }
+    Some(now_ms - retention_days * 24 * 60 * 60 * 1000)
+}
+
+/// 删除早于 `cutoff` 的报文行。抽出来是为了能用内存库单测，不必碰进程级 usage 库。
+fn prune_payloads(connection: &rusqlite::Connection, cutoff: i64) -> AppResult<usize> {
+    Ok(connection.execute(
+        "DELETE FROM usage_payload WHERE created_time < ?1",
+        params![cutoff],
+    )?)
+}
+
+/// 保存窗口清理的节奏：启动先跑一次，之后每 24 小时一轮。
+const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// 每天按当前设置清理一次过期报文。用独立线程而不是 tokio 任务：落库本身是同步的，
+/// 清理一天才一次，不值得占用异步运行时；线程在进程退出时随之结束。
+pub fn spawn_retention_task() {
+    let _ = std::thread::Builder::new()
+        .name("usage-retention".into())
+        .spawn(|| loop {
+            cleanup_expired_payloads(settings::snapshot().request_retention_days);
+            std::thread::sleep(RETENTION_SWEEP_INTERVAL);
+        });
+}
+
 /// 按明细行号取单条记录（详情页深链/刷新用）。
 pub fn find(usage_detail_id: i64) -> Option<UsageRecord> {
     let sql = format!("SELECT {SELECT_COLUMNS} FROM usage_detail WHERE usage_detail_id = ?1");
@@ -534,4 +577,47 @@ pub fn totals() -> UsageTotals {
 pub fn current_timestamp() -> (String, String) {
     let now = chrono::Local::now();
     (now.to_rfc3339(), now.format("%Y-%m-%d").to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+    #[test]
+    fn retention_cutoff_is_permanent_only_when_disabled() {
+        // 0 / 负数 = 永久保留：没有截止时刻，也就是不清理。
+        assert_eq!(retention_cutoff(0, 1_000), None);
+        assert_eq!(retention_cutoff(-30, 1_000), None);
+        // 正数 = 现在往前推 N 天；边界取「恰好 N 天前」，更早的才算过期。
+        assert_eq!(retention_cutoff(7, 1_000), Some(1_000 - 7 * DAY_MS));
+    }
+
+    #[test]
+    fn pruning_removes_only_rows_older_than_the_cutoff() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(db::SCHEMA_SQL).unwrap();
+        for created in [100_i64, 200, 300] {
+            connection
+                .execute(
+                    "INSERT INTO usage_payload (usage_detail_id, created_time, update_time) \
+                     VALUES (1, ?1, ?1)",
+                    params![created],
+                )
+                .unwrap();
+        }
+
+        // 250 之前的两条删除，250 之后的保留（边界不算过期）。
+        assert_eq!(prune_payloads(&connection, 250).unwrap(), 2);
+        let remaining: Vec<i64> = connection
+            .prepare("SELECT created_time FROM usage_payload ORDER BY created_time")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(remaining, vec![300]);
+    }
 }

@@ -43,6 +43,9 @@ pub struct Settings {
     /// 出站代理地址（如 `http://127.0.0.1:7890`）。
     /// 生效点是 providers::http_client()，所有出站流量共用。
     pub proxy_url: String,
+    /// 请求报文保留天数（usage_payload 清理策略）：7 / 30 / 100，0 = 永久保留。
+    /// 只删报文快照，usage_detail 明细与每日汇总不受影响。
+    pub request_retention_days: i64,
     /// app_kind -> model_id
     pub applied: BTreeMap<String, i64>,
     /// app_kind -> 应用专属网关 Key（固定可读，= app_kind）
@@ -52,6 +55,9 @@ pub struct Settings {
 fn default_port() -> u16 {
     8931
 }
+
+/// 「请求保存时间」的合法天数：7 / 30 / 100 天，0 = 永久保留。后端校验与前端选项共用这套值。
+pub const RETENTION_DAY_OPTIONS: [i64; 4] = [7, 30, 100, 0];
 
 impl Default for Settings {
     fn default() -> Self {
@@ -65,6 +71,8 @@ impl Default for Settings {
             // 代理默认关：地址都没有，开了也没用。
             proxy_enabled: false,
             proxy_url: String::new(),
+            // 请求报文默认保留 7 天：磁盘增长最狠的就是报文快照，默认给个短窗口。
+            request_retention_days: 7,
             applied: BTreeMap::new(),
             app_tokens: BTreeMap::new(),
         }
@@ -206,6 +214,11 @@ fn load() -> AppResult<Settings> {
                 "launch_at_login" => settings.launch_at_login = value.trim() == "1",
                 "proxy_enabled" => settings.proxy_enabled = value.trim() == "1",
                 "proxy_url" => settings.proxy_url = value.trim().to_string(),
+                "request_retention_days" => {
+                    if let Ok(days) = value.trim().parse() {
+                        settings.request_retention_days = days;
+                    }
+                }
                 _ => {}
             }
         }
@@ -303,6 +316,10 @@ fn setting_pairs(settings: &Settings) -> Vec<(&'static str, String)> {
             if settings.proxy_enabled { "1" } else { "0" }.to_string(),
         ),
         ("proxy_url", settings.proxy_url.clone()),
+        (
+            "request_retention_days",
+            settings.request_retention_days.to_string(),
+        ),
     ]
 }
 

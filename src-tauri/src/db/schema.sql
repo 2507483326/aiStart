@@ -1,5 +1,5 @@
 -- =====================================================================
--- AI Start SQLite schema v8（db_schema_version = 8）
+-- AI Start SQLite schema v10（db_schema_version = 10）
 -- v1 首次落库：app_settings / models / app_model_bindings（配置与模型，取代 settings.json）、
 -- usage_detail / usage_daily_total（token 消耗，取代 usage.jsonl）、events（审计事件）、
 -- app_version_records（应用版本检查与更新记录）。
@@ -11,6 +11,9 @@
 -- v7 变更：app_version_records 由「每次检查/动作追加一行」改为「每个应用一行」（app_kind 作主键，
 --          刷新只更新这一行）。
 -- v8 新增：usage_detail.proxied（这次请求是否经代理出站）。
+-- v9 新增：usage_payload.inbound_headers（客户端入站 HTTP header，原样保存不脱敏）。
+-- v10 新增：usage_daily_total 补 cache_read_tokens / cache_write_tokens / failovers 三列——
+--           汇总查询（summary / totals）改为只读这张每日表，不再扫 usage_detail 全表。
 --
 -- 规范（对齐 eTeam：C:\eTeam\src\host\state\schema.sql）：
 --   主键 = 每张表自己的编号列，统一 INTEGER 自增（仅 schema_meta / app_settings 以 key 为主键，
@@ -78,9 +81,12 @@ CREATE TABLE IF NOT EXISTS usage_daily_total (
   day                TEXT PRIMARY KEY,      -- 消耗日 'yyyy-MM-dd'（行即主键）
   input_tokens       INTEGER NOT NULL DEFAULT 0,
   output_tokens      INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens  INTEGER NOT NULL DEFAULT 0,  -- 缓存读之和（v10；旧库由 db::init 回填）
+  cache_write_tokens INTEGER NOT NULL DEFAULT 0,  -- 缓存写之和（v10；旧库由 db::init 回填）
   total_tokens       INTEGER NOT NULL DEFAULT 0,  -- 明细 total_tokens 之和（增量累计）
   calls              INTEGER NOT NULL DEFAULT 0,  -- 明细行数 = 调用次数
   failed_calls       INTEGER NOT NULL DEFAULT 0,  -- 其中失败次数（ok = 0）
+  failovers          INTEGER NOT NULL DEFAULT 0,  -- 其中触发切换探测次数（failover = 1，v10）
   created_time       INTEGER NOT NULL,      -- 首次写入该日行
   update_time        INTEGER NOT NULL       -- 最近一次增量
 );
@@ -133,6 +139,7 @@ CREATE TABLE IF NOT EXISTS app_version_records (
 --    合法键：active_model_id（生效模型 ID）/ gateway_port（本地网关端口）
 --            / auto_failover（1/0）/ launch_at_login（开机启动，1/0）
 --            / proxy_enabled（代理开关，1/0）/ proxy_url（出站代理地址，空串 = 直连）
+--            / request_retention_days（请求报文保留天数：7/30/100，0 = 永久）
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS app_settings (
   key            TEXT PRIMARY KEY,             -- 设置键（行即主键，key 例外同 schema_meta）

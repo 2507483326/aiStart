@@ -18,6 +18,7 @@ pub struct SettingsView {
     pub launch_at_login: bool,
     pub proxy_enabled: bool,
     pub proxy_url: String,
+    pub request_retention_days: i64,
     pub active_model_id: Option<i64>,
     pub applied: BTreeMap<String, i64>,
 }
@@ -37,6 +38,9 @@ pub struct SettingsInput {
     /// 空串 = 清空代理地址；不带这个字段则保持原样。
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// 请求报文保留天数：7 / 30 / 100，0 = 永久保留。
+    #[serde(default)]
+    pub request_retention_days: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -57,6 +61,7 @@ fn view() -> SettingsView {
         launch_at_login: snapshot.launch_at_login,
         proxy_enabled: snapshot.proxy_enabled,
         proxy_url: snapshot.proxy_url,
+        request_retention_days: snapshot.request_retention_days,
         active_model_id: snapshot.active_model_id,
         applied: snapshot.applied,
     }
@@ -99,6 +104,13 @@ pub async fn update_settings(input: SettingsInput) -> AppResult<SettingsView> {
         }
     }
 
+    // 只认下拉框里的四个值：写进来别的天数没有对应的 UI，不如当场拒绝。
+    if let Some(days) = input.request_retention_days {
+        if !settings::RETENTION_DAY_OPTIONS.contains(&days) {
+            return Err(AppError::InvalidConfig("请求保存时间取值非法".into()));
+        }
+    }
+
     settings::mutate(|store| {
         if let Some(port) = input.gateway_port {
             store.gateway_port = port;
@@ -108,6 +120,9 @@ pub async fn update_settings(input: SettingsInput) -> AppResult<SettingsView> {
         }
         if let Some(enabled) = input.launch_at_login {
             store.launch_at_login = enabled;
+        }
+        if let Some(days) = input.request_retention_days {
+            store.request_retention_days = days;
         }
         store.proxy_enabled = proxy_enabled;
         if let Some(url) = proxy_url {
