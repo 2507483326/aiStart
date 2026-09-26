@@ -221,6 +221,11 @@ parse_sse_stream(upstream)                       // → SseFrame { event, data, 
 按影响分组。A 组是跨协议转发的保真缺口（只影响**跨协议**请求）；B 组是健壮性；
 C 组是一致性/小项。
 
+> 传输层（超时与半开连接、缓冲上限、入站体积限制、重定向与凭据、落库时序与磁盘增长）另有一份
+> 复核：`docs/transport-review.md`（2026-09-25，含 H1–H3 / M1–M5 / L1–L7 与建议的批 5 顺序）。
+> 其中 **H2（入站体积）、L1（事件名回落）、L3（绕行判定收成一份）已于当轮落地**，逐条记录在该文
+> §8；**H1（`read_timeout`）与 H3（跟随重定向）明确未做**，M / L 组其余条目也未动。
+
 ### A. 跨协议保真缺口
 
 **A1｜Completions 入站跨协议丢 `tool_choice`**（高）
@@ -485,7 +490,30 @@ Responses 的思考按事件名区分（`response.reasoning_summary_text.delta`�
   做成「设置项 + 默认关」可以不破坏现有绑定，代价是需要同时动 Rust 设置、DB 列与
   `SettingsDialog.vue` / `types.ts`。
 
-138 通过。
+批 4 结束时全量 138 通过。
+
+### 批 5（部分）：传输层复核落地（H2 / L1 / L3 ✅ 已完成；H1 / H3 未做）
+
+来源是 `docs/transport-review.md` 的复核（传输层另开的一份，§7 开头有指针），按用户指名只做
+其中三条；**该文的 §8 是这三条的逐条落地记录**，此处只记与本文件其余章节相关的部分与测试数。
+
+**H2 入站体积**（`gateway/server.rs` / `error.rs` / `usage.rs`）：两层上限——handler 内 32MB 自检
+（超限按入站协议形状回 `413 request_too_large`，并走既有的失败落库路径记一条明细）+ axum
+`DefaultBodyLimit` 64MB 硬兜底。顺带把入站报文落库从「整份复制再截断」改成「只取上限 +1 字节的前缀」
+（`usage::PAYLOAD_MAX_BYTES` 因此升为 `pub(crate)`，网关与落库共用一个上限）。这直接改了
+§6「落库」那一行的行为——上限没变，只是不再为超长请求先复制一整份。
+
+**L1 事件名回落**（`providers/{openai_responses,anthropic_messages}.rs`）：SSE 帧的名字有两个来源
+（`event:` 行与 body 的 `type`），现在先认前者、不认得再拿后者试；两条都不认得才按原来的丢帧处理。
+Anthropic 那一路因为每帧都必须转发，回落命中时事件名也一并换成认出来的那个——否则客户端 SDK
+照样当丢帧。对应 §6 的流式解析。
+
+**L3 绕行判定收成一份**（`providers/mod.rs`）：`NO_PROXY_LIST` 是唯一名单，`build_client` 把它交给
+reqwest 真正执行路由，`is_loopback_target` 用同一份名单自己判（reqwest 的 `NoProxy` 不透明、
+hyper-util 里做判定的 matcher 不是 `pub`，规则只能抄一份，用测试盯住）。对应 §2 的出站路径。
+
+**没做**：H1（`read_timeout`）与 H3（跟随重定向）——两条都还是一行级改动，方案见该文 §2；
+M1–M5、L2、L4–L7 也未动。
 
 ### 不做的（明确排除）
 
@@ -497,7 +525,7 @@ Responses 的思考按事件名区分（`response.reasoning_summary_text.delta`�
 - **不重建直通开关**：同协议直通按 `same_protocol` 硬边界生效，无配置项；回滚手段就是让
   谓词返回 `false`（一行）。
 
-## 9. 守护测试现状（138 passed）
+## 9. 守护测试现状（144 passed, 1 ignored）
 
 关键守护点与对应测试：
 
@@ -518,3 +546,14 @@ Responses 的思考按事件名区分（`response.reasoning_summary_text.delta`�
 | 块状态机不变式 | `block_normalizer_keeps_payloads_in_their_own_block`、`block_normalizer_serializes_parallel_tool_arguments` |
 | 流判罚 | `stream_verdict_flags_reasoning_only_and_truncated` |
 | 过滤器 | `filter_injects_system_prompt`、`filter_skips_disabled_and_stacks_in_order` |
+| 入站体积上限（判定 + 413 形状） | `gateway::server::tests::inbound_body_check_rejects_only_above_the_cap`、`oversize_error_keeps_the_inbound_protocol_shape` |
+| 超大入站请求被拒且落库（**默认忽略**，单独跑） | `gateway::server::tests::h2_oversize_request_is_rejected_and_recorded` |
+| SSE 帧名回落（两个来源） | `responses_frames_fall_back_to_the_body_type_when_the_envelope_is_unknown`、`anthropic_frames_fall_back_to_the_body_type_when_the_envelope_is_unknown` |
+| 绕行名单语义（对齐 reqwest）与只有环回 | `loopback_bypass_matches_reqwest_rules`、`no_proxy_list_only_covers_loopback` |
+
+上表里唯一 `#[ignore]` 的那条要单独跑（它写进程级 usage 库，全量跑会顶掉
+`sqlite_persistence_round_trips` 的条数断言）：
+
+```bash
+cargo test h2_oversize_request_is_rejected_and_recorded -- --ignored
+```

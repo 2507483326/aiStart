@@ -25,6 +25,11 @@ use tauri::{
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // 必须第一个注册：第二次启动时本进程直接退出，回调跑在**已有实例**里，
+        // 把它的主面板唤到前台 —— 等价于点托盘菜单的「打开主界面」。
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let config_dir = app.path().app_config_dir()?;

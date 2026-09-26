@@ -2501,3 +2501,157 @@ fn completions_stream_captures_the_upstream_chunk_id() {
         .unwrap();
     assert_eq!(state.message_id, "chatcmpl-abc123");
 }
+
+/// L1：`event:` 信封名不认识时，拿正文的 `type` 回落。不守规矩的中转会把每一帧的信封
+/// 统一写成别的名字（这里用 `message` 当例子），正文里的 `type` 才是权威。
+#[test]
+fn responses_frames_fall_back_to_the_body_type_when_the_envelope_is_unknown() {
+    let config = model(ModelFormat::OpenaiResponses, "https://api.openai.com/v1");
+    let provider = provider_for(ModelFormat::OpenaiResponses);
+    let mut state = StreamState::new("gpt-4o");
+
+    let events = provider
+        .decode_stream_event(
+            &config,
+            "message",
+            &json!({ "type": "response.output_text.delta", "delta": "你好" }),
+            &mut state,
+        )
+        .unwrap();
+    let text = events
+        .iter()
+        .find_map(|event| event.data.pointer("/delta/text").and_then(Value::as_str))
+        .expect("正文分片不能因为信封名不认识就整帧丢掉");
+    assert_eq!(text, "你好");
+
+    // 终止帧同样要认出来：`upstream_ended` 不置位，一条答完的流会被记成 Truncated
+    provider
+        .decode_stream_event(
+            &config,
+            "message",
+            &json!({
+                "type": "response.completed",
+                "response": { "usage": { "input_tokens": 7, "output_tokens": 3 } }
+            }),
+            &mut state,
+        )
+        .unwrap();
+    assert!(state.upstream_ended, "终止帧也要按正文的 type 认出来");
+    assert_eq!(state.output_tokens, 3);
+
+    // 两个名字都不认识：维持改动前的行为——丢掉，且不许碰状态
+    let mut untouched = StreamState::new("gpt-4o");
+    let events = provider
+        .decode_stream_event(
+            &config,
+            "message",
+            &json!({ "type": "message" }),
+            &mut untouched,
+        )
+        .unwrap();
+    assert!(events.is_empty());
+    assert!(!untouched.message_started && !untouched.upstream_ended);
+}
+
+/// L1：Anthropic 侧同样用正文的 `type` 回落。它的每一帧本来就要发给客户端，所以认出来之后
+/// 连事件名一起改成认出来的那个——把不认识的信封名原样发过去，客户端一样是丢帧。
+#[test]
+fn anthropic_frames_fall_back_to_the_body_type_when_the_envelope_is_unknown() {
+    let config = model(ModelFormat::AnthropicMessages, "https://api.anthropic.com");
+    let provider = provider_for(ModelFormat::AnthropicMessages);
+    let mut state = StreamState::new("claude");
+
+    let events = provider
+        .decode_stream_event(
+            &config,
+            "message",
+            &json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "max_tokens" },
+                "usage": { "output_tokens": 12 }
+            }),
+            &mut state,
+        )
+        .unwrap();
+    assert_eq!(
+        state.stop_reason.as_deref(),
+        Some("max_tokens"),
+        "回落之后状态照样要推进"
+    );
+    assert_eq!(state.output_tokens, 12);
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].event, "message_delta",
+        "事件名要跟着认出来的那个走，别把不认识的信封名发出去"
+    );
+
+    // 两个名字都不认识：原样转发（维持改动前的行为），状态不动
+    let mut untouched = StreamState::new("claude");
+    let events = provider
+        .decode_stream_event(
+            &config,
+            "message",
+            &json!({ "type": "message" }),
+            &mut untouched,
+        )
+        .unwrap();
+    assert_eq!(events[0].event, "message");
+    assert!(!untouched.message_started && !untouched.upstream_ended && !untouched.finished);
+}
+
+/// L3：代理绕行的判定只有一份名单（`NO_PROXY_LIST`），规则照着 reqwest 内部那份抄。
+/// 这张表按 hyper-util 自己的用例（reqwest 真正用的 matcher）整理，保证两边不各说各话。
+#[test]
+fn loopback_bypass_matches_reqwest_rules() {
+    use crate::providers::no_proxy_matches;
+
+    // 本机地址：走直连（清单里 `localhost` 也覆盖它的全部子域，`127.0.0.0/8` 覆盖整个网段）
+    for host in [
+        "localhost",
+        "LOCALHOST",
+        "api.localhost",
+        "127.0.0.1",
+        "127.9.9.9",
+        "[::1]",
+    ] {
+        assert!(
+            no_proxy_matches(host),
+            "{host} 是本机地址，展示口径不该写成「走了代理」"
+        );
+    }
+
+    // 非本机地址：代理开着就走代理
+    for host in [
+        "example.com",
+        "localhost.example.com",
+        "notlocalhost",
+        "8.8.8.8",
+        "128.0.0.1",
+        "[2001:db8::1]",
+    ] {
+        assert!(!no_proxy_matches(host), "{host} 不是本机地址，不该白名单放行");
+    }
+}
+
+/// L3 的守门测试：名单里只许有回环地址。这条不是为了现在，是为了以后——想把 `10.0.0.0/8`
+/// 顺手加进去时会红，而那不是「加一行」：`is_loopback_target` / `request_proxies_through`
+/// 的命名、注释、明细里的展示口径都得跟着重新想。
+#[test]
+fn no_proxy_list_only_covers_loopback() {
+    for entry in crate::providers::NO_PROXY_LIST.split(',').map(str::trim) {
+        let address = entry.split('/').next().unwrap_or(entry);
+        let loopback = match address.parse::<std::net::IpAddr>() {
+            Ok(ip) => ip.is_loopback(),
+            // 域名条目：只认 `localhost` 与它的子域（RFC 6761 把 `.localhost` 整个留给了回环）。
+            Err(_) => {
+                let domain = address.trim_start_matches('.').to_ascii_lowercase();
+                domain == "localhost" || domain.ends_with(".localhost")
+            }
+        };
+        assert!(
+            loopback,
+            "`{entry}` 不是回环地址：{}",
+            crate::providers::NO_PROXY_LIST
+        );
+    }
+}

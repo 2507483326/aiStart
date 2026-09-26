@@ -173,7 +173,9 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRecord> {
 }
 
 /// 单条报文保存上限：流式大响应可能极大，超过即截断并置 truncated 标记，避免撑爆本地库。
-const PAYLOAD_MAX_BYTES: usize = 256 * 1024;
+/// 网关也读它（`gateway::server::inbound_request_text`）：入站报文只按这个上限取前缀，
+/// 不再为落库整份复制一遍——上限改了，两边一起跟着走。
+pub(crate) const PAYLOAD_MAX_BYTES: usize = 256 * 1024;
 
 /// 按 UTF-8 字节截断文本（不切坏多字节字符），返回 (截断后文本, 是否发生截断)。
 fn cap_bytes(text: &str, limit: usize) -> (String, bool) {

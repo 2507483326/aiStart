@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "请求与用量的数据流",
+    "subtitle": "一份客户端字节从入站到落库的全部形态：规范请求 → 上游报文 → 规范事件流 → 记账",
+    "output": "docs/diagrams/gateway-dataflow.html",
+    "viewBox": [1100, 760]
+  },
+  "stages": [
+    { "label": "入站字节" },
+    { "label": "规范请求" },
+    { "label": "上游报文" },
+    { "label": "规范事件流" },
+    { "label": "记账与展示" }
+  ],
+  "nodes": [
+    { "id": "body_raw", "stage": 0, "row": 0, "type": "backend", "label": "原始请求体", "sublabel": "客户端原样 · 三种入站", "tag": "raw" },
+    { "id": "client_raw", "stage": 0, "row": 1, "type": "database", "label": "客户端原文快照", "sublabel": "直通时当底稿", "tag": "client_raw" },
+    { "id": "headers", "stage": 0, "row": 2, "type": "security", "label": "请求头", "sublabel": "api key · 模型名", "tag": "x-api-key" },
+
+    { "id": "canonical", "stage": 1, "row": 0, "type": "backend", "label": "CanonicalRequest", "sublabel": "Anthropic Messages 形态", "tag": "decode_request" },
+    { "id": "filtered", "stage": 1, "row": 1, "type": "security", "label": "注入后的规范请求", "sublabel": "system 追加提示词", "tag": "filters::apply" },
+    { "id": "target", "stage": 1, "row": 2, "type": "database", "label": "ResolvedTarget", "sublabel": "点名 → 该模型", "tag": "Named | Active" },
+
+    { "id": "up_req", "stage": 2, "row": 0, "type": "cloud", "label": "上游请求体", "sublabel": "按上游协议编码", "tag": "headers()" },
+    { "id": "up_resp", "stage": 2, "row": 1, "type": "cloud", "label": "上游响应", "sublabel": "状态码 · SSE 帧", "tag": "HTTP / SSE" },
+    { "id": "up_err", "stage": 2, "row": 2, "type": "cloud", "label": "上游错误体", "sublabel": "假流式也归类", "tag": "401 / 403 / 429 / 5xx" },
+
+    { "id": "sse", "stage": 3, "row": 0, "type": "messagebus", "label": "SSE 逐帧解码", "sublabel": "parse_sse_stream", "tag": "首帧超时" },
+    { "id": "blocks", "stage": 3, "row": 1, "type": "backend", "label": "内容块组装", "sublabel": "文本 · 思维 · 工具入参", "tag": "StreamState" },
+    { "id": "verdict", "stage": 3, "row": 2, "type": "security", "label": "流末判罚", "sublabel": "Ok · 空思维 · 截断", "tag": "StreamVerdict" },
+
+    { "id": "usage_detail", "stage": 4, "row": 0, "type": "database", "label": "usage_detail", "sublabel": "每请求明细", "tag": "含原始报文" },
+    { "id": "usage_daily", "stage": 4, "row": 1, "type": "database", "label": "usage_daily_total", "sublabel": "按天累加 · 含失败", "tag": "256KB 封顶" },
+    { "id": "ui", "stage": 4, "row": 2, "type": "frontend", "label": "统计页与请求详情", "sublabel": "趋势 · 明细 · 详情", "tag": "Vue 3" }
+  ],
+  "flows": [
+    { "from": "body_raw", "to": "canonical", "label": "原始请求体", "variant": "emphasis", "route": "straight", "labelAt": [207.5, 147] },
+    { "from": "body_raw", "to": "client_raw", "label": "原文保留", "variant": "dashed", "route": "straight", "labelAt": [100, 206] },
+    { "from": "headers", "to": "target", "label": "模型名定上游", "variant": "security", "route": "straight", "labelAt": [207.5, 377] },
+
+    { "from": "canonical", "to": "filtered", "label": "注入提示词", "variant": "security", "route": "straight", "labelAt": [315, 206] },
+    { "from": "filtered", "to": "up_req", "label": "编码上游请求", "variant": "emphasis", "route": "vertical-channel", "channelX": 440, "fromSide": "right", "toSide": "top", "labelAt": [440, 190] },
+    { "from": "target", "to": "up_req", "label": "选定上游", "route": "vertical-channel", "channelX": 422.5, "fromSide": "right", "toSide": "left", "labelAt": [422.5, 264] },
+
+    { "from": "up_req", "to": "up_resp", "label": "POST 上游", "variant": "emphasis", "route": "straight", "labelAt": [530, 206] },
+    { "from": "up_resp", "to": "sse", "label": "字节流回传", "variant": "emphasis", "route": "auto", "labelAt": [637.5, 204] },
+    { "from": "up_err", "to": "verdict", "label": "错误归类", "variant": "security", "route": "straight", "labelAt": [637.5, 377] },
+
+    { "from": "sse", "to": "blocks", "label": "逐事件解码", "route": "straight", "labelAt": [745, 206] },
+    { "from": "blocks", "to": "verdict", "label": "用量汇总", "route": "straight", "labelAt": [745, 320] },
+    { "from": "verdict", "to": "usage_detail", "label": "落库明细", "variant": "dashed", "route": "auto", "labelAt": [852.5, 264] },
+
+    { "from": "usage_detail", "to": "usage_daily", "label": "按天累加", "variant": "dashed", "route": "straight", "labelAt": [960, 206] },
+    { "from": "usage_daily", "to": "ui", "label": "读汇总", "route": "straight", "labelAt": [960, 320] }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "规范形态是唯一的中间表示",
+      "items": [
+        "入站三种协议在这里收敛成同一份 CanonicalRequest，以 Anthropic Messages 为形状基准",
+        "规范请求里保留 raw 与 client_raw 两层原文，直通时直接拿客户端字节当底稿"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "用量与判罚同源",
+      "items": [
+        "usage_detail 的 token 数、失败原因、原始报文全部来自流末那一次判罚，不各算各的",
+        "按天汇总只做累加，重算历史不会和明细对不上"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "原文按上限截断",
+      "items": [
+        "usage_payload 存放原始报文用于请求详情页，单条超过 256KB 就截断，避免库体被大响应撑爆",
+        "截断只影响展示，不影响 token 计数与判罚结果"
+      ]
+    }
+  ]
+}

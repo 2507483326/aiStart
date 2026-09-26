@@ -156,51 +156,70 @@ impl ModelProvider for AnthropicMessagesProvider {
         if data.get("type").and_then(Value::as_str) == Some("ping") && event.is_empty() {
             return Ok(vec![SseEvent::new("ping", data.clone())]);
         }
-        let name = if event.is_empty() {
-            data.get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("message")
-                .to_string()
-        } else {
-            event.to_string()
-        };
+        /// 按事件名推进流状态。返回「本协议认不认识这个名字」——不认识时**一动 `state` 都没动**，
+        /// 调用方因此可以拿另一个候选名重试（L1）。
+        fn apply(name: &str, data: &Value, state: &mut StreamState) -> bool {
+            match name {
+                "message_start" => {
+                    state.message_started = true;
+                    if let Some(model) = data
+                        .pointer("/message/model")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                    {
+                        state.upstream_model = model;
+                    }
+                    if let Some(id) = data.pointer("/message/id").and_then(Value::as_str) {
+                        state.message_id = id.to_string();
+                    }
+                    read_usage(state, data.pointer("/message/usage"));
+                }
+                "message_delta" => {
+                    // 文档口径：message_delta 的 usage 是累计值，且同样带 input / 缓存字段。
+                    read_usage(state, data.get("usage"));
+                    if let Some(stop) = data.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                        state.stop_reason = Some(wire::stop_reason_from_anthropic(Some(stop)));
+                    }
+                }
+                "message_stop" | "error" => {
+                    state.finished = true;
+                    state.upstream_ended = true;
+                    // 上游在流里报的错误以前只当成一个事件转发，明细却记成成功。
+                    if name == "error" {
+                        state.upstream_error = Some(
+                            data.pointer("/error/message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("上游返回错误")
+                                .to_string(),
+                        );
+                    }
+                }
+                _ => return false,
+            }
 
-        match name.as_str() {
-            "message_start" => {
-                state.message_started = true;
-                if let Some(model) = data
-                    .pointer("/message/model")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                {
-                    state.upstream_model = model;
-                }
-                if let Some(id) = data.pointer("/message/id").and_then(Value::as_str) {
-                    state.message_id = id.to_string();
-                }
-                read_usage(state, data.pointer("/message/usage"));
+            true
+        }
+
+        // 事件名有两处来源：SSE 的 `event:` 行，与正文里的 `type` 字段。信封优先，但信封写的
+        // 名字本协议不认识、而正文的 `type` 认识时，采用正文的名字（L1）——有些中转会把每一帧的
+        // 信封统一写成别的名字，正文的 `type` 才是权威。事件名也跟着改成认出来的那个：
+        // Anthropic 客户端就是按事件名解析的，把不认识的信封名原样发过去等于丢帧。
+        let data_type = data.get("type").and_then(Value::as_str).unwrap_or("");
+        let mut name = if event.is_empty() {
+            if data_type.is_empty() {
+                "message"
+            } else {
+                data_type
             }
-            "message_delta" => {
-                // 文档口径：message_delta 的 usage 是累计值，且同样带 input / 缓存字段。
-                read_usage(state, data.get("usage"));
-                if let Some(stop) = data.pointer("/delta/stop_reason").and_then(Value::as_str) {
-                    state.stop_reason = Some(wire::stop_reason_from_anthropic(Some(stop)));
-                }
+        } else {
+            event
+        };
+        // 两个候选都不认识时，仍按信封名原样转发：Anthropic 的帧总是要发给客户端的，
+        // 网关照旧只做能理解的那部分状态推进（与改动前一致）。
+        if !apply(name, data, state) && !data_type.is_empty() && data_type != name {
+            if apply(data_type, data, state) {
+                name = data_type;
             }
-            "message_stop" | "error" => {
-                state.finished = true;
-                state.upstream_ended = true;
-                // 上游在流里报的错误以前只当成一个事件转发，明细却记成成功。
-                if name == "error" {
-                    state.upstream_error = Some(
-                        data.pointer("/error/message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("上游返回错误")
-                            .to_string(),
-                    );
-                }
-            }
-            _ => {}
         }
 
         Ok(vec![SseEvent::new(name, data.clone())])

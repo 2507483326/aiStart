@@ -1,0 +1,1113 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>aiStart Architecture</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    /* ==========================================================
+       THEME VARIABLES — switch by toggling [data-theme] on <html>
+       ========================================================== */
+    :root,
+    [data-theme="dark"] {
+      --bg: #020617;
+      --grid: #1e293b;
+      --text: #ffffff;
+      --text-muted: #94a3b8;
+      --text-dim: #475569;
+
+      --panel: rgba(15, 23, 42, 0.5);
+      --panel-border: #1e293b;
+      --lane-fill: rgba(15, 23, 42, 0.22);
+      --lane-stroke: #334155;
+
+      --arrow: #64748b;
+      --arrow-emphasis: #34d399;
+
+      --mask: #0f172a;
+
+      --frontend-fill:    rgba(8, 51, 68, 0.4);
+      --frontend-stroke:  #22d3ee;
+      --backend-fill:     rgba(6, 78, 59, 0.4);
+      --backend-stroke:   #34d399;
+      --database-fill:    rgba(76, 29, 149, 0.4);
+      --database-stroke:  #a78bfa;
+      --cloud-fill:       rgba(120, 53, 15, 0.3);
+      --cloud-stroke:     #fbbf24;
+      --security-fill:    rgba(136, 19, 55, 0.4);
+      --security-stroke:  #fb7185;
+      --messagebus-fill:  rgba(251, 146, 60, 0.3);
+      --messagebus-stroke:#fb923c;
+      --external-fill:    rgba(30, 41, 59, 0.5);
+      --external-stroke:  #94a3b8;
+
+      --toolbar-bg:       rgba(15, 23, 42, 0.8);
+      --toolbar-border:   #334155;
+      --toolbar-text:     #e2e8f0;
+      --toolbar-hover:    rgba(15, 23, 42, 0.95);
+      --toolbar-menu-bg:  #0f172a;
+    }
+
+    [data-theme="light"] {
+      --bg: #f8fafc;
+      --grid: #e2e8f0;
+      --text: #0f172a;
+      --text-muted: #64748b;
+      --text-dim: #94a3b8;
+
+      --panel: #ffffff;
+      --panel-border: #e2e8f0;
+      --lane-fill: rgba(248, 250, 252, 0.65);
+      --lane-stroke: #cbd5e1;
+
+      --arrow: #94a3b8;
+      --arrow-emphasis: #059669;
+
+      --mask: #ffffff;
+
+      --frontend-fill:    rgba(34, 211, 238, 0.15);
+      --frontend-stroke:  #0891b2;
+      --backend-fill:     rgba(52, 211, 153, 0.18);
+      --backend-stroke:   #059669;
+      --database-fill:    rgba(167, 139, 250, 0.2);
+      --database-stroke:  #7c3aed;
+      --cloud-fill:       rgba(251, 191, 36, 0.18);
+      --cloud-stroke:     #d97706;
+      --security-fill:    rgba(251, 113, 133, 0.15);
+      --security-stroke:  #e11d48;
+      --messagebus-fill:  rgba(251, 146, 60, 0.15);
+      --messagebus-stroke:#ea580c;
+      --external-fill:    rgba(148, 163, 184, 0.18);
+      --external-stroke:  #64748b;
+
+      --toolbar-bg:       rgba(255, 255, 255, 0.92);
+      --toolbar-border:   #cbd5e1;
+      --toolbar-text:     #334155;
+      --toolbar-hover:    #ffffff;
+      --toolbar-menu-bg:  #ffffff;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+      background: var(--bg);
+      min-height: 100vh;
+      padding: 2rem;
+      color: var(--text);
+      transition: background 0.2s ease, color 0.2s ease;
+    }
+
+    .container { max-width: 1200px; margin: 0 auto; }
+
+    .header { margin-bottom: 2rem; }
+
+    .header-row {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      margin-bottom: 0.5rem;
+    }
+
+    .pulse-dot {
+      width: 12px;
+      height: 12px;
+      background: var(--frontend-stroke);
+      border-radius: 50%;
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+
+    h1 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      letter-spacing: -0.025em;
+    }
+
+    .subtitle {
+      color: var(--text-muted);
+      font-size: 0.875rem;
+      margin-left: 1.75rem;
+    }
+
+    .diagram-container {
+      background: var(--panel);
+      border-radius: 1rem;
+      border: 1px solid var(--panel-border);
+      padding: 1.5rem;
+      overflow-x: auto;
+    }
+
+    svg {
+      width: 100%;
+      min-width: min(900px, 100%);
+      display: block;
+    }
+
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1rem;
+      margin-top: 2rem;
+    }
+
+    .card {
+      background: var(--panel);
+      border-radius: 0.75rem;
+      border: 1px solid var(--panel-border);
+      padding: 1.25rem;
+    }
+
+    .card-header {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      margin-bottom: 0.75rem;
+    }
+
+    .card-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+    }
+
+    .card-dot.cyan     { background: var(--frontend-stroke); }
+    .card-dot.emerald  { background: var(--backend-stroke); }
+    .card-dot.violet   { background: var(--database-stroke); }
+    .card-dot.amber    { background: var(--cloud-stroke); }
+    .card-dot.rose     { background: var(--security-stroke); }
+    .card-dot.orange   { background: var(--messagebus-stroke); }
+    .card-dot.slate    { background: var(--external-stroke); }
+
+    .card h3 { font-size: 0.875rem; font-weight: 600; color: var(--text); }
+
+    .card ul {
+      list-style: none;
+      color: var(--text-muted);
+      font-size: 0.75rem;
+    }
+
+    .card li { margin-bottom: 0.375rem; }
+
+    .footer {
+      text-align: center;
+      margin-top: 1.5rem;
+      color: var(--text-dim);
+      font-size: 0.75rem;
+    }
+
+    @page { size: landscape; margin: 1.5cm; }
+
+    @media print {
+      :root, [data-theme="dark"], [data-theme="light"] {
+        --bg: #ffffff;
+        --grid: transparent;
+        --panel: #ffffff;
+        --panel-border: #e2e8f0;
+        --text: #0f172a;
+        --text-muted: #475569;
+        --text-dim: #94a3b8;
+        --mask: #ffffff;
+      }
+      body { background: #ffffff !important; padding: 0; }
+      .container { max-width: none; }
+      .toolbar, .archify-toast { display: none !important; }
+      .diagram-container, .card { box-shadow: none; border-color: #e2e8f0; }
+      .cards { grid-template-columns: 1fr 1fr; }
+      .card { break-inside: avoid; page-break-inside: avoid; }
+      .diagram-container { break-inside: avoid; page-break-inside: avoid; }
+      h1, .subtitle { color: #0f172a; }
+    }
+
+    /* ==========================================================
+       TOOLBAR (theme toggle + export menu)
+       ========================================================== */
+    .toolbar {
+      position: fixed;
+      top: 1rem;
+      right: 1rem;
+      display: flex;
+      gap: 0.5rem;
+      z-index: 100;
+    }
+    .toolbar button {
+      background: var(--toolbar-bg);
+      color: var(--toolbar-text);
+      border: 1px solid var(--toolbar-border);
+      padding: 0.5rem 0.875rem;
+      border-radius: 0.5rem;
+      font-family: inherit;
+      font-size: 0.75rem;
+      font-weight: 500;
+      cursor: pointer;
+      backdrop-filter: blur(8px);
+      transition: background 0.15s, border-color 0.15s;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.375rem;
+    }
+    .toolbar button:hover {
+      background: var(--toolbar-hover);
+      border-color: var(--arrow);
+    }
+    .toolbar button:focus-visible {
+      outline: 2px solid var(--frontend-stroke);
+      outline-offset: 2px;
+    }
+    .toolbar .export-wrap { position: relative; }
+    .toolbar .export-menu {
+      position: absolute;
+      top: calc(100% + 0.375rem);
+      right: 0;
+      background: var(--toolbar-menu-bg);
+      border: 1px solid var(--toolbar-border);
+      border-radius: 0.5rem;
+      padding: 0.375rem;
+      min-width: 160px;
+      display: none;
+      flex-direction: column;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.25);
+    }
+    .toolbar .export-menu.open { display: flex; }
+    .toolbar .export-menu button {
+      background: transparent;
+      border: 0;
+      justify-content: space-between;
+      width: 100%;
+      text-align: left;
+      padding: 0.5rem 0.75rem;
+    }
+    .toolbar .export-menu button:hover {
+      background: var(--toolbar-hover);
+    }
+    .toolbar .export-menu .hint {
+      color: var(--text-dim);
+      font-size: 0.625rem;
+    }
+    .toolbar .export-menu hr {
+      border: 0;
+      border-top: 1px solid var(--toolbar-border);
+      margin: 0.25rem 0.375rem;
+      opacity: 0.5;
+    }
+
+    .archify-toast {
+      position: fixed;
+      top: 1rem;
+      left: 50%;
+      transform: translateX(-50%) translateY(-8px);
+      background: var(--toolbar-menu-bg);
+      color: var(--text);
+      border: 1px solid var(--toolbar-border);
+      padding: 0.5rem 1rem;
+      border-radius: 0.5rem;
+      font-family: inherit;
+      font-size: 0.75rem;
+      opacity: 0;
+      transition: opacity 0.2s, transform 0.2s;
+      z-index: 200;
+      pointer-events: none;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.25);
+    }
+    .archify-toast.show {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+    }
+
+    @media (max-width: 720px) {
+      body { padding: 1rem; }
+      .toolbar {
+        position: static;
+        justify-content: flex-end;
+        margin-bottom: 1rem;
+      }
+      .header { margin-bottom: 1.25rem; }
+      .header-row { gap: 0.75rem; align-items: flex-start; }
+      h1 { font-size: 1.25rem; line-height: 1.25; }
+      .subtitle { margin-left: 0; font-size: 0.8125rem; line-height: 1.55; }
+      .diagram-container { padding: 0.75rem; border-radius: 0.75rem; }
+      .cards { grid-template-columns: 1fr; margin-top: 1rem; }
+    }
+
+    /* ==========================================================
+       SVG SEMANTIC CLASSES — use these instead of inline fill/stroke
+       ========================================================== */
+    .c-grid       { stroke: var(--grid); fill: none; }
+    .c-mask       { fill: var(--mask); stroke: none; }
+
+    .c-frontend   { fill: var(--frontend-fill);   stroke: var(--frontend-stroke); }
+    .c-backend    { fill: var(--backend-fill);    stroke: var(--backend-stroke); }
+    .c-database   { fill: var(--database-fill);   stroke: var(--database-stroke); }
+    .c-cloud      { fill: var(--cloud-fill);      stroke: var(--cloud-stroke); }
+    .c-security   { fill: var(--security-fill);   stroke: var(--security-stroke); }
+    .c-messagebus { fill: var(--messagebus-fill); stroke: var(--messagebus-stroke); }
+    .c-external   { fill: var(--external-fill);   stroke: var(--external-stroke); }
+
+    .t-primary { fill: var(--text); }
+    .t-muted   { fill: var(--text-muted); }
+    .t-dim     { fill: var(--text-dim); }
+    .t-frontend   { fill: var(--frontend-stroke); }
+    .t-backend    { fill: var(--backend-stroke); }
+    .t-database   { fill: var(--database-stroke); }
+    .t-cloud      { fill: var(--cloud-stroke); }
+    .t-security   { fill: var(--security-stroke); }
+    .t-messagebus { fill: var(--messagebus-stroke); }
+    .t-external   { fill: var(--external-stroke); }
+
+    .a-default   { stroke: var(--arrow); fill: none; }
+    .a-emphasis  { stroke: var(--arrow-emphasis); fill: none; }
+    .a-security  { stroke: var(--security-stroke); fill: none; stroke-dasharray: 5,5; }
+    .a-dashed    { stroke: var(--database-stroke); fill: none; stroke-dasharray: 4,4; }
+
+    .m-default   { fill: var(--arrow); }
+    .m-emphasis  { fill: var(--arrow-emphasis); }
+    .m-security  { fill: var(--security-stroke); }
+    .m-dashed    { fill: var(--database-stroke); }
+
+    .c-security-group { fill: transparent; stroke: var(--security-stroke); stroke-dasharray: 4,4; }
+    .c-region         { fill: rgba(251, 191, 36, 0.05); stroke: var(--cloud-stroke); stroke-dasharray: 8,4; }
+    .c-lane           { fill: var(--lane-fill); stroke: var(--lane-stroke); stroke-dasharray: 6,6; }
+  </style>
+</head>
+<body>
+  <div class="toolbar" role="toolbar" aria-label="Diagram actions">
+    <button id="btn-theme" type="button" title="Toggle theme (T)" aria-label="Toggle color theme" aria-pressed="false">
+      <span id="theme-icon" aria-hidden="true">&#9790;</span>
+      <span id="theme-label">Dark</span>
+    </button>
+    <div class="export-wrap">
+      <button id="btn-export" type="button" title="Export diagram (E)" aria-label="Export diagram" aria-haspopup="menu" aria-expanded="false" aria-controls="export-menu">
+        Export <span aria-hidden="true">&#9662;</span>
+      </button>
+      <div class="export-menu" id="export-menu" role="menu" aria-label="Export">
+        <button data-action="copy"  type="button" role="menuitem" tabindex="-1">Copy to clipboard <span class="hint">PNG</span></button>
+        <hr role="separator" aria-hidden="true">
+        <button data-format="png"   type="button" role="menuitem" tabindex="-1">Download PNG</button>
+        <button data-format="jpeg"  type="button" role="menuitem" tabindex="-1">Download JPEG</button>
+        <button data-format="webp"  type="button" role="menuitem" tabindex="-1">Download WebP</button>
+        <hr role="separator" aria-hidden="true">
+        <button data-format="svg"   type="button" role="menuitem" tabindex="-1">Download SVG <span class="hint">vector</span></button>
+      </div>
+    </div>
+  </div>
+
+  <div class="container">
+    <div class="header">
+      <div class="header-row">
+        <div class="pulse-dot"></div>
+        <h1>aiStart 架构</h1>
+      </div>
+      <p class="subtitle">本地一体化 AI 工具箱：五个 Desktop 客户端共用一个本地网关，网关按请求协议与上游协议决定直通还是改写</p>
+    </div>
+
+    <div class="diagram-container">
+      <!-- ARCHIFY:SVG_SLOT_START -->
+      <svg viewBox="0 0 1200 900">
+        <defs>
+          <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" class="m-default" />
+          </marker>
+          <marker id="arrowhead-emphasis" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" class="m-emphasis" />
+          </marker>
+          <marker id="arrowhead-security" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" class="m-security" />
+          </marker>
+          <marker id="arrowhead-dashed" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" class="m-dashed" />
+          </marker>
+          <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+            <path d="M 40 0 L 0 0 0 40" class="c-grid" stroke-width="0.5"/>
+          </pattern>
+        </defs>
+
+        <!-- Background Grid -->
+        <rect width="100%" height="100%" fill="url(#grid)" />
+
+        <!-- =================================================================
+             01 / 客户端层 — 五个被纳管的 Desktop 客户端
+             ================================================================= -->
+        <text x="40" y="34" class="t-dim" font-size="10" font-weight="600">01 / 客户端 · 各自说自己的协议</text>
+        <path d="M 40 44 L 1160 44" class="a-default" stroke-width="0.8" stroke-dasharray="3,8"/>
+
+        <rect x="60" y="66" width="196" height="66" rx="8" class="c-mask"/>
+        <rect x="60" y="66" width="196" height="66" rx="8" class="c-frontend" stroke-width="1.5"/>
+        <text x="158" y="90" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Claude Desktop</text>
+        <text x="158" y="108" class="t-muted" font-size="8" text-anchor="middle">Anthropic Messages</text>
+        <text x="158" y="122" class="t-frontend" font-size="7" text-anchor="middle">/v1/messages</text>
+
+        <rect x="272" y="66" width="196" height="66" rx="8" class="c-mask"/>
+        <rect x="272" y="66" width="196" height="66" rx="8" class="c-frontend" stroke-width="1.5"/>
+        <text x="370" y="90" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">DeepSeek Desktop</text>
+        <text x="370" y="108" class="t-muted" font-size="8" text-anchor="middle">OpenAI Chat Completions</text>
+        <text x="370" y="122" class="t-frontend" font-size="7" text-anchor="middle">/v1/chat/completions</text>
+
+        <rect x="484" y="66" width="196" height="66" rx="8" class="c-mask"/>
+        <rect x="484" y="66" width="196" height="66" rx="8" class="c-frontend" stroke-width="1.5"/>
+        <text x="582" y="90" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Codex</text>
+        <text x="582" y="108" class="t-muted" font-size="8" text-anchor="middle">OpenAI Responses</text>
+        <text x="582" y="122" class="t-frontend" font-size="7" text-anchor="middle">/v1/responses</text>
+
+        <rect x="696" y="66" width="196" height="66" rx="8" class="c-mask"/>
+        <rect x="696" y="66" width="196" height="66" rx="8" class="c-frontend" stroke-width="1.5"/>
+        <text x="794" y="90" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">ZCode</text>
+        <text x="794" y="108" class="t-muted" font-size="8" text-anchor="middle">Anthropic Messages</text>
+        <text x="794" y="122" class="t-frontend" font-size="7" text-anchor="middle">/v1/messages</text>
+
+        <rect x="908" y="66" width="196" height="66" rx="8" class="c-mask"/>
+        <rect x="908" y="66" width="196" height="66" rx="8" class="c-frontend" stroke-width="1.5"/>
+        <text x="1006" y="90" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">WorkBuddy</text>
+        <text x="1006" y="108" class="t-muted" font-size="8" text-anchor="middle">Anthropic Messages</text>
+        <text x="1006" y="122" class="t-frontend" font-size="7" text-anchor="middle">/v1/messages</text>
+
+        <!-- 客户端 → 网关：主干用实线加粗，同类路径淡化 -->
+        <path d="M 566 132 L 566 246 L 348 246 L 348 284" class="a-emphasis" stroke-width="2" marker-end="url(#arrowhead-emphasis)"/>
+        <text x="466" y="230" class="t-backend" font-size="8" text-anchor="middle">http://127.0.0.1:8931</text>
+        <path d="M 158 132 L 158 246 L 348 246" class="a-emphasis" stroke-width="1.2" opacity="0.4"/>
+        <path d="M 370 132 L 370 246 L 348 246" class="a-emphasis" stroke-width="1.2" opacity="0.4"/>
+        <path d="M 794 132 L 794 246 L 348 246" class="a-emphasis" stroke-width="1.2" opacity="0.4"/>
+        <path d="M 1006 132 L 1006 246 L 348 246" class="a-emphasis" stroke-width="1.2" opacity="0.4"/>
+
+        <!-- =================================================================
+             02 / 本地网关 — 只绑 127.0.0.1
+             ================================================================= -->
+        <rect x="40" y="250" width="720" height="286" rx="12" class="c-lane" stroke-width="1"/>
+        <text x="56" y="272" class="t-dim" font-size="10" font-weight="600">02 / 本地网关 · axum · 只监听 127.0.0.1</text>
+
+        <rect x="60" y="288" width="180" height="62" rx="6" class="c-mask"/>
+        <rect x="60" y="288" width="180" height="62" rx="6" class="c-security" stroke-width="1.5"/>
+        <text x="150" y="310" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">入站校验</text>
+        <text x="150" y="326" class="t-muted" font-size="7" text-anchor="middle">api key 比对 · 体积自检</text>
+        <text x="150" y="340" class="t-security" font-size="7" text-anchor="middle">32MB 上限 → 413</text>
+
+        <rect x="258" y="288" width="180" height="62" rx="6" class="c-mask"/>
+        <rect x="258" y="288" width="180" height="62" rx="6" class="c-backend" stroke-width="1.5"/>
+        <text x="348" y="310" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">规范化解码</text>
+        <text x="348" y="326" class="t-muted" font-size="7" text-anchor="middle">decode_request</text>
+        <text x="348" y="340" class="t-backend" font-size="7" text-anchor="middle">保留客户端原文</text>
+
+        <rect x="456" y="288" width="180" height="62" rx="6" class="c-mask"/>
+        <rect x="456" y="288" width="180" height="62" rx="6" class="c-security" stroke-width="1.5"/>
+        <text x="546" y="310" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">过滤器注入</text>
+        <text x="546" y="326" class="t-muted" font-size="7" text-anchor="middle">filters::apply</text>
+        <text x="546" y="340" class="t-security" font-size="7" text-anchor="middle">system 追加提示词</text>
+
+        <rect x="60" y="368" width="180" height="62" rx="6" class="c-mask"/>
+        <rect x="60" y="368" width="180" height="62" rx="6" class="c-database" stroke-width="1.5"/>
+        <text x="150" y="390" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">选上游</text>
+        <text x="150" y="406" class="t-muted" font-size="7" text-anchor="middle">resolve_target</text>
+        <text x="150" y="420" class="t-database" font-size="7" text-anchor="middle">点名 → 该模型</text>
+
+        <rect x="258" y="368" width="180" height="62" rx="6" class="c-mask"/>
+        <rect x="258" y="368" width="180" height="62" rx="6" class="c-backend" stroke-width="1.5"/>
+        <text x="348" y="390" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">派发</text>
+        <text x="348" y="406" class="t-muted" font-size="7" text-anchor="middle">dispatch · 单上游</text>
+        <text x="348" y="420" class="t-backend" font-size="7" text-anchor="middle">失败即返回，不重试</text>
+
+        <rect x="456" y="368" width="180" height="62" rx="6" class="c-mask"/>
+        <rect x="456" y="368" width="180" height="62" rx="6" class="c-messagebus" stroke-width="1.5"/>
+        <text x="546" y="390" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">协议编解码</text>
+        <text x="546" y="406" class="t-muted" font-size="7" text-anchor="middle">直通 or 重建</text>
+        <text x="546" y="420" class="t-messagebus" font-size="7" text-anchor="middle">SSE 逐帧转换</text>
+
+        <rect x="60" y="448" width="576" height="62" rx="6" class="c-mask"/>
+        <rect x="60" y="448" width="576" height="62" rx="6" class="c-database" stroke-width="1.5"/>
+        <text x="348" y="470" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">记账 · StreamAccounting（Arc&lt;Mutex&gt; 快照）</text>
+        <text x="348" y="486" class="t-muted" font-size="7" text-anchor="middle">token 用量 · 状态码 · 错误原因 · 首字延迟</text>
+        <text x="348" y="500" class="t-database" font-size="7" text-anchor="middle">客户端中途断开也由落点守卫补记</text>
+
+        <!-- 网关内部主链路 -->
+        <line x1="240" y1="319" x2="256" y2="319" class="a-emphasis" stroke-width="1.6" marker-end="url(#arrowhead-emphasis)"/>
+        <line x1="438" y1="319" x2="454" y2="319" class="a-emphasis" stroke-width="1.6" marker-end="url(#arrowhead-emphasis)"/>
+        <path d="M 546 350 L 546 359 L 150 359 L 150 366" class="a-emphasis" stroke-width="1.6" marker-end="url(#arrowhead-emphasis)"/>
+        <line x1="240" y1="399" x2="256" y2="399" class="a-emphasis" stroke-width="1.6" marker-end="url(#arrowhead-emphasis)"/>
+        <line x1="438" y1="399" x2="454" y2="399" class="a-emphasis" stroke-width="1.6" marker-end="url(#arrowhead-emphasis)"/>
+        <path d="M 150 430 L 150 446" class="a-emphasis" stroke-width="1.6" marker-end="url(#arrowhead-emphasis)"/>
+        <path d="M 348 430 L 348 446" class="a-emphasis" stroke-width="1.6" marker-end="url(#arrowhead-emphasis)"/>
+
+        <!-- =================================================================
+             03 / 上游 — 每个模型各自一套协议
+             ================================================================= -->
+        <rect x="800" y="250" width="360" height="286" rx="12" class="c-region" stroke-width="1"/>
+        <text x="816" y="272" class="t-cloud" font-size="10" font-weight="600">03 / 上游 · 每个模型独立配置</text>
+
+        <rect x="820" y="288" width="320" height="58" rx="6" class="c-mask"/>
+        <rect x="820" y="288" width="320" height="58" rx="6" class="c-cloud" stroke-width="1.5"/>
+        <text x="980" y="310" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">Anthropic / Claude</text>
+        <text x="980" y="326" class="t-muted" font-size="7" text-anchor="middle">Messages API · api.anthropic.com</text>
+        <text x="980" y="339" class="t-cloud" font-size="7" text-anchor="middle">SONNET · OPUS · HAIKU · FABLE</text>
+
+        <rect x="820" y="360" width="320" height="58" rx="6" class="c-mask"/>
+        <rect x="820" y="360" width="320" height="58" rx="6" class="c-cloud" stroke-width="1.5"/>
+        <text x="980" y="382" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">DeepSeek</text>
+        <text x="980" y="398" class="t-muted" font-size="7" text-anchor="middle">OpenAI Chat Completions</text>
+        <text x="980" y="411" class="t-cloud" font-size="7" text-anchor="middle">api.deepseek.com</text>
+
+        <rect x="820" y="432" width="320" height="58" rx="6" class="c-mask"/>
+        <rect x="820" y="432" width="320" height="58" rx="6" class="c-cloud" stroke-width="1.5"/>
+        <text x="980" y="454" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">OpenAI · Ollama · LiteLLM</text>
+        <text x="980" y="470" class="t-muted" font-size="7" text-anchor="middle">Responses / Chat Completions</text>
+        <text x="980" y="483" class="t-cloud" font-size="7" text-anchor="middle">自建地址也可，走同一套编解码</text>
+
+        <!-- 编解码 ↔ 上游：出站编码与回程帧流 -->
+        <line x1="638" y1="396" x2="816" y2="396" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <text x="727" y="390" class="t-backend" font-size="8" text-anchor="middle">按上游协议编码</text>
+        <line x1="816" y1="414" x2="640" y2="414" class="a-default" stroke-width="1.4" marker-end="url(#arrowhead)"/>
+        <text x="727" y="426" class="t-muted" font-size="8" text-anchor="middle">SSE 帧流</text>
+
+        <!-- 帧流经网关回传客户端 -->
+        <path d="M 636 428 L 660 428 L 660 200 L 598 200 L 598 134" class="a-default" stroke-width="1.4" marker-end="url(#arrowhead)"/>
+        <text x="630" y="192" class="t-muted" font-size="8" text-anchor="middle">逐帧回写</text>
+
+        <!-- =================================================================
+             04 / 桌面外壳
+             ================================================================= -->
+        <text x="40" y="578" class="t-dim" font-size="10" font-weight="600">04 / 桌面外壳 · 配置与可视化</text>
+        <path d="M 40 588 L 1160 588" class="a-default" stroke-width="0.8" stroke-dasharray="3,8"/>
+
+        <rect x="40" y="604" width="250" height="70" rx="8" class="c-mask"/>
+        <rect x="40" y="604" width="250" height="70" rx="8" class="c-database" stroke-width="1.5"/>
+        <text x="165" y="628" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">SQLite · ai-start.db3</text>
+        <text x="165" y="646" class="t-muted" font-size="8" text-anchor="middle">模型配置 · 过滤器 · 请求明细</text>
+        <text x="165" y="662" class="t-database" font-size="7" text-anchor="middle">按天用量汇总 · 事件日志</text>
+
+        <rect x="310" y="604" width="250" height="70" rx="8" class="c-mask"/>
+        <rect x="310" y="604" width="250" height="70" rx="8" class="c-frontend" stroke-width="1.5"/>
+        <text x="435" y="628" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Vue 3 界面</text>
+        <text x="435" y="646" class="t-muted" font-size="8" text-anchor="middle">面板 · 应用 · 模型 · 过滤器</text>
+        <text x="435" y="662" class="t-frontend" font-size="7" text-anchor="middle">统计 · 请求明细 · 请求详情</text>
+
+        <rect x="580" y="604" width="250" height="70" rx="8" class="c-mask"/>
+        <rect x="580" y="604" width="250" height="70" rx="8" class="c-backend" stroke-width="1.5"/>
+        <text x="705" y="628" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Tauri 命令层</text>
+        <text x="705" y="646" class="t-muted" font-size="8" text-anchor="middle">网关启停 · 重启 · 状态查询</text>
+        <text x="705" y="662" class="t-backend" font-size="7" text-anchor="middle">写配置 · 连通性自检</text>
+
+        <rect x="850" y="604" width="310" height="70" rx="8" class="c-mask"/>
+        <rect x="850" y="604" width="310" height="70" rx="8" class="c-security" stroke-width="1.5"/>
+        <text x="1005" y="628" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">事后切换 · failover</text>
+        <text x="1005" y="646" class="t-muted" font-size="8" text-anchor="middle">失败后后台探测 → 改写当前模型</text>
+        <text x="1005" y="662" class="t-security" font-size="7" text-anchor="middle">同一时刻只跑一轮</text>
+
+        <line x1="292" y1="639" x2="308" y2="639" class="a-default" stroke-width="1.4" marker-end="url(#arrowhead)"/>
+        <line x1="562" y1="639" x2="578" y2="639" class="a-default" stroke-width="1.4" marker-end="url(#arrowhead)"/>
+
+        <!-- 记账落库 -->
+        <path d="M 200 510 L 200 602" class="a-dashed" stroke-width="1.4" marker-end="url(#arrowhead-dashed)"/>
+        <text x="212" y="550" class="t-database" font-size="8">落库</text>
+
+        <!-- 失败 → 事后切换 -->
+        <path d="M 636 479 L 700 479 L 700 560 L 1005 560 L 1005 602" class="a-security" stroke-width="1.4" marker-end="url(#arrowhead-security)"/>
+        <text x="852" y="554" class="t-security" font-size="8" text-anchor="middle">上游失败且满足条件时触发探测</text>
+
+        <!-- 事后切换 → 选上游（只改写当前模型，服务下一次） -->
+        <path d="M 1100 674 L 1100 690 L 24 690 L 24 399 L 58 399" class="a-security" stroke-width="1.4" marker-end="url(#arrowhead-security)"/>
+        <text x="565" y="684" class="t-security" font-size="8" text-anchor="middle">改写当前模型 · 只服务下一次请求</text>
+
+        <!-- 配置文件写入范围 -->
+        <rect x="40" y="706" width="1120" height="80" rx="10" class="c-security-group" stroke-width="1"/>
+        <text x="52" y="724" class="t-security" font-size="8" font-weight="600">platform / · 由命令层写入并还原的客户端配置文件</text>
+
+        <rect x="60" y="734" width="196" height="28" rx="5" class="c-mask"/>
+        <rect x="60" y="734" width="196" height="28" rx="5" class="c-external" stroke-width="1.2"/>
+        <text x="158" y="752" class="t-muted" font-size="8" text-anchor="middle">claude_desktop_config.json</text>
+
+        <rect x="272" y="734" width="196" height="28" rx="5" class="c-mask"/>
+        <rect x="272" y="734" width="196" height="28" rx="5" class="c-external" stroke-width="1.2"/>
+        <text x="370" y="752" class="t-muted" font-size="8" text-anchor="middle">dsh.rs · DeepSeek</text>
+
+        <rect x="484" y="734" width="196" height="28" rx="5" class="c-mask"/>
+        <rect x="484" y="734" width="196" height="28" rx="5" class="c-external" stroke-width="1.2"/>
+        <text x="582" y="752" class="t-muted" font-size="8" text-anchor="middle">codex.rs · config.toml</text>
+
+        <rect x="696" y="734" width="196" height="28" rx="5" class="c-mask"/>
+        <rect x="696" y="734" width="196" height="28" rx="5" class="c-external" stroke-width="1.2"/>
+        <text x="794" y="752" class="t-muted" font-size="8" text-anchor="middle">zcode.rs</text>
+
+        <rect x="908" y="734" width="196" height="28" rx="5" class="c-mask"/>
+        <rect x="908" y="734" width="196" height="28" rx="5" class="c-external" stroke-width="1.2"/>
+        <text x="1006" y="752" class="t-muted" font-size="8" text-anchor="middle">workbuddy.rs</text>
+
+        <!-- =================================================================
+             LEGEND
+             ================================================================= -->
+        <text x="40" y="812" class="t-primary" font-size="10" font-weight="600">Legend</text>
+
+        <rect x="40" y="822" width="16" height="10" rx="2" class="c-frontend" stroke-width="1"/>
+        <text x="62" y="831" class="t-muted" font-size="8">客户端 / 界面</text>
+
+        <rect x="152" y="822" width="16" height="10" rx="2" class="c-security" stroke-width="1"/>
+        <text x="174" y="831" class="t-muted" font-size="8">校验 / 注入 / 切换</text>
+
+        <rect x="290" y="822" width="16" height="10" rx="2" class="c-backend" stroke-width="1"/>
+        <text x="312" y="831" class="t-muted" font-size="8">网关逻辑</text>
+
+        <rect x="400" y="822" width="16" height="10" rx="2" class="c-messagebus" stroke-width="1"/>
+        <text x="422" y="831" class="t-muted" font-size="8">协议转换</text>
+
+        <rect x="510" y="822" width="16" height="10" rx="2" class="c-database" stroke-width="1"/>
+        <text x="532" y="831" class="t-muted" font-size="8">存储 / 记账</text>
+
+        <rect x="630" y="822" width="16" height="10" rx="2" class="c-cloud" stroke-width="1"/>
+        <text x="652" y="831" class="t-muted" font-size="8">上游模型</text>
+
+        <line x1="40" y1="861" x2="74" y2="861" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <text x="83" y="864" class="t-muted" font-size="8">请求主链路</text>
+
+        <line x1="190" y1="861" x2="224" y2="861" class="a-default" stroke-width="1.4" stroke-dasharray="3,5" marker-end="url(#arrowhead)"/>
+        <text x="233" y="864" class="t-muted" font-size="8">响应回传</text>
+
+        <line x1="330" y1="861" x2="364" y2="861" class="a-security" stroke-width="1.4" marker-end="url(#arrowhead-security)"/>
+        <text x="373" y="864" class="t-muted" font-size="8">失败与切换</text>
+
+        <line x1="480" y1="861" x2="514" y2="861" class="a-dashed" stroke-width="1.4" marker-end="url(#arrowhead-dashed)"/>
+        <text x="523" y="864" class="t-muted" font-size="8">写配置 / 落库 / 后台路径</text>
+
+        <rect x="700" y="857" width="16" height="10" rx="2" class="c-lane" stroke-width="1"/>
+        <text x="722" y="866" class="t-muted" font-size="8">网关边界</text>
+
+        <rect x="800" y="857" width="16" height="10" rx="2" class="c-region" stroke-width="1"/>
+        <text x="822" y="866" class="t-muted" font-size="8">上游边界</text>
+
+        <rect x="900" y="857" width="16" height="10" rx="2" class="c-security-group" stroke-width="1"/>
+        <text x="922" y="866" class="t-muted" font-size="8">配置写入范围</text>
+      </svg>
+
+      <!-- ARCHIFY:SVG_SLOT_END -->
+    </div>
+
+    <!-- ARCHIFY:CARDS_SLOT_START -->
+    <div class="cards">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-dot cyan"></div>
+          <h3>一处配置，五个客户端</h3>
+        </div>
+        <ul>
+          <li>&bull; 客户端只管把 base_url 指到 127.0.0.1:8931，协议不用改</li>
+          <li>&bull; 各客户端的配置文件由 platform 层负责写入与还原，失败有兜底策略</li>
+          <li>&bull; 上游密钥留在本地数据库，出站时才由网关代入</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-dot emerald"></div>
+          <h3>协议转换只在必要时发生</h3>
+        </div>
+        <ul>
+          <li>&bull; 入站协议与上游协议一致时走直通：请求用客户端原文，响应与流逐字节转发</li>
+          <li>&bull; 不一致才经规范层重建，规范形态以 Anthropic Messages 为基准</li>
+          <li>&bull; 记账、判罚、事件日志在两条路径上跑的是同一份代码</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-dot violet"></div>
+          <h3>可观测性落在本地</h3>
+        </div>
+        <ul>
+          <li>&bull; 每个请求记下用量、状态码、错误原因与首字延迟</li>
+          <li>&bull; 请求详情页能追溯原始报文，超长内容按上限截断后展示</li>
+          <li>&bull; 客户端中途断开也有补偿记账，统计不会因为断线漏账</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-dot rose"></div>
+          <h3>失败不隐藏，只换下一次</h3>
+        </div>
+        <ul>
+          <li>&bull; 首个上游失败就直接把真实错误返回客户端，不做候选重试</li>
+          <li>&bull; 满足条件时后台探测其它模型，成功后改写当前模型</li>
+          <li>&bull; 点名指定模型的请求永远不被自动切换</li>
+        </ul>
+      </div>
+    </div>
+    <!-- ARCHIFY:CARDS_SLOT_END -->
+
+    <p class="footer">
+      aiStart &bull; Tauri 2 + Vue 3 + axum &bull; 本地网关 127.0.0.1:8931 &bull; 按 <kbd>T</kbd> 切换主题、<kbd>E</kbd> 导出
+    </p>
+  </div>
+
+  <script>
+    var Archify = {};
+
+    Archify.theme = (function () {
+      var STORAGE_KEY = 'archify-theme';
+      var html = document.documentElement;
+      var btn = document.getElementById('btn-theme');
+      var icon = document.getElementById('theme-icon');
+      var label = document.getElementById('theme-label');
+
+      function resolveInitial() {
+        try {
+          var param = new URLSearchParams(window.location.search).get('theme');
+          if (param === 'light' || param === 'dark') return param;
+        } catch (_) {}
+        var saved = localStorage.getItem(STORAGE_KEY);
+        if (saved === 'light' || saved === 'dark') return saved;
+        return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+      }
+
+      function apply(theme) {
+        html.setAttribute('data-theme', theme);
+        icon.textContent = theme === 'dark' ? '☾' : '☼';
+        label.textContent = theme === 'dark' ? 'Dark' : 'Light';
+        btn.setAttribute('aria-pressed', theme === 'light' ? 'true' : 'false');
+      }
+
+      function toggle() {
+        var next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+        apply(next);
+        localStorage.setItem(STORAGE_KEY, next);
+      }
+
+      apply(resolveInitial());
+      btn.addEventListener('click', toggle);
+
+      return { toggle: toggle };
+    })();
+
+    (function () {
+      var RASTER_SCALE = 4;
+
+      function diagramFilename() {
+        var title = (document.title || 'diagram').replace(/\s+Architecture(\s+Diagram)?$/i, '').trim();
+        return title.replace(/[^a-z0-9_\-]+/gi, '-')
+                    .toLowerCase()
+                    .replace(/^-+|-+$/g, '') || 'diagram';
+      }
+
+      function currentBg() {
+        return getComputedStyle(document.body).backgroundColor || '#ffffff';
+      }
+
+      function serializeSvg(scale, opts) {
+        scale = scale || 1;
+        opts = opts || {};
+        var autoTheme = opts.autoTheme === true;
+
+        var svg = document.querySelector('.diagram-container svg');
+        var clone = svg.cloneNode(true);
+
+        var vb = svg.viewBox.baseVal;
+        clone.setAttribute('width', vb.width * scale);
+        clone.setAttribute('height', vb.height * scale);
+        clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+
+        var hostStyle = Array.prototype.map.call(document.querySelectorAll('style'), function (s) {
+          return s.textContent;
+        }).join('\n');
+
+        var varNames = [
+          '--bg','--grid','--text','--text-muted','--text-dim',
+          '--arrow','--arrow-emphasis','--mask',
+          '--frontend-fill','--frontend-stroke',
+          '--backend-fill','--backend-stroke',
+          '--database-fill','--database-stroke',
+          '--cloud-fill','--cloud-stroke',
+          '--security-fill','--security-stroke',
+          '--messagebus-fill','--messagebus-stroke',
+          '--external-fill','--external-stroke'
+        ];
+
+        function resolveVars(themeAttr) {
+          var probe = document.createElement('div');
+          probe.setAttribute('data-theme', themeAttr);
+          probe.style.cssText = 'position:absolute;width:0;height:0;visibility:hidden;';
+          document.body.appendChild(probe);
+          try {
+            var c = getComputedStyle(probe);
+            return varNames.map(function (n) {
+              return n + ': ' + c.getPropertyValue(n).trim() + ';';
+            }).join(' ');
+          } finally {
+            document.body.removeChild(probe);
+          }
+        }
+
+        var fontFallback = [400, 500, 600, 700].map(function (w) {
+          return "@font-face { font-family: 'JetBrains Mono'; font-weight: " + w +
+                 "; src: local('JetBrains Mono'), local('JetBrainsMono-Regular'); }";
+        }).join('\n');
+
+        var style = document.createElementNS('http://www.w3.org/2000/svg', 'style');
+        var bgRect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+        bgRect.setAttribute('width', '100%');
+        bgRect.setAttribute('height', '100%');
+
+        if (autoTheme) {
+          var darkVars = resolveVars('dark');
+          var lightVars = resolveVars('light');
+
+          style.textContent =
+            fontFallback + "\n" +
+            "svg { font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace; }\n" +
+            hostStyle + "\n" +
+            ":root, svg { " + darkVars + " }\n" +
+            "@media (prefers-color-scheme: light) { :root, svg { " + lightVars + " } }\n" +
+            "svg[data-theme=\"light\"] { " + lightVars + " }\n" +
+            "svg[data-theme=\"dark\"] { " + darkVars + " }\n" +
+            "rect.c-bg-rect { fill: var(--bg); }\n";
+
+          clone.removeAttribute('data-theme');
+          bgRect.setAttribute('class', 'c-bg-rect');
+        } else {
+          var theme = document.documentElement.getAttribute('data-theme') || 'dark';
+          var themeHost = document.querySelector('[data-theme="' + theme + '"]') || document.documentElement;
+          var computed = getComputedStyle(themeHost);
+          var vars = varNames.map(function (n) {
+            return n + ': ' + computed.getPropertyValue(n).trim() + ';';
+          }).join(' ');
+
+          style.textContent =
+            fontFallback + "\n" +
+            "svg { font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace; }\n" +
+            hostStyle + "\n" +
+            ":root, svg { " + vars + " }\n";
+
+          bgRect.setAttribute('fill', computed.getPropertyValue('--bg').trim() || '#ffffff');
+        }
+
+        clone.insertBefore(style, clone.firstChild);
+        clone.insertBefore(bgRect, style.nextSibling);
+
+        return {
+          svgString: new XMLSerializer().serializeToString(clone),
+          width: vb.width * scale,
+          height: vb.height * scale
+        };
+      }
+
+      function download(blob, filename) {
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+      }
+
+      var MAX_CANVAS_PIXELS = 16 * 1024 * 1024;
+
+      function pickSafeScale(vbW, vbH) {
+        for (var s = RASTER_SCALE; s >= 1; s--) {
+          if (vbW * s * vbH * s <= MAX_CANVAS_PIXELS) return s;
+        }
+        return 1;
+      }
+
+      function rasterize(format) {
+        var svg = document.querySelector('.diagram-container svg');
+        var vb = svg.viewBox.baseVal;
+        var scale = pickSafeScale(vb.width, vb.height);
+        var data = serializeSvg(scale);
+        var svgBlob = new Blob([data.svgString], { type: 'image/svg+xml;charset=utf-8' });
+        var svgUrl = URL.createObjectURL(svgBlob);
+
+        return new Promise(function (resolve, reject) {
+          var img = new Image();
+          img.onload = function () {
+            var canvas = document.createElement('canvas');
+            canvas.width = data.width;
+            canvas.height = data.height;
+            var ctx = canvas.getContext('2d');
+            if (format === 'jpeg') {
+              ctx.fillStyle = currentBg();
+              ctx.fillRect(0, 0, canvas.width, canvas.height);
+            }
+            ctx.drawImage(img, 0, 0);
+            URL.revokeObjectURL(svgUrl);
+            var mime = format === 'jpeg' ? 'image/jpeg' :
+                       format === 'webp' ? 'image/webp' : 'image/png';
+            var quality = format === 'png' ? undefined : 0.95;
+            canvas.toBlob(function (blob) {
+              if (!blob) reject(new Error('toBlob returned null for ' + format));
+              else resolve(blob);
+            }, mime, quality);
+          };
+          img.onerror = function (e) {
+            URL.revokeObjectURL(svgUrl);
+            reject(e);
+          };
+          img.src = svgUrl;
+        });
+      }
+
+      var menu = document.getElementById('export-menu');
+      var btn = document.getElementById('btn-export');
+      var items = function () {
+        return Array.prototype.slice.call(menu.querySelectorAll('button[role="menuitem"]'));
+      };
+
+      function canCopyImage() {
+        return typeof ClipboardItem !== 'undefined' &&
+               navigator.clipboard &&
+               typeof navigator.clipboard.write === 'function';
+      }
+
+      function supports(format) {
+        if (format === 'svg' || format === 'png') return true;
+        var mime = format === 'jpeg' ? 'image/jpeg' : 'image/webp';
+        try {
+          var c = document.createElement('canvas');
+          c.width = c.height = 2;
+          return c.toDataURL(mime).indexOf('data:' + mime) === 0;
+        } catch (_) { return false; }
+      }
+
+      items().forEach(function (it) {
+        if (it.dataset.format && !supports(it.dataset.format)) {
+          it.disabled = true;
+          it.title = 'Not supported by this browser';
+          it.style.opacity = '0.5';
+        }
+        if (it.dataset.action === 'copy' && !canCopyImage()) {
+          it.disabled = true;
+          it.title = 'Clipboard image write not supported by this browser';
+          it.style.opacity = '0.5';
+        }
+      });
+
+      function toast(msg) {
+        var t = document.createElement('div');
+        t.className = 'archify-toast';
+        t.textContent = msg;
+        document.body.appendChild(t);
+        requestAnimationFrame(function () { t.classList.add('show'); });
+        setTimeout(function () {
+          t.classList.remove('show');
+          setTimeout(function () { t.remove(); }, 300);
+        }, 1500);
+      }
+
+      function open() {
+        menu.classList.add('open');
+        btn.setAttribute('aria-expanded', 'true');
+        var first = items().filter(function (i) { return !i.disabled; })[0];
+        if (first) first.focus();
+      }
+      function close(focusTrigger) {
+        menu.classList.remove('open');
+        btn.setAttribute('aria-expanded', 'false');
+        if (focusTrigger) btn.focus();
+      }
+      function isOpen() { return menu.classList.contains('open'); }
+
+      btn.addEventListener('click', function (e) {
+        e.stopPropagation();
+        if (isOpen()) close(false);
+        else open();
+      });
+      document.addEventListener('click', function (e) {
+        if (!menu.contains(e.target) && e.target !== btn) close(false);
+      });
+
+      menu.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape') { e.preventDefault(); close(true); return; }
+        if (e.key === 'Tab')    { close(false); return; }
+
+        var available = items().filter(function (i) { return !i.disabled; });
+        var current = available.indexOf(document.activeElement);
+        switch (e.key) {
+          case 'ArrowDown':
+            e.preventDefault();
+            if (available.length) available[(current + 1 + available.length) % available.length].focus();
+            break;
+          case 'ArrowUp':
+            e.preventDefault();
+            if (available.length) available[(current - 1 + available.length) % available.length].focus();
+            break;
+          case 'Home':
+            e.preventDefault();
+            if (available[0]) available[0].focus();
+            break;
+          case 'End':
+            e.preventDefault();
+            if (available[available.length - 1]) available[available.length - 1].focus();
+            break;
+        }
+      });
+
+      function runExport(format) {
+        var base = diagramFilename();
+        close(false);
+        return (format === 'svg'
+          ? Promise.resolve(serializeSvg(1, { autoTheme: true })).then(function (d) {
+              download(new Blob([d.svgString], { type: 'image/svg+xml;charset=utf-8' }), base + '.svg');
+            })
+          : rasterize(format).then(function (blob) {
+              download(blob, base + '.' + format);
+            })
+        ).catch(function (err) {
+          console.error(err);
+          alert('Export failed: ' + (err && err.message ? err.message : format));
+        });
+      }
+
+      function runCopy() {
+        close(false);
+        if (!canCopyImage()) {
+          alert('Clipboard image write not supported in this browser.');
+          return;
+        }
+        return rasterize('png').then(function (blob) {
+          return navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+        }).then(function () {
+          toast('Copied PNG to clipboard');
+        }).catch(function (err) {
+          console.error(err);
+          alert('Copy failed: ' + (err && err.message ? err.message : 'unknown'));
+        });
+      }
+
+      menu.addEventListener('click', function (e) {
+        var copyBtn = e.target.closest('button[data-action="copy"]');
+        if (copyBtn && !copyBtn.disabled) { runCopy(); return; }
+
+        var formatBtn = e.target.closest('button[data-format]');
+        if (formatBtn && !formatBtn.disabled) { runExport(formatBtn.dataset.format); }
+      });
+
+      Archify.exportMenu = { open: open, close: close, isOpen: isOpen, run: runExport };
+
+      try {
+        if (new URLSearchParams(window.location.search).get('openExport') === '1') {
+          var openWhenReady = function () {
+            requestAnimationFrame(function () { requestAnimationFrame(open); });
+          };
+          if (document.fonts && document.fonts.ready) {
+            document.fonts.ready.then(openWhenReady);
+          } else {
+            setTimeout(openWhenReady, 200);
+          }
+        }
+      } catch (_) {}
+    })();
+
+    document.addEventListener('keydown', function (e) {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      var t = e.target;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      if (e.key === 't' || e.key === 'T') {
+        e.preventDefault();
+        Archify.theme.toggle();
+      } else if (e.key === 'e' || e.key === 'E') {
+        e.preventDefault();
+        if (!Archify.exportMenu.isOpen()) Archify.exportMenu.open();
+      }
+    });
+  </script>
+</body>
+</html>

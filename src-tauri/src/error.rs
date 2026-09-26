@@ -19,6 +19,9 @@ pub enum AppError {
     Unsupported(String),
     #[error("配置无效: {0}")]
     InvalidConfig(String),
+    /// 入站请求体超过网关上限（H2）：按入站协议的形状回 413，并落一条失败明细。
+    #[error("{0}")]
+    PayloadTooLarge(String),
     #[error("{0}")]
     Message(String),
 }

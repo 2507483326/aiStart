@@ -66,7 +66,7 @@ function openAll(): void {
 </script>
 
 <template>
-  <div class="mx-auto max-w-6xl space-y-5">
+  <div class="w-full space-y-5">
     <div class="grid grid-cols-4 gap-3 xl:grid-cols-7">
       <StatTile label="总请求" :value="formatNumber(summary?.totalRequests ?? 0)" />
       <StatTile

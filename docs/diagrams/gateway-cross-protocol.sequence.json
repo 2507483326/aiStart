@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "跨协议请求 · 调用时序",
+    "subtitle": "Claude Desktop 打 Anthropic 协议、上游是 OpenAI 系：一次完整往返 + 事后切换",
+    "output": "docs/diagrams/gateway-cross-protocol.html",
+    "viewBox": [920, 760]
+  },
+  "participants": [
+    { "id": "client", "type": "frontend", "label": "客户端", "sublabel": "Claude Desktop" },
+    { "id": "gateway", "type": "backend", "label": "网关", "sublabel": "handle · route" },
+    { "id": "canonical", "type": "messagebus", "label": "规范层", "sublabel": "decode · filters" },
+    { "id": "provider", "type": "backend", "label": "协议编解码", "sublabel": "ModelProvider" },
+    { "id": "upstream", "type": "cloud", "label": "上游模型", "sublabel": "OpenAI 系" },
+    { "id": "usage", "type": "database", "label": "记账", "sublabel": "SQLite" },
+    { "id": "failover", "type": "security", "label": "事后切换", "sublabel": "failover" }
+  ],
+  "segments": [
+    { "from": 142, "to": 340, "label": "01 / 入站 · 鉴权 · 规范化解码" },
+    { "from": 340, "to": 506, "label": "02 / 上游往返 · 直通或重建" },
+    { "from": 506, "to": 694, "label": "03 / 记账 · 判罚 · 事后切换" }
+  ],
+  "messages": [
+    { "from": "client", "to": "gateway", "y": 188, "label": "POST /v1/messages", "variant": "emphasis" },
+    { "from": "gateway", "to": "canonical", "y": 222, "label": "decode_request", "variant": "emphasis" },
+    { "from": "canonical", "to": "gateway", "y": 256, "label": "CanonicalRequest", "variant": "return" },
+    { "from": "gateway", "to": "canonical", "y": 290, "label": "filters::apply", "variant": "security" },
+    { "from": "canonical", "to": "gateway", "y": 324, "label": "注入后规范请求", "variant": "return" },
+
+    { "from": "gateway", "to": "provider", "y": 388, "label": "encode_request", "variant": "emphasis" },
+    { "from": "provider", "to": "upstream", "y": 422, "label": "POST /v1/chat/completions", "variant": "emphasis" },
+    { "from": "upstream", "to": "provider", "y": 456, "label": "SSE 帧流", "variant": "return" },
+    { "from": "provider", "to": "gateway", "y": 490, "label": "规范事件流", "variant": "return" },
+
+    { "from": "gateway", "to": "client", "y": 548, "label": "SSE 逐帧写出", "variant": "return" },
+    { "from": "gateway", "to": "usage", "y": 582, "label": "usage_detail", "variant": "dashed" },
+    { "from": "usage", "to": "failover", "y": 616, "label": "判罚 · 可切?", "variant": "security" },
+    { "from": "failover", "to": "gateway", "y": 650, "label": "换模型服务下一次", "variant": "security" }
+  ],
+  "activations": [
+    { "participant": "gateway", "from": 180, "to": 500 },
+    { "participant": "canonical", "from": 214, "to": 340 },
+    { "participant": "provider", "from": 380, "to": 500 },
+    { "participant": "upstream", "from": 414, "to": 466 },
+    { "participant": "gateway", "from": 540, "to": 668, "type": "security" },
+    { "participant": "usage", "from": 574, "to": 626 },
+    { "participant": "failover", "from": 608, "to": 662 }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "协议在网关处收敛",
+      "items": [
+        "入站三种协议（Anthropic / OpenAI Chat / OpenAI Responses）先解成同一份规范请求",
+        "规范形态以 Anthropic Messages 为准，其余两个协议各自实现双向转换"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "协议相同就不翻译",
+      "items": [
+        "入站协议 = 上游协议时：请求以客户端原文为底，响应与 SSE 逐字节转发",
+        "此时上游报文里没见过的字段、错误体、额外事件类型都能原样透传"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "失败不回滚，只换下一次",
+      "items": [
+        "本次请求失败即返回错误，不做候选重试——客户端拿到的是真实上游错误",
+        "后台探测成功后改写当前模型，下一次请求才走新模型"
+      ]
+    }
+  ]
+}

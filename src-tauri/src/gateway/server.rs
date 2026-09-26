@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -29,6 +29,18 @@ use super::{GatewayStats, MODEL_ROLES};
 /// 只限「等响应头」与「等首帧」两程（首帧见 `first_frame_timeout`）。
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// 入站请求体的逻辑上限（H2）：超过它就进 handler 自检，按**入站协议的形状**回 413 并落一条
+/// 失败明细。取 32MB 是因为「几张 base64 图片 + 长提示词」也到不了——A4 支持 `data:` URL 图片，
+/// 而 axum 的默认上限 2MB 连一张 1.5MB 的图（base64 后约 2MB）都放不下，超限时更是连明细都不落。
+const MAX_INBOUND_BODY: usize = 32 * MEGABYTE;
+
+/// axum 那一层的硬上限（`DefaultBodyLimit`）。比逻辑上限高出一截，好处是「略微超限」的请求
+/// 能进到 handler：拿到协议形状的 413，并留下一条可查的失败明细。只有真离谱的（超过这里）
+/// 才由 axum 在 handler 之前用纯文本 413 挡掉——那种请求不值得为它准备一份 JSON 形状和一条库记录。
+const INBOUND_BODY_HARD_LIMIT: usize = 64 * MEGABYTE;
+
+const MEGABYTE: usize = 1024 * 1024;
+
 pub fn router() -> Router {
     Router::new()
         .route("/health", get(health))
@@ -36,6 +48,9 @@ pub fn router() -> Router {
         .route("/v1/messages", post(messages))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses))
+        // 硬上限写在 CORS 之前（后加的层在外层），这样硬上限自己回的 413 也带着 CORS 头：
+        // 浏览器里看到的是「请求太大」，而不是一个伪装成跨域问题的 413。
+        .layer(DefaultBodyLimit::max(INBOUND_BODY_HARD_LIMIT))
         .layer(CorsLayer::permissive())
         .with_state(super::stats())
 }
@@ -294,6 +309,16 @@ async fn responses(
     route(ModelFormat::OpenaiResponses, stats, headers, body).await
 }
 
+/// 落库用的入站报文文本：只取入库上限**多一个字节**的前缀。
+///
+/// 多出来的那 1 个字节是给 `cap_bytes` 用的——它靠「长度是否超过上限」判定「确实被截断过」，
+/// 少了它，正好超出一个字节的请求在库里会显示成完整报文。整份报文本来就要被 `serde_json`
+/// 解析一遍，这里不再为落库多复制一份全集（32MB 的请求复制成 String 就是又多 32MB）。
+fn inbound_request_text(body: &[u8]) -> String {
+    let head = &body[..body.len().min(crate::usage::PAYLOAD_MAX_BYTES + 1)];
+    String::from_utf8_lossy(head).into_owned()
+}
+
 async fn route(
     inbound: ModelFormat,
     stats: Arc<GatewayStats>,
@@ -302,7 +327,7 @@ async fn route(
 ) -> Response {
     stats.requests.fetch_add(1, Ordering::Relaxed);
     let started = std::time::Instant::now();
-    let inbound_request = String::from_utf8_lossy(&body).into_owned();
+    let inbound_request = inbound_request_text(&body);
     let token = extract_token(&headers);
     let inbound_headers = serialize_headers(&headers);
 
@@ -396,6 +421,9 @@ async fn route(
                 AppError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "authentication_error"),
                 AppError::NotFound(_) => (StatusCode::NOT_FOUND, "api_error"),
                 AppError::InvalidConfig(_) => (StatusCode::BAD_REQUEST, "api_error"),
+                // `request_too_large` 是 Anthropic 的正式错误类型；OpenAI 那两个协议把同一个词
+                // 放进 `type` / `code`，客户端本来就是按状态码 + message 处置，形状对得上。
+                AppError::PayloadTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, "request_too_large"),
                 _ => (StatusCode::BAD_GATEWAY, "api_error"),
             };
             api_error(inbound, status, kind, &message)
@@ -732,6 +760,20 @@ impl Drop for DisconnectGuard {
     }
 }
 
+/// 入站请求体的体积自检（H2）。报错就走 `route()` 那条统一的失败路径：按入站协议的形状回 413、
+/// 记一条失败明细、计入错误统计。到了这里 body 已经全在内存里，`body_len` 就是实际长度，
+/// 不看客户端报的 Content-Length——那个可以撒谎。
+fn check_inbound_body(body_len: usize) -> AppResult<()> {
+    if body_len <= MAX_INBOUND_BODY {
+        return Ok(());
+    }
+    Err(AppError::PayloadTooLarge(format!(
+        "请求体 {:.1} MB 超过网关上限 {} MB，请减少输入内容或图片体积后重试",
+        body_len as f64 / MEGABYTE as f64,
+        MAX_INBOUND_BODY / MEGABYTE,
+    )))
+}
+
 async fn handle(
     inbound: ModelFormat,
     stats: Arc<GatewayStats>,
@@ -751,6 +793,9 @@ async fn handle(
         )));
     };
     let source_app = source_app_for(&token);
+
+    // H2：体积自检。放在「有 Key」之后，超限就走统一的失败落库与形状映射。
+    check_inbound_body(body.len()).map_err(RouteFailure::from)?;
 
     let raw: Value = serde_json::from_slice(&body)
         .map_err(|error| AppError::InvalidConfig(format!("请求体不是合法 JSON: {error}")))?;
@@ -1184,5 +1229,118 @@ mod tests {
                 "{inbound:?}：上游流内错误与网关自产错误必须是同一形状"
             );
         }
+    }
+
+    /// H2：体积自检的两条边界——上限之内放行，超一个字节就报 413 口径的错误，
+    /// 文案里同时给出「这次多大」和「上限多少」，用户才知道差多少。
+    #[test]
+    fn inbound_body_check_rejects_only_above_the_cap() {
+        assert!(check_inbound_body(MAX_INBOUND_BODY).is_ok());
+
+        let message = check_inbound_body(MAX_INBOUND_BODY + 1)
+            .expect_err("超过上限就该报错")
+            .to_string();
+        assert!(message.contains("32 MB"), "要说清上限是多少：{message}");
+        assert!(message.contains("32.0 MB"), "也要说清这次是多少：{message}");
+
+        // 硬上限必须真的比逻辑上限高：不然「略微超限的请求也能拿到协议形状的 413 和一条明细」
+        // 就成了空话——所有超限请求都会被 axum 在 handler 之前用纯文本挡掉。
+        assert!(MAX_INBOUND_BODY < INBOUND_BODY_HARD_LIMIT);
+    }
+
+    /// H2：超限的 413 要按**入站协议**的形状出——客户端 SDK 解析的是自己那套错误信封，
+    /// 一个纯文本的 413 在它眼里就是「响应体解析失败」，用户看不到「请求太大」。
+    #[tokio::test]
+    async fn oversize_error_keeps_the_inbound_protocol_shape() {
+        let message = check_inbound_body(MAX_INBOUND_BODY + 1)
+            .expect_err("构造一个超限错误")
+            .to_string();
+
+        let anthropic = api_error(
+            ModelFormat::AnthropicMessages,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+            &message,
+        );
+        assert_eq!(anthropic.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(anthropic.into_body(), usize::MAX)
+                .await
+                .expect("body"),
+        )
+        .expect("JSON");
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "request_too_large");
+        assert_eq!(body["error"]["message"], message.as_str());
+
+        let openai = api_error(
+            ModelFormat::OpenaiCompletions,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+            &message,
+        );
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(openai.into_body(), usize::MAX)
+                .await
+                .expect("body"),
+        )
+        .expect("JSON");
+        assert_eq!(body["error"]["type"], "request_too_large");
+        assert_eq!(body["error"]["code"], "request_too_large");
+        assert_eq!(body["error"]["message"], message.as_str());
+    }
+
+    /// H2 的端到端验证：40MB 的请求真的走到 handler 自检、拿到协议形状的 413，
+    /// 并在明细里留下一条失败记录；入站报文按入库上限截断（不是把 40MB 整份写进库里）。
+    ///
+    /// 默认跳过：这条会往**进程级**的 usage 库里写一条记录，全量跑会把
+    /// `sqlite_persistence_round_trips` 的「库里只有我这一条」断言顶掉（同一进程共用一个库）。
+    /// 单独跑：`cargo test h2_oversize_request_is_rejected_and_recorded -- --ignored`
+    #[tokio::test]
+    #[ignore = "要写进程级 usage 库；会和 sqlite_persistence_round_trips 的计数断言打架"]
+    async fn h2_oversize_request_is_rejected_and_recorded() {
+        let dir = std::env::temp_dir().join(format!("ai-start-h2-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        // 同进程里 `db::init` 只会生效一次：单独跑由本用例初始化；万一和别的用例一起跑，
+        // 库已经在那儿了，沿用即可（要找的是「有没有我这条」，不是「库里一共几条」）。
+        if let Err(error) = crate::settings::init(&dir) {
+            println!("沿用已初始化的库：{error}");
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "claude-desktop".parse().expect("header"));
+        let body = Bytes::from(vec![b' '; MAX_INBOUND_BODY + 8 * MEGABYTE]);
+
+        let response = route(
+            ModelFormat::AnthropicMessages,
+            crate::gateway::stats(),
+            headers,
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let raw = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&raw).expect("JSON");
+        assert_eq!(body["error"]["type"], "request_too_large");
+
+        let record = crate::usage::recent(20)
+            .into_iter()
+            .find(|record| {
+                record
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("超过网关上限"))
+            })
+            .expect("超限请求要落一条失败明细");
+        assert!(!record.ok);
+        assert_eq!(record.inbound_protocol, "anthropic-messages");
+        let payload = crate::usage::payload_detail(record.id).expect("报文详情");
+        assert!(payload.request_truncated, "40MB 的报文只该存下前缀");
+        assert!(
+            payload.inbound_request.expect("入站报文").len() <= crate::usage::PAYLOAD_MAX_BYTES,
+            "入库的报文不许超过保存上限"
+        );
     }
 }

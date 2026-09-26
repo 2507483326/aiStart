@@ -67,7 +67,7 @@ function goBack(): void {
 </script>
 
 <template>
-  <div class="mx-auto max-w-6xl space-y-4">
+  <div class="w-full space-y-4">
     <div class="flex items-center justify-between gap-3">
       <Button variant="ghost" size="sm" class="gap-1.5" @click="goBack">
         <MorphIconBox :icon="ArrowLeft" :size="15" />

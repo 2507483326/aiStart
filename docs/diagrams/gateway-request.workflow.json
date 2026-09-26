@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "网关请求生命周期",
+    "subtitle": "从客户端入站到流末落库：单上游、直通优先、事后切换",
+    "output": "docs/diagrams/gateway-request.html",
+    "viewBox": [760, 880]
+  },
+  "lanes": [
+    { "id": "client", "label": "客户端 · Desktop × 5" },
+    { "id": "gateway", "label": "网关主链路" },
+    { "id": "canonical", "label": "规范层" },
+    { "id": "protocol", "label": "协议层" },
+    { "id": "upstream", "label": "上游" },
+    { "id": "ops", "label": "记账与切换" }
+  ],
+  "nodes": [
+    { "id": "inbound", "lane": "client", "col": 0, "type": "external", "label": "入站请求", "sublabel": "三种协议之一", "tag": "api key: aiStart" },
+    { "id": "resp", "lane": "client", "col": 5, "type": "frontend", "label": "响应 / SSE", "sublabel": "直通或重建", "tag": "字节保真" },
+
+    { "id": "guard", "lane": "gateway", "col": 1, "type": "security", "label": "鉴权 · 自检", "sublabel": "x-api-key / Bearer", "tag": "32MB → 413" },
+    { "id": "resolve", "lane": "gateway", "col": 4, "type": "database", "label": "选上游", "sublabel": "点名 → 该模型", "tag": "否则当前模型" },
+    { "id": "dispatch", "lane": "gateway", "col": 5, "type": "backend", "label": "dispatch", "sublabel": "只打一个上游", "tag": "300s 超时" },
+
+    { "id": "decode", "lane": "canonical", "col": 2, "type": "backend", "label": "decode", "sublabel": "→ 规范请求", "tag": "存 client_raw" },
+    { "id": "inject", "lane": "canonical", "col": 3, "type": "security", "label": "过滤器注入", "sublabel": "system 追加", "tag": "只跑一次" },
+
+    { "id": "codec", "lane": "protocol", "col": 5, "type": "messagebus", "label": "协议编解码", "sublabel": "直通 / 重建", "tag": "两向翻译" },
+
+    { "id": "upstream", "lane": "upstream", "col": 5, "type": "cloud", "label": "上游模型", "sublabel": "按上游协议", "tag": "三种协议" },
+
+    { "id": "accounting", "lane": "ops", "col": 2, "type": "database", "label": "记账快照", "sublabel": "StreamAccounting", "tag": "Arc<Mutex>" },
+    { "id": "failover", "lane": "ops", "col": 5, "type": "security", "label": "事后切换", "sublabel": "探测 → 换模型", "tag": "服务下一次" }
+  ],
+  "edges": [
+    { "from": "inbound", "to": "guard", "variant": "emphasis", "fromSide": "bottom", "toSide": "top", "route": "drop" },
+    { "from": "guard", "to": "decode", "variant": "emphasis", "fromSide": "bottom", "toSide": "top", "route": "drop" },
+    { "from": "decode", "to": "inject", "variant": "emphasis", "route": "same-lane" },
+    { "from": "inject", "to": "resolve", "variant": "emphasis", "fromSide": "top", "toSide": "bottom", "route": "auto", "label": "规范请求", "labelAt": [420, 282] },
+
+    { "from": "resolve", "to": "dispatch", "variant": "emphasis", "route": "same-lane" },
+    { "from": "dispatch", "to": "codec", "variant": "emphasis", "fromSide": "bottom", "toSide": "top", "route": "straight" },
+    { "from": "codec", "to": "upstream", "variant": "emphasis", "fromSide": "bottom", "toSide": "top", "route": "straight" },
+
+    { "from": "upstream", "to": "resp", "variant": "default", "fromSide": "top", "toSide": "bottom", "route": "outside-right", "channelX": 700, "label": "SSE 回传", "labelAt": [700, 456] },
+
+    { "from": "codec", "to": "accounting", "variant": "dashed", "fromSide": "left", "toSide": "top", "via": [[579, 536], [300, 536]], "label": "记账快照", "labelAt": [462, 528] },
+    { "from": "dispatch", "to": "failover", "variant": "security", "fromSide": "right", "toSide": "right", "route": "outside-right", "channelX": 724, "label": "触发探测", "labelAt": [724, 544] },
+    { "from": "accounting", "to": "failover", "variant": "default", "route": "same-lane", "label": "落库后判定", "labelSegment": 0, "labelDy": -12 }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "单上游 · 不循环候选",
+      "items": [
+        "请求模型名命中显示名 → 只打该模型，失败也不切换",
+        "别名 aiStart / auto、未指定、未命中 → 当前模型",
+        "第一个上游失败立即返回客户端，不再等候选列表试完"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "直通与转换两条出口",
+      "items": [
+        "入站协议 = 上游协议 → 请求以客户端原文为底，响应与流逐字节转发",
+        "协议不同才经规范层重建：decode_request → encode_request",
+        "记账与判罚走旁路，两条路径跑同一份代码"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "失败之后 · 后台切换",
+      "items": [
+        "触发条件：自动切换开 + 未点名 + 5xx/401/403/404/408/429 或网络错误",
+        "后台按模型列表逐个连接测试，跳过刚失败的那个，同一时刻只跑一轮",
+        "切换前复查当前模型没被手动换过，成功结果服务下一次请求"
+      ]
+    }
+  ]
+}

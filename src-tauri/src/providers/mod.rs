@@ -511,18 +511,95 @@ pub fn request_proxies_through(url: &str) -> bool {
     }
 }
 
-/// 目标是不是绕行名单里的本机地址（与 `build_client` 的 NoProxy 名单同源同义）。
+/// 回环绕行名单：代理开着时，这些目标仍然直连。**一处定义，两处使用**——
+/// `build_client` 把它交给 reqwest 的 `NoProxy`（真正决定请求怎么走），`is_loopback_target`
+/// 拿同一份名单判定「明细里该写走没走代理」。语法与匹配规则都照 reqwest 内部那一份
+/// （`hyper_util::client::proxy::matcher`，它的 `NoProxy` 不对外公开，只能在这里对齐），
+/// 名单只有一份，两边就不会各说各话。
+///
+/// `tests::no_proxy_list_only_covers_loopback` 盯着「名单里只许有回环地址」：真要加内网网段，
+/// 那条测试会失败，逼着把 `is_loopback_target` / `request_proxies_through` 的命名与口径一起重新想。
+pub(crate) const NO_PROXY_LIST: &str = "localhost,127.0.0.0/8,::1";
+
+/// 目标是不是绕行名单里的本机地址（与 `build_client` 交给 reqwest 的名单同源同义）。
 fn is_loopback_target(url: &reqwest::Url) -> bool {
     let Some(host) = url.host_str() else {
         return false;
     };
-    // IPv6 主机的序列化带方括号（[::1]），剥掉再认。
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    host.eq_ignore_ascii_case("localhost")
-        || host.to_ascii_lowercase().ends_with(".localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
+    no_proxy_matches(host)
+}
+
+/// `host` 在不在 [`NO_PROXY_LIST`] 里。规则对着 `hyper_util::client::proxy::matcher::NoProxy::contains`
+/// 抄：先看目标本身是不是 IP（是就只按 IP / CIDR 条目判），否则按域名判（大小写不敏感，
+/// 条目匹配它自己**与它的全部子域**）；IPv6 主机序列化带的方括号 `[::1]` 先剥掉。
+/// 可见性给到 crate 是为了让测试能直接对着这张表验规则（见 `tests::loopback_bypass_matches_reqwest_rules`）。
+pub(crate) fn no_proxy_matches(host: &str) -> bool {
+    let host = host.trim_matches(['[', ']']);
+    let host_ip = host.parse::<std::net::IpAddr>().ok();
+
+    NO_PROXY_LIST.split(',').map(str::trim).any(|entry| {
+        if entry.is_empty() {
+            return false;
+        }
+        // IP / CIDR 条目：目标也是 IP 时才可能命中（同版本 + 前 N 位相同）。
+        if let Some((network, prefix)) = parse_ip_entry(entry) {
+            return host_ip.is_some_and(|host_ip| network_contains(network, prefix, host_ip));
+        }
+        // 域名条目：`localhost` 同时命中 `localhost` 与 `a.localhost`（条目写成 `.localhost` 也一样）。
+        let entry = entry.strip_prefix('.').unwrap_or(entry);
+        host.eq_ignore_ascii_case(entry) || is_subdomain_of(host, entry)
+    })
+}
+
+/// 名单条目里的 IP / CIDR（`127.0.0.0/8`、`::1`）；不是 IP 就是域名，返回 `None`。
+/// 前缀长度越界（`127.0.0.0/33`）同样按「不是 IP 条目」处理——写错了的条目不该悄悄放行一大段地址。
+fn parse_ip_entry(entry: &str) -> Option<(std::net::IpAddr, Option<u8>)> {
+    let (address, prefix) = match entry.split_once('/') {
+        Some((address, prefix)) => (address, Some(prefix.parse::<u8>().ok()?)),
+        None => (entry, None),
+    };
+    let address = address.parse::<std::net::IpAddr>().ok()?;
+    let max = if address.is_ipv4() { 32 } else { 128 };
+    if prefix.is_some_and(|prefix| prefix > max) {
+        return None;
+    }
+    Some((address, prefix))
+}
+
+/// CIDR 命中：同版本，且前面 `prefix` 位相同（`None` = 只有这一个地址）。
+fn network_contains(network: std::net::IpAddr, prefix: Option<u8>, host: std::net::IpAddr) -> bool {
+    match (network, host) {
+        (std::net::IpAddr::V4(network), std::net::IpAddr::V4(host)) => {
+            let mask = mask(prefix.unwrap_or(32), 32) as u32;
+            u32::from(network) & mask == u32::from(host) & mask
+        }
+        (std::net::IpAddr::V6(network), std::net::IpAddr::V6(host)) => {
+            let mask = mask(prefix.unwrap_or(128), 128);
+            u128::from(network) & mask == u128::from(host) & mask
+        }
+        // 版本不同（v4 网段 vs v6 目标）不命中。
+        _ => false,
+    }
+}
+
+/// 前 `prefix` 位为 1、其余为 0 的掩码（`prefix` 已由 `parse_ip_entry` 保证不越界）。
+fn mask(prefix: u8, bits: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (bits - prefix)
+    }
+}
+
+/// `host` 是不是 `entry` 的子域——reqwest 的规则之一：条目是目标的尾部，且它的前一个字符是点。
+fn is_subdomain_of(host: &str, entry: &str) -> bool {
+    let Some(prefix) = host.get(..host.len().saturating_sub(entry.len())) else {
+        return false;
+    };
+    prefix.ends_with('.')
+        && host
+            .get(prefix.len()..)
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(entry))
 }
 
 /// 全应用共用的出站客户端：网关转发上游、模型探测、版本检查、安装包下载都从这里取。
@@ -556,8 +633,8 @@ fn build_client(proxy_url: &str) -> reqwest::Client {
             Ok(proxy) => {
                 // 回环地址不走代理：本机上跑的 Ollama 之类上游，代理软件多半也转发不了它自己，
                 // 「给远端上游配代理」不该顺手把本地链路也挡在外面。
-                // 名单与 is_loopback_target 同义（整个 127.0.0.0/8，不止 127.0.0.1）。
-                let bypass = reqwest::NoProxy::from_string("localhost,127.0.0.0/8,::1");
+                // 名单与 is_loopback_target 是同一份（整个 127.0.0.0/8，不止 127.0.0.1）。
+                let bypass = reqwest::NoProxy::from_string(NO_PROXY_LIST);
                 builder = builder.proxy(proxy.no_proxy(bypass));
             }
             // 地址在保存设置时已经校验过，走到这里说明库里的值是被手改过的：

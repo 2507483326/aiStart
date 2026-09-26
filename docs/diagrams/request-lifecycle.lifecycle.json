@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "一次请求的生命周期",
+    "subtitle": "五个阶段、三条中断支路、三种结局：成功落库、失败判罚、后台切换",
+    "output": "docs/diagrams/request-lifecycle.html",
+    "viewBox": [980, 660]
+  },
+  "lanes": [
+    { "id": "main", "label": "主链路" },
+    { "id": "events", "label": "中断与恢复" },
+    { "id": "terminal", "label": "结局" }
+  ],
+  "states": [
+    { "id": "accept", "lane": "main", "col": 0, "type": "start", "step": "01", "label": "接入", "sublabel": "鉴权 · 体积自检", "tag": "api key" },
+    { "id": "decode", "lane": "main", "col": 1, "type": "active", "step": "02", "label": "解码", "sublabel": "→ 规范请求", "tag": "三种入站" },
+    { "id": "inject", "lane": "main", "col": 2, "type": "decision", "step": "03", "label": "注入", "sublabel": "system 追加", "tag": "过滤器" },
+    { "id": "dispatch", "lane": "main", "col": 3, "type": "active", "step": "04", "label": "派发", "sublabel": "只打一个上游", "tag": "300s 超时" },
+    { "id": "relay", "lane": "main", "col": 4, "type": "active", "step": "05", "label": "回传", "sublabel": "直通或重建", "tag": "逐帧写出" },
+
+    { "id": "too_big", "lane": "events", "col": 0, "type": "failure", "step": "E1", "label": "体积超限", "sublabel": "请求体超上限", "tag": "413 直接返回" },
+    { "id": "up_fail", "lane": "events", "col": 1, "type": "waiting", "step": "E2", "label": "上游失败", "sublabel": "超时 / 5xx / 401", "tag": "不做候选重试" },
+    { "id": "probe", "lane": "events", "col": 2, "type": "active", "step": "E3", "label": "后台探测", "sublabel": "逐个模型试连", "tag": "同一时刻只跑一轮" },
+
+    { "id": "persisted", "lane": "terminal", "col": 0, "type": "success", "step": "T1", "label": "完成落库", "sublabel": "明细 + 按天累加", "tag": "usage_detail" },
+    { "id": "failed", "lane": "terminal", "col": 1, "type": "failure", "step": "T2", "label": "失败判罚", "sublabel": "记下错误原因", "tag": "满足条件才切换" },
+    { "id": "switched", "lane": "terminal", "col": 2, "type": "success", "step": "T3", "label": "模型切换", "sublabel": "改成可用模型", "tag": "服务下一次请求" }
+  ],
+  "transitions": [
+    { "from": "accept", "to": "too_big", "variant": "security", "fromSide": "bottom", "toSide": "top", "route": "drop", "channelY": 210, "label": "超限拒绝", "labelSegment": 1 },
+
+    { "from": "dispatch", "to": "up_fail", "variant": "security", "fromSide": "bottom", "toSide": "top", "route": "straight", "label": "超时 / 报错", "labelAt": [556, 233] },
+    { "from": "relay", "to": "probe", "variant": "dashed", "fromSide": "bottom", "toSide": "top", "route": "straight", "label": "触发探测", "labelAt": [710, 233] },
+
+    { "from": "too_big", "to": "failed", "variant": "security", "fromSide": "bottom", "toSide": "left", "route": "drop", "channelY": 410, "label": "判失败", "labelSegment": 1 },
+    { "from": "up_fail", "to": "failed", "variant": "default", "fromSide": "bottom", "toSide": "top", "route": "straight", "label": "记录错误", "labelAt": [556, 393] },
+    { "from": "probe", "to": "switched", "variant": "emphasis", "fromSide": "bottom", "toSide": "top", "route": "straight", "label": "切换当前模型", "labelAt": [710, 393] },
+
+    { "from": "relay", "to": "persisted", "variant": "emphasis", "fromSide": "left", "toSide": "top", "via": [[630, 157], [630, 430], [402, 430]], "label": "流末落库", "labelAt": [630, 240] }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "五个阶段都可能在半路被打断",
+      "items": [
+        "鉴权或体积不过关：在解码之前就返回，不产生上游流量，也不写明细",
+        "上游失败：立刻把真实错误交还客户端，本次不做任何重试——不掩盖故障",
+        "客户端断开：由落点守卫兜底，把已经产生的用量补记，不让统计漏账"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "只有一条路能走到落库",
+      "items": [
+        "流末判罚为 Ok 才计成功；只收到思维块没有正文、或上游中途截断，都算异常",
+        "失败请求同样落库，只是把错误原因和状态一起写进去，统计里能区分开"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "切换只服务后续请求",
+      "items": [
+        "触发条件：自动切换开启 + 请求未点名模型 + 错误属于可重试类别",
+        "探测跑在后台，不阻塞当前请求；同一时刻只有一轮，避免多个失败并发抢锁",
+        "探测成功后写回当前模型，客户端下次请求才走新模型——本次结果不做改动"
+      ]
+    }
+  ]
+}

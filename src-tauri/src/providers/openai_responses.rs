@@ -409,118 +409,134 @@ impl ModelProvider for OpenaiResponsesProvider {
         data: &Value,
         state: &mut StreamState,
     ) -> AppResult<Vec<SseEvent>> {
-        let name = if event.is_empty() {
-            data.get("type").and_then(Value::as_str).unwrap_or("")
-        } else {
-            event
-        };
-        let mut events: Vec<SseEvent> = Vec::new();
+        /// 按事件名产出规范事件。返回 `None` 表示**本协议不认识这个名字**——此时一动 `state`
+        /// 都没动，调用方可以安全地拿另一个候选名重试（L1）。
+        fn dispatch(name: &str, data: &Value, state: &mut StreamState) -> Option<Vec<SseEvent>> {
+            let mut events: Vec<SseEvent> = Vec::new();
 
-        match name {
-            "response.created" => {
-                if let Some(id) = data.pointer("/response/id").and_then(Value::as_str) {
-                    state.message_id = id.to_string();
+            match name {
+                "response.created" => {
+                    if let Some(id) = data.pointer("/response/id").and_then(Value::as_str) {
+                        state.message_id = id.to_string();
+                    }
+                    if let Some(model) = data.pointer("/response/model").and_then(Value::as_str) {
+                        state.upstream_model = model.to_string();
+                    }
+                    events.extend(state.begin());
                 }
-                if let Some(model) = data.pointer("/response/model").and_then(Value::as_str) {
-                    state.upstream_model = model.to_string();
+                "response.output_text.delta" => {
+                    if let Some(delta) = data.get("delta").and_then(Value::as_str) {
+                        events.extend(state.text_delta(delta));
+                    }
                 }
-                events.extend(state.begin());
-            }
-            "response.output_text.delta" => {
-                if let Some(delta) = data.get("delta").and_then(Value::as_str) {
-                    events.extend(state.text_delta(delta));
+                // 拒答内容按正文转发，否则客户端只看到空白。
+                "response.refusal.delta" => {
+                    if let Some(delta) = data.get("delta").and_then(Value::as_str) {
+                        events.extend(state.text_delta(delta));
+                    }
                 }
-            }
-            // 拒答内容按正文转发，否则客户端只看到空白。
-            "response.refusal.delta" => {
-                if let Some(delta) = data.get("delta").and_then(Value::as_str) {
-                    events.extend(state.text_delta(delta));
+                "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                    if let Some(delta) = data.get("delta").and_then(Value::as_str) {
+                        events.extend(state.thinking_delta(delta));
+                    }
                 }
-            }
-            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
-                if let Some(delta) = data.get("delta").and_then(Value::as_str) {
-                    events.extend(state.thinking_delta(delta));
+                "response.output_item.added" => {
+                    if let Some(item) = data.get("item") {
+                        if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                            // 并行工具调用：上游用 output_index 区分，规范里同样按它排序（工具表内的序号）。
+                            let index = data
+                                .get("output_index")
+                                .and_then(Value::as_i64)
+                                .unwrap_or(0);
+                            let call_id = item
+                                .get("call_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            let call_name = item
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            state.tool_calls.insert(index);
+                            events.extend(state.tool_start(index, &call_id, &call_name));
+                        }
+                    }
                 }
-            }
-            "response.output_item.added" => {
-                if let Some(item) = data.get("item") {
-                    if item.get("type").and_then(Value::as_str) == Some("function_call") {
-                        // 并行工具调用：上游用 output_index 区分，规范里同样按它排序（工具表内的序号）。
+                "response.function_call_arguments.delta" => {
+                    if let Some(delta) = data.get("delta").and_then(Value::as_str) {
                         let index = data
                             .get("output_index")
                             .and_then(Value::as_i64)
                             .unwrap_or(0);
-                        let call_id = item
-                            .get("call_id")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                        let call_name = item
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                        state.tool_calls.insert(index);
-                        events.extend(state.tool_start(index, &call_id, &call_name));
+                        events.extend(state.tool_args(index, delta));
                     }
                 }
-            }
-            "response.function_call_arguments.delta" => {
-                if let Some(delta) = data.get("delta").and_then(Value::as_str) {
-                    let index = data
-                        .get("output_index")
-                        .and_then(Value::as_i64)
-                        .unwrap_or(0);
-                    events.extend(state.tool_args(index, delta));
+                "response.completed" | "response.incomplete" => {
+                    let has_tools = !state.tool_calls.is_empty();
+                    let incomplete = name == "response.incomplete";
+                    if let Some(usage) = data.pointer("/response/usage") {
+                        let cache_read = usage
+                            .pointer("/input_tokens_details/cached_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        if let Some(input) = usage.get("input_tokens").and_then(Value::as_u64) {
+                            // input_tokens 含缓存命中，canonical 只留未命中部分。
+                            state.input_tokens = input.saturating_sub(cache_read);
+                        }
+                        state.cache_read_tokens = cache_read;
+                        if let Some(output) = usage.get("output_tokens").and_then(Value::as_u64) {
+                            state.output_tokens = output;
+                        }
+                        if let Some(reasoning) = usage
+                            .pointer("/output_tokens_details/reasoning_tokens")
+                            .and_then(Value::as_u64)
+                        {
+                            state.reasoning_tokens = reasoning;
+                        }
+                    }
+                    state.upstream_ended = true;
+                    let stop_reason = if incomplete {
+                        "max_tokens"
+                    } else if has_tools {
+                        "tool_use"
+                    } else {
+                        "end_turn"
+                    };
+                    events.extend(state.finish(stop_reason));
                 }
-            }
-            "response.completed" | "response.incomplete" => {
-                let has_tools = !state.tool_calls.is_empty();
-                let incomplete = name == "response.incomplete";
-                if let Some(usage) = data.pointer("/response/usage") {
-                    let cache_read = usage
-                        .pointer("/input_tokens_details/cached_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                    if let Some(input) = usage.get("input_tokens").and_then(Value::as_u64) {
-                        // input_tokens 含缓存命中，canonical 只留未命中部分。
-                        state.input_tokens = input.saturating_sub(cache_read);
-                    }
-                    state.cache_read_tokens = cache_read;
-                    if let Some(output) = usage.get("output_tokens").and_then(Value::as_u64) {
-                        state.output_tokens = output;
-                    }
-                    if let Some(reasoning) = usage
-                        .pointer("/output_tokens_details/reasoning_tokens")
-                        .and_then(Value::as_u64)
-                    {
-                        state.reasoning_tokens = reasoning;
-                    }
+                "response.failed" | "error" => {
+                    let message = data
+                        .pointer("/response/error/message")
+                        .or_else(|| data.pointer("/error/message"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("上游返回错误");
+                    state.upstream_ended = true;
+                    state.upstream_error = Some(message.to_string());
+                    events.extend(state.error("api_error", message));
                 }
-                state.upstream_ended = true;
-                let stop_reason = if incomplete {
-                    "max_tokens"
-                } else if has_tools {
-                    "tool_use"
-                } else {
-                    "end_turn"
-                };
-                events.extend(state.finish(stop_reason));
+                _ => return None,
             }
-            "response.failed" | "error" => {
-                let message = data
-                    .pointer("/response/error/message")
-                    .or_else(|| data.pointer("/error/message"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("上游返回错误");
-                state.upstream_ended = true;
-                state.upstream_error = Some(message.to_string());
-                events.extend(state.error("api_error", message));
-            }
-            _ => {}
+
+            Some(events)
         }
 
-        Ok(events)
+        // 事件名有两处来源：SSE 的 `event:` 行，与正文里的 `type` 字段。信封优先，但信封写的
+        // 名字本协议不认识、而正文的 `type` 认识时，采用正文的名字——有些中转会把每一帧的信封
+        // 统一写成别的名字（如 `message`），正文的 `type` 才是权威（L1）。
+        // 两个候选都不认识才算真不认识：这帧丢掉，与改动前一致。
+        let data_type = data.get("type").and_then(Value::as_str).unwrap_or("");
+        let primary = if event.is_empty() { data_type } else { event };
+        for candidate in [primary, data_type] {
+            if candidate.is_empty() {
+                continue;
+            }
+            if let Some(events) = dispatch(candidate, data, state) {
+                return Ok(events);
+            }
+        }
+
+        Ok(Vec::new())
     }
 
     fn decode_stream_done(
