@@ -151,10 +151,7 @@ export const useAppsStore = defineStore("apps", {
         });
         if (!report) return false;
         this.lastSteps = report.steps;
-        notifySuccess(
-          `已把「${report.modelName}」接入 ${report.target.split(" → ")[0]}`,
-          report.note ?? undefined,
-        );
+        notifySuccess("应用成功");
         await this.refresh();
         return true;
       } finally {

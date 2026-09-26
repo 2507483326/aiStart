@@ -43,6 +43,10 @@ const props = defineProps<{
 
 const { pending, download, apply, clear, downloadUrl } = useApps();
 
+// 应用卡片右侧的配置下拉（移除模型配置 / 打开下载页等）先隐藏：置回 true 即可恢复，
+// 入口与其依赖的逻辑都原地保留，不做删除。
+const SHOW_CONFIG_MENU = false;
+
 const APP_ICONS: Record<AppKind, string> = {
   "claude-desktop": "/app-icons/claude-desktop.svg",
   "deepseek-desktop": "/app-icons/deepseek-desktop.png",
@@ -153,6 +157,16 @@ function onMenuOpen(value: boolean) {
           {{ app.homepage }}
         </button>
       </p>
+      <p class="truncate">
+        <span class="text-muted-foreground">下载地址: </span>
+        <button
+          type="button"
+          class="text-blue-600 underline-offset-4 hover:underline dark:text-blue-400"
+          @click="openUrl(app.downloadPage)"
+        >
+          {{ app.downloadPage }}
+        </button>
+      </p>
       <p class="flex items-center gap-1.5 truncate">
         <span class="text-muted-foreground">API Key: </span>
         <span class="min-w-0 truncate">{{ app.apiKey }}</span>
@@ -208,7 +222,7 @@ function onMenuOpen(value: boolean) {
         {{ app.installed ? "升级" : "安装" }}
       </Button>
 
-      <DropdownMenu @update:open="onMenuOpen">
+      <DropdownMenu v-if="SHOW_CONFIG_MENU" @update:open="onMenuOpen">
         <DropdownMenuTrigger as-child>
           <Button variant="outline" size="icon-xs" class="ml-auto">
             <MorphIconBox :icon="Route" :size="15" />

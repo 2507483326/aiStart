@@ -62,12 +62,15 @@ const protocolHint = computed(() => {
   }
 });
 
-const sample = computed(
-  () => `curl ${endpointUrl.value} \\
-  -H "content-type: application/json" \\
-  -H "x-api-key: ${props.app.apiKey}" \\
-  -d '{"model":"${GATEWAY_ALIAS}","max_tokens":64,"messages":[{"role":"user","content":"ping"}]}'`,
+// 复制用单行命令：cmd 写法（双引号 + \" 转义）——cmd 不认单引号，也不认 `\` 续行，
+// 所以给一条可直接粘贴执行、不依赖行续接的命令。
+const command = computed(
+  () =>
+    `curl.exe ${endpointUrl.value} -H "content-type: application/json" -H "x-api-key: ${props.app.apiKey}" -d "{\\"model\\":\\"${GATEWAY_ALIAS}\\",\\"max_tokens\\":64,\\"messages\\":[{\\"role\\":\\"user\\",\\"content\\":\\"ping\\"}]}"`,
 );
+
+// 展示用多行：只在参数前断行，复制内容仍是 command 的单行原文。
+const sample = computed(() => command.value.replace(/ (-H|-d) /g, " \\\n  $1 "));
 
 const icon = computed(() => sourceAppIcon(props.app.kind));
 
@@ -171,7 +174,7 @@ async function copyText(text: string, message: string) {
               variant="ghost"
               size="sm"
               class="gap-1.5"
-              @click="copyText(sample, '调用示例已复制')"
+              @click="copyText(command, '调用示例已复制')"
             >
               <MorphIconBox :icon="Copy" :size="14" />
               复制

@@ -372,6 +372,23 @@ async fn route(
                 .is_some_and(|trigger| {
                     super::failover::qualifies(settings.auto_failover, trigger.named, trigger.retryable)
                 });
+            // 网关自己在出网前就拒掉的请求（缺 Key、没启用模型、报文非法/超限等）补一条事件：
+            // 这类是网关/配置侧的问题，面板的「网关事件」要能看到；上游自身的失败仍归「请求明细」。
+            if upstream_url.is_empty() {
+                crate::events::log(
+                    "gateway",
+                    Some("网关"),
+                    "gateway.error",
+                    Some("gateway"),
+                    None,
+                    Some(serde_json::json!({
+                        "message": message.clone(),
+                        "sourceApp": source_app.clone(),
+                        "inbound": inbound.as_str(),
+                    })),
+                );
+            }
+
             let (timestamp, date) = crate::usage::current_timestamp();
             crate::usage::submit(
                 &crate::usage::UsageRecord {

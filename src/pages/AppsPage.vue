@@ -26,7 +26,7 @@ onMounted(async () => {
       <div>
         <h2 class="text-sm font-semibold">开发者工具</h2>
         <p class="text-xs text-muted-foreground">
-          一键安装、一键更新，并把任意模型的推理能力接入这些客户端。
+          把任意模型的推理能力接入这些客户端。
         </p>
       </div>
       <Button variant="outline" size="sm" class="gap-2" :disabled="loading" @click="recheck">

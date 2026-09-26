@@ -1,10 +1,9 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
-import { Activity, ArrowLeftRight, Copy, LoaderCircle, RefreshCw, Route } from "lucide";
+import { Activity, ArrowLeftRight, Copy, LoaderCircle, RefreshCw } from "lucide";
 
 import MorphIconBox from "@/components/common/MorphIconBox.vue";
 import StatTile from "@/components/common/StatTile.vue";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -71,12 +70,15 @@ async function handleRestart() {
   if (await restart()) await loadToday();
 }
 
-const sample = computed(
-  () => `curl ${baseUrl.value}/v1/messages \\
-  -H "content-type: application/json" \\
-  -H "x-api-key: aiStartClaude" \\
-  -d '{"model":"aiStart","max_tokens":64,"messages":[{"role":"user","content":"ping"}]}'`,
+// 复制用单行命令：cmd 写法（双引号 + \" 转义）——cmd 不认单引号，也不认 `\` 续行，
+// 所以给一条可直接粘贴执行、不依赖行续接的命令。
+const command = computed(
+  () =>
+    `curl.exe ${baseUrl.value}/v1/messages -H "content-type: application/json" -H "x-api-key: aiStart" -d "{\\"model\\":\\"aiStart\\",\\"max_tokens\\":64,\\"messages\\":[{\\"role\\":\\"user\\",\\"content\\":\\"ping\\"}]}"`,
 );
+
+// 展示用多行：只在参数前断行，复制内容仍是 command 的单行原文。
+const sample = computed(() => command.value.replace(/ (-H|-d) /g, " \\\n  $1 "));
 
 async function copyText(text: string, message: string) {
   await navigator.clipboard.writeText(text);
@@ -148,21 +150,7 @@ onMounted(loadToday);
         <Badge :variant="status?.autoFailover ? 'default' : 'outline'">
           {{ status?.autoFailover ? "已开启" : "已关闭" }}
         </Badge>
-        <template v-if="status?.autoFailover">
-          <span class="text-muted-foreground">已触发 {{ status.failovers }} 次</span>
-          <span v-if="status.lastFailover" class="font-mono text-muted-foreground">
-            {{ status.lastFailover }}
-          </span>
-        </template>
       </div>
-
-      <Alert v-if="status?.lastError" variant="destructive">
-        <MorphIconBox :icon="Route" :size="14" />
-        <AlertTitle>最近一次网关错误</AlertTitle>
-        <AlertDescription class="break-words font-mono text-xs">
-          {{ status.lastError }}
-        </AlertDescription>
-      </Alert>
 
       <div class="space-y-2">
         <p class="text-sm text-muted-foreground">对接说明</p>
@@ -248,7 +236,7 @@ onMounted(loadToday);
             variant="ghost"
             size="sm"
             class="gap-1.5"
-            @click="copyText(sample, '调用示例已复制')"
+            @click="copyText(command, '调用示例已复制')"
           >
             <MorphIconBox :icon="Copy" :size="14" />
             复制

@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted } from "vue";
 import { useRouter } from "vue-router";
-import { ArrowRight, Boxes, CircleCheck, BrainCircuit } from "lucide";
+import { ArrowRight, BrainCircuit } from "lucide";
 
 import EmptyState from "@/components/common/EmptyState.vue";
 import MorphIconBox from "@/components/common/MorphIconBox.vue";
+import GatewayEventsCard from "@/components/events/GatewayEventsCard.vue";
 import GatewayPanel from "@/components/models/GatewayPanel.vue";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -16,14 +17,11 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
-import { useApps } from "@/composables/useApps";
 import { useGateway } from "@/composables/useGateway";
 import { useModels } from "@/composables/useModels";
-import { applyModeLabels } from "@/lib/format";
 
 const router = useRouter();
 const gateway = useGateway();
-const { apps, refresh: refreshApps, ensureListener } = useApps();
 const { models, activeModel, refresh: refreshModels } = useModels();
 
 // 面板只做概览：模型多了也不铺开，最多列 5 个，其余到「模型」页看。
@@ -31,8 +29,7 @@ const PREVIEW_LIMIT = 5;
 const previewModels = computed(() => models.value.slice(0, PREVIEW_LIMIT));
 
 onMounted(async () => {
-  await ensureListener();
-  await Promise.all([gateway.refresh(), refreshApps(), refreshModels()]);
+  await Promise.all([gateway.refresh(), refreshModels()]);
 });
 </script>
 
@@ -41,52 +38,7 @@ onMounted(async () => {
     <GatewayPanel />
 
     <div class="grid gap-4 lg:grid-cols-2">
-      <Card class="gap-4">
-        <CardHeader>
-          <div class="flex items-center justify-between">
-            <div class="space-y-1">
-              <CardTitle>应用接入</CardTitle>
-              <CardDescription class="text-xs">
-                已安装的桌面客户端及其当前接入的模型
-              </CardDescription>
-            </div>
-            <Button variant="ghost" size="sm" class="gap-1.5" @click="router.push('/apps')">
-              管理
-              <MorphIconBox :icon="ArrowRight" :size="14" />
-            </Button>
-          </div>
-        </CardHeader>
-        <CardContent>
-          <div v-if="apps.length" class="space-y-3">
-            <div
-              v-for="app in apps"
-              :key="app.kind"
-              class="-mx-2 flex items-center justify-between gap-3 rounded-md px-2 py-1.5 transition-colors duration-150 hover:bg-accent/50"
-            >
-              <div class="flex min-w-0 items-center gap-2.5">
-                <MorphIconBox :icon="Boxes" :size="16" class="text-muted-foreground" />
-                <div class="min-w-0 leading-tight">
-                  <p class="truncate text-sm font-medium">{{ app.name }}</p>
-                  <p class="truncate text-xs text-muted-foreground">
-                    {{ applyModeLabels[app.applyMode] }}
-                    <template v-if="app.version"> · v{{ app.version }}</template>
-                  </p>
-                </div>
-              </div>
-              <div class="flex shrink-0 items-center gap-2">
-                <Badge :variant="app.installed ? 'outline' : 'secondary'">
-                  {{ app.installed ? "已安装" : "未安装" }}
-                </Badge>
-                <Badge v-if="app.appliedModelName" class="gap-1">
-                  <MorphIconBox :icon="CircleCheck" :size="10" />
-                  {{ app.appliedModelName }}
-                </Badge>
-              </div>
-            </div>
-          </div>
-          <p v-else class="text-xs text-muted-foreground">正在读取应用状态…</p>
-        </CardContent>
-      </Card>
+      <GatewayEventsCard />
 
       <Card class="gap-4">
         <CardHeader>
