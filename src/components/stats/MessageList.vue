@@ -6,7 +6,14 @@ import PayloadCard from "@/components/stats/PayloadCard.vue";
 import { Badge } from "@/components/ui/badge";
 import type { PayloadMessage } from "@/lib/payload";
 
-defineProps<{ messages: PayloadMessage[] }>();
+withDefaults(
+  defineProps<{
+    messages: PayloadMessage[];
+    /** 转发给每条消息卡片内容区的类，例如「最大高度 + 内部滚动」。 */
+    bodyClass?: string;
+  }>(),
+  { bodyClass: "" },
+);
 
 const roleClass: Record<string, string> = {
   user: "border-transparent bg-sky-500/15 text-sky-600 dark:text-sky-400",
@@ -35,6 +42,7 @@ function messageText(message: PayloadMessage): string {
       :label="message.role"
       :label-class="roleStyle(message.role)"
       :text="messageText(message)"
+      :body-class="bodyClass"
     >
       <template v-for="(part, partIndex) in message.parts" :key="partIndex">
         <pre

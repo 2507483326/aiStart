@@ -312,16 +312,6 @@ async fn responses(
     route(ModelFormat::OpenaiResponses, stats, headers, body).await
 }
 
-/// 落库用的入站报文文本：只取入库上限**多一个字节**的前缀。
-///
-/// 多出来的那 1 个字节是给 `cap_bytes` 用的——它靠「长度是否超过上限」判定「确实被截断过」，
-/// 少了它，正好超出一个字节的请求在库里会显示成完整报文。整份报文本来就要被 `serde_json`
-/// 解析一遍，这里不再为落库多复制一份全集（32MB 的请求复制成 String 就是又多 32MB）。
-fn inbound_request_text(body: &[u8]) -> String {
-    let head = &body[..body.len().min(crate::usage::PAYLOAD_MAX_BYTES + 1)];
-    String::from_utf8_lossy(head).into_owned()
-}
-
 async fn route(
     inbound: ModelFormat,
     stats: Arc<GatewayStats>,
@@ -330,7 +320,8 @@ async fn route(
 ) -> Response {
     stats.requests.fetch_add(1, Ordering::Relaxed);
     let started = std::time::Instant::now();
-    let inbound_request = inbound_request_text(&body);
+    // 落库用的入站报文：客户端原始 body 全量转为 UTF-8 字符串（非 UTF-8 字节按 lossy 保留）。
+    let inbound_request = String::from_utf8_lossy(&body).into_owned();
     let token = extract_token(&headers);
     let inbound_headers = serialize_headers(&headers);
 
@@ -1329,7 +1320,8 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert("x-api-key", "claude-desktop".parse().expect("header"));
-        let body = Bytes::from(vec![b' '; MAX_INBOUND_BODY + 8 * MEGABYTE]);
+        let body_len = MAX_INBOUND_BODY + 8 * MEGABYTE;
+        let body = Bytes::from(vec![b' '; body_len]);
 
         let response = route(
             ModelFormat::AnthropicMessages,
@@ -1358,10 +1350,10 @@ mod tests {
         assert!(!record.ok);
         assert_eq!(record.inbound_protocol, "anthropic-messages");
         let payload = crate::usage::payload_detail(record.id).expect("报文详情");
-        assert!(payload.request_truncated, "40MB 的报文只该存下前缀");
-        assert!(
-            payload.inbound_request.expect("入站报文").len() <= crate::usage::PAYLOAD_MAX_BYTES,
-            "入库的报文不许超过保存上限"
+        assert_eq!(
+            payload.inbound_request.expect("入站报文").len(),
+            body_len,
+            "入站报文全量保存，不再截断"
         );
     }
 }

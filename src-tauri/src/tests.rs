@@ -1788,12 +1788,7 @@ fn sqlite_persistence_round_trips() {
         Some("{\"system\":\"injected\"}")
     );
     assert_eq!(detail.upstream_response.as_deref(), Some("{\"ok\":true}"));
-    assert!(
-        !detail.stream
-            && !detail.request_truncated
-            && !detail.upstream_request_truncated
-            && !detail.response_truncated
-    );
+    assert!(!detail.stream);
 
     // 某天首次写入时 usage_total 会新建当日行，报文仍须挂到正确的明细行
     // （回归：last_insert_rowid 若在汇总 upsert 之后取，会被覆盖成汇总行的行号）
@@ -1837,7 +1832,7 @@ fn sqlite_persistence_round_trips() {
         Some("{\"day\":\"first\"}")
     );
 
-    // 超限报文被截断并置标记
+    // 报文不再截断：超过旧上限（300KB）的入站报文原样全量保存
     usage::submit(
         &UsageRecord {
             id: 0,
@@ -1873,11 +1868,10 @@ fn sqlite_persistence_round_trips() {
     crate::db::flush();
     let latest = usage::recent(1);
     let detail = usage::payload_detail(latest[0].id).expect("payload should load");
-    assert!(detail.request_truncated);
     assert!(detail.stream);
-    assert_eq!(detail.inbound_request.as_ref().unwrap().len(), 256 * 1024);
+    assert_eq!(detail.inbound_request.as_ref().unwrap().len(), 300 * 1024);
 
-    // 报文不再做条数保留清理：写入多少就留多少（此时已有 3 条，再补 1001 条后应为 1004 条）
+    // 报文按「请求保存数量」即时清理：默认保留最新 500 条（此时已有 2 条，再补 1001 条后仍封顶 500）
     for _ in 0..1001 {
         usage::submit(
             &UsageRecord {
@@ -1916,7 +1910,7 @@ fn sqlite_persistence_round_trips() {
         Ok(connection.query_row("SELECT COUNT(*) FROM usage_payload", [], |row| row.get(0))?)
     })
     .expect("count should load");
-    assert_eq!(payload_count, 1004);
+    assert_eq!(payload_count, 500);
 
     events::log(
         "user",

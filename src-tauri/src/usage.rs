@@ -59,7 +59,7 @@ impl UsageRecord {
 }
 
 /// 写入侧报文：一次调用的入站请求体/HTTP header + 注入后发给上游的请求体 + 上游响应。
-/// 截断与标记由 `record_with_payload` 统一处理。
+/// 报文按原样全量保存，写入侧不做任何截断。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsagePayload {
@@ -81,9 +81,6 @@ pub struct UsagePayloadDetail {
     pub inbound_headers: Option<String>,
     pub upstream_request: Option<String>,
     pub upstream_response: Option<String>,
-    pub request_truncated: bool,
-    pub upstream_request_truncated: bool,
-    pub response_truncated: bool,
     pub stream: bool,
 }
 
@@ -170,23 +167,6 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRecord> {
     })
 }
 
-/// 单条报文保存上限：流式大响应可能极大，超过即截断并置 truncated 标记，避免撑爆本地库。
-/// 网关也读它（`gateway::server::inbound_request_text`）：入站报文只按这个上限取前缀，
-/// 不再为落库整份复制一遍——上限改了，两边一起跟着走。
-pub(crate) const PAYLOAD_MAX_BYTES: usize = 256 * 1024;
-
-/// 按 UTF-8 字节截断文本（不切坏多字节字符），返回 (截断后文本, 是否发生截断)。
-fn cap_bytes(text: &str, limit: usize) -> (String, bool) {
-    if text.len() <= limit {
-        return (text.to_string(), false);
-    }
-    let mut end = limit;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    (text[..end].to_string(), true)
-}
-
 /// 投递一条调用记录（明细 + 每日汇总 + 可选报文）给写线程，单事务。
 ///
 /// **非阻塞**（队列未满时立即返回）：网关请求结束只做一次投递，不再等这次 SQLite 事务
@@ -194,6 +174,8 @@ fn cap_bytes(text: &str, limit: usize) -> (String, bool) {
 pub fn submit(entry: &UsageRecord, payload: Option<&UsagePayload>) {
     let entry = entry.clone();
     let payload = payload.cloned();
+    // 保留条数在投递时取一次快照：写线程里不再回读设置，避免和写事务交错。
+    let retention = settings::retention_count();
     db::submit(move |connection| {
         let transaction = connection.transaction()?;
         let event_time = db::ms_from_iso(&entry.timestamp).unwrap_or_else(db::now_ms);
@@ -235,35 +217,31 @@ pub fn submit(entry: &UsageRecord, payload: Option<&UsagePayload>) {
         upsert_usage_total(&transaction, GRAND_TOTAL_DAY, &entry, event_time)?;
 
         if let Some(payload) = &payload {
-            let (inbound_request, request_truncated) =
-                cap_optional(payload.inbound_request.as_deref());
-            // header 通常很小，同一上限截断即可，不单设 truncated 标记列。
-            let (inbound_headers, _) = cap_optional(payload.inbound_headers.as_deref());
-            let (upstream_request, upstream_request_truncated) =
-                cap_optional(payload.upstream_request.as_deref());
-            let (upstream_response, response_truncated) =
-                cap_optional(payload.upstream_response.as_deref());
-
             transaction.execute(
                 "INSERT INTO usage_payload (usage_detail_id, inbound_request, inbound_headers, upstream_request, upstream_response, \
-                 request_truncated, upstream_request_truncated, response_truncated, is_stream, created_time, update_time) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+                 is_stream, created_time, update_time) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
                 params![
                     detail_id,
-                    inbound_request,
-                    inbound_headers,
-                    upstream_request,
-                    upstream_response,
-                    i64::from(request_truncated),
-                    i64::from(upstream_request_truncated),
-                    i64::from(response_truncated),
+                    payload.inbound_request.as_deref(),
+                    payload.inbound_headers.as_deref(),
+                    payload.upstream_request.as_deref(),
+                    payload.upstream_response.as_deref(),
                     i64::from(payload.stream),
                     event_time,
                 ],
             )?;
+            // 写入即清理：同事务内把超出上限的旧报文删掉，不依赖每日清扫。
+            if retention > 0 {
+                prune_payloads(&transaction, retention)?;
+            }
         }
 
         transaction.commit()?;
+        // 删掉的页要显式回收，否则只进 freelist，DB 文件不会缩小。
+        if retention > 0 && payload.is_some() {
+            db::reclaim_free_pages(connection);
+        }
         Ok(())
     });
 }
@@ -316,26 +294,15 @@ fn upsert_usage_total(
     Ok(())
 }
 
-fn cap_optional(text: Option<&str>) -> (Option<String>, bool) {
-    match text {
-        Some(text) => {
-            let (capped, truncated) = cap_bytes(text, PAYLOAD_MAX_BYTES);
-            (Some(capped), truncated)
-        }
-        None => (None, false),
-    }
-}
-
 /// 按明细行号取报文详情；无报文记录（老数据或已被保留策略清理）返回 None。
 pub fn payload_detail(usage_detail_id: i64) -> Option<UsagePayloadDetail> {
     db::with_conn(|connection| {
         let mut statement = connection.prepare(
-            "SELECT inbound_request, inbound_headers, upstream_request, upstream_response, request_truncated, \
-             upstream_request_truncated, response_truncated, is_stream, created_time FROM usage_payload \
+            "SELECT inbound_request, inbound_headers, upstream_request, upstream_response, is_stream, created_time FROM usage_payload \
              WHERE usage_detail_id = ?1 ORDER BY usage_payload_id DESC LIMIT 1",
         )?;
         let mut rows = statement.query_map(params![usage_detail_id], |row| {
-            let created_time: i64 = row.get(8)?;
+            let created_time: i64 = row.get(5)?;
             Ok(UsagePayloadDetail {
                 id: usage_detail_id,
                 time: db::iso_from_ms(created_time),
@@ -343,10 +310,7 @@ pub fn payload_detail(usage_detail_id: i64) -> Option<UsagePayloadDetail> {
                 inbound_headers: row.get(1)?,
                 upstream_request: row.get(2)?,
                 upstream_response: row.get(3)?,
-                request_truncated: row.get::<_, i64>(4)? != 0,
-                upstream_request_truncated: row.get::<_, i64>(5)? != 0,
-                response_truncated: row.get::<_, i64>(6)? != 0,
-                stream: row.get::<_, i64>(7)? != 0,
+                stream: row.get::<_, i64>(4)? != 0,
             })
         })?;
         match rows.next() {
@@ -357,29 +321,30 @@ pub fn payload_detail(usage_detail_id: i64) -> Option<UsagePayloadDetail> {
     .unwrap_or(None)
 }
 
-/// 按「请求保存时间」清理过期报文快照。只删 usage_payload（入站/上游请求与响应），
-/// usage_detail 明细与 usage_total 汇总保留；`retention_days <= 0`（永久保留）不动任何行。
+/// 按「请求保存数量」清理超额报文快照：只保留最新的 `retention_count` 条，
+/// 更早的删除。usage_detail 明细与 usage_total 汇总保留；`retention_count <= 0` 不动任何行。
 /// 走写线程（读连接是 `query_only`，删除只能交给写线程）；异步投递，行数不再返回。
-pub fn cleanup_expired_payloads(retention_days: i64) {
-    let Some(cutoff) = retention_cutoff(retention_days, db::now_ms()) else {
+/// 写入侧每条报文落库时也会即时清理（见 [`submit`]），这里主要用于「用户调小上限后立即生效」。
+pub fn cleanup_excess_payloads(retention_count: i64) {
+    if retention_count <= 0 {
         return;
-    };
-    db::submit(move |connection| prune_payloads(connection, cutoff).map(|_| ()));
-}
-
-/// 保留天数换算成「早于它即过期」的截止时刻；`retention_days <= 0`（永久保留）返回 None。
-fn retention_cutoff(retention_days: i64, now_ms: i64) -> Option<i64> {
-    if retention_days <= 0 {
-        return None;
     }
-    Some(now_ms - retention_days * 24 * 60 * 60 * 1000)
+    db::submit(move |connection| {
+        prune_payloads(connection, retention_count)?;
+        db::reclaim_free_pages(connection);
+        Ok(())
+    });
 }
 
-/// 删除早于 `cutoff` 的报文行。抽出来是为了能用内存库单测，不必碰进程级 usage 库。
-fn prune_payloads(connection: &rusqlite::Connection, cutoff: i64) -> AppResult<usize> {
+/// 只保留最新的 `keep` 条报文行，删除其余。抽出来是为了能用内存库单测，不必碰进程级 usage 库。
+/// 用「第 keep+1 新的行号」作水位线一次删干净，避免逐条构造 NOT IN 列表；
+/// 现有条数不足 keep+1 时子查询为 NULL，`<= NULL` 不命中任何行，等于不删。
+fn prune_payloads(connection: &rusqlite::Connection, keep: i64) -> AppResult<usize> {
     Ok(connection.execute(
-        "DELETE FROM usage_payload WHERE created_time < ?1",
-        params![cutoff],
+        "DELETE FROM usage_payload WHERE usage_payload_id <= ( \
+             SELECT usage_payload_id FROM usage_payload ORDER BY usage_payload_id DESC LIMIT 1 OFFSET ?1 \
+         )",
+        params![keep],
     )?)
 }
 
@@ -392,7 +357,7 @@ pub fn spawn_retention_task() {
     let _ = std::thread::Builder::new()
         .name("usage-retention".into())
         .spawn(|| loop {
-            cleanup_expired_payloads(settings::snapshot().request_retention_days);
+            cleanup_excess_payloads(settings::snapshot().request_retention_count);
             std::thread::sleep(RETENTION_SWEEP_INTERVAL);
         });
 }
@@ -548,41 +513,33 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
 
-    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
-
     #[test]
-    fn retention_cutoff_is_permanent_only_when_disabled() {
-        // 0 / 负数 = 永久保留：没有截止时刻，也就是不清理。
-        assert_eq!(retention_cutoff(0, 1_000), None);
-        assert_eq!(retention_cutoff(-30, 1_000), None);
-        // 正数 = 现在往前推 N 天；边界取「恰好 N 天前」，更早的才算过期。
-        assert_eq!(retention_cutoff(7, 1_000), Some(1_000 - 7 * DAY_MS));
-    }
-
-    #[test]
-    fn pruning_removes_only_rows_older_than_the_cutoff() {
+    fn pruning_keeps_only_the_newest_rows() {
         let connection = Connection::open_in_memory().unwrap();
         connection.execute_batch(db::SCHEMA_SQL).unwrap();
-        for created in [100_i64, 200, 300] {
+        for detail_id in [10_i64, 20, 30] {
             connection
                 .execute(
                     "INSERT INTO usage_payload (usage_detail_id, created_time, update_time) \
-                     VALUES (1, ?1, ?1)",
-                    params![created],
+                     VALUES (?1, 100, 100)",
+                    params![detail_id],
                 )
                 .unwrap();
         }
 
-        // 250 之前的两条删除，250 之后的保留（边界不算过期）。
-        assert_eq!(prune_payloads(&connection, 250).unwrap(), 2);
+        // 上限 2 条：最旧的一条删除，保留最新的两条。
+        assert_eq!(prune_payloads(&connection, 2).unwrap(), 1);
         let remaining: Vec<i64> = connection
-            .prepare("SELECT created_time FROM usage_payload ORDER BY created_time")
+            .prepare("SELECT usage_detail_id FROM usage_payload ORDER BY usage_payload_id")
             .unwrap()
             .query_map([], |row| row.get(0))
             .unwrap()
             .filter_map(Result::ok)
             .collect();
-        assert_eq!(remaining, vec![300]);
+        assert_eq!(remaining, vec![20, 30]);
+
+        // 上限不小于现有条数：一行都不删。
+        assert_eq!(prune_payloads(&connection, 3).unwrap(), 0);
     }
 
     /// v11：usage_total 由写入侧增量累加（每日行 + 全量行共用一张表），读取侧只按 day 取行。

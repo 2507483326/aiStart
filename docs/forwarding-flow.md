@@ -485,7 +485,7 @@ Completions 入站是 `finish_reason:"stop"` + `usage` + `[DONE]`，Responses �
 | 1 | **A2** `Policy::none()` | 一行，堵住 Key 泄漏给重定向目标 |
 | 2 | **A1** `read_timeout(300s)` | 一行，堵住半开连接永久挂起 + 漏记 |
 | 3 | **A3 + A3+ + A4** 判罚先于尾巴 + 直通首帧失败补错误事件 | 都在流末/错误分支，一起改，三协议各加守护测试 |
-| 4 | **A5** ✅ 已修（写线程 + rollup）；**A7** 的报文保留一半已修（`cleanup_expired_payloads` 每日清理），`events` 页面未做 | A5 见 §8-A5；都在 `usage.rs` + `db/mod.rs` |
+| 4 | **A5** ✅ 已修（写线程 + rollup）；**A7** 的报文保留一半已修（`cleanup_excess_payloads` 每日清理），`events` 页面未做 | A5 见 §8-A5；都在 `usage.rs` + `db/mod.rs` |
 | 5 | **A6** 三处缓冲上限 | 收尾健壮性 |
 | 6 | **A8–A11** | 低优先，择机 |
 

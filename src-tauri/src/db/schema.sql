@@ -1,5 +1,5 @@
 -- =====================================================================
--- AI Start SQLite schema v11（db_schema_version = 11）
+-- AI Start SQLite schema v12（db_schema_version = 12）
 -- v1 首次落库：app_settings / models / app_model_bindings（配置与模型，取代 settings.json）、
 -- usage_detail / usage_daily_total（token 消耗，取代 usage.jsonl）、events（审计事件）、
 -- app_version_records（应用版本检查与更新记录）。
@@ -17,6 +17,9 @@
 -- v11 变更：usage_daily_total 改名为 usage_total 并改为自增主键；每日行（day = 'yyyy-MM-dd'）
 --           与全量累计行（day = ''）共用这一张表，写入时增量累加，读时不做 SUM；
 --           老库的 usage_daily_total 在 db::init 里搬运进 usage_total 后整表丢弃。
+-- v12 变更：usage_payload 的报文不再截断——移除 request_truncated / upstream_request_truncated /
+--           response_truncated 三列，入站/上游请求与响应按原样全量保存。
+--           （老库的这三列留作无用的历史列，代码不再读写；新库不再建。）
 --
 -- 规范（对齐 eTeam：C:\eTeam\src\host\state\schema.sql）：
 --   主键 = 每张表自己的编号列，统一 INTEGER 自增（仅 schema_meta / app_settings 以 key 为主键，
@@ -147,7 +150,7 @@ CREATE TABLE IF NOT EXISTS app_version_records (
 --    合法键：active_model_id（生效模型 ID）/ gateway_port（本地网关端口）
 --            / auto_failover（1/0）/ launch_at_login（开机启动，1/0）
 --            / proxy_enabled（代理开关，1/0）/ proxy_url（出站代理地址，空串 = 直连）
---            / request_retention_days（请求报文保留天数：7/30/100，0 = 永久）
+--            / request_retention_count（请求报文保留条数：500/1000/2000，只保留最新）
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS app_settings (
   key            TEXT PRIMARY KEY,             -- 设置键（行即主键，key 例外同 schema_meta）
@@ -193,7 +196,8 @@ CREATE INDEX IF NOT EXISTS idx_app_model_bindings_kind ON app_model_bindings (ap
 --    与 usage_detail 一比一（usage_detail_id 松引用，不建外键）；
 --    存「原生报文」：入站请求为客户端原始 body，上游请求为注入后实际发出的 body，
 --    响应为上游原生形状（流式按事件拼装后再转回上游协议原生形状），
---    由前端按入站/上游协议解析展示；写入后不再做条数清理，全部保留
+--    由前端按入站/上游协议解析展示；报文按原样全量保存（不截断），
+--    写入后由「请求保存数量」定期清理，只保留最新的 500/1000/2000 条
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS usage_payload (
   usage_payload_id   INTEGER PRIMARY KEY AUTOINCREMENT,  -- 报文行号，自增
@@ -202,9 +206,6 @@ CREATE TABLE IF NOT EXISTS usage_payload (
   inbound_headers    TEXT,               -- 客户端发来的 HTTP header（JSON 对象，原样保存不脱敏）；未捕获为 NULL
   upstream_request   TEXT,               -- 提示词注入后实际发往上游的请求体（上游协议原生形状）；未捕获为 NULL
   upstream_response  TEXT,               -- 上游原生响应：非流式=上游返回原文；流式=拼装后转回上游协议原生形状
-  request_truncated  INTEGER NOT NULL DEFAULT 0,  -- 1=入站请求体因超上限被截断
-  upstream_request_truncated INTEGER NOT NULL DEFAULT 0,  -- 1=上游请求体因超上限被截断
-  response_truncated INTEGER NOT NULL DEFAULT 0,  -- 1=上游响应因超上限被截断
   is_stream          INTEGER NOT NULL DEFAULT 0,  -- 1=流式（响应为拼装结果）/ 0=非流式（上游原文）
   created_time       INTEGER NOT NULL,   -- 入库时刻
   update_time        INTEGER NOT NULL    -- 报文行只插不改，= created_time

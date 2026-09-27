@@ -11,7 +11,7 @@ use crate::error::{AppError, AppResult};
 pub const SCHEMA_SQL: &str = include_str!("schema.sql");
 
 /// 当前 schema 版本号，写入 schema_meta.db_schema_version。
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 /// **读连接**：所有查询都走它（`with_conn`）。迁移跑完后置 `query_only = ON`，此后只能读。
 /// 写全部交给下面的写线程——两个连接各司其职，WAL 下读不挡写。
@@ -45,6 +45,9 @@ pub fn init(dir: &Path) -> AppResult<()> {
     connection.execute_batch(
         "PRAGMA journal_mode = WAL;\nPRAGMA foreign_keys = OFF;\nPRAGMA busy_timeout = 5000;",
     )?;
+
+    // 让删除的报文页能真正还给文件系统（见 ensure_incremental_autovacuum）。
+    ensure_incremental_autovacuum(&connection);
 
     // CREATE TABLE IF NOT EXISTS 只建新表，不会给已存在的旧库补列；schema.sql 里的索引又引用了新列，
     // 所以必须在执行 DDL 之前对「已存在的表」补列（新库由 schema.sql 直接建出带列的表，这里跳过）。
@@ -80,12 +83,6 @@ pub fn init(dir: &Path) -> AppResult<()> {
         "TEXT NOT NULL DEFAULT ''",
     )?;
     let _ = ensure_column(&connection, "usage_payload", "upstream_request", "TEXT")?;
-    let _ = ensure_column(
-        &connection,
-        "usage_payload",
-        "upstream_request_truncated",
-        "INTEGER NOT NULL DEFAULT 0",
-    )?;
     // v9：入站 HTTP header 原样入库（用户确认不脱敏）。
     let _ = ensure_column(&connection, "usage_payload", "inbound_headers", "TEXT")?;
 
@@ -225,6 +222,29 @@ fn record_write_failure(message: &str) {
     if let Ok(mut guard) = LAST_WRITE_ERROR.get_or_init(|| Mutex::new(None)).lock() {
         *guard = Some(message.to_string());
     }
+}
+
+/// 打开增量 auto-vacuum：SQLite 默认把删除后的页留在 freelist 里，文件只涨不缩；
+/// 增量模式下再配合 [`reclaim_free_pages`] 才能把空闲页还给文件系统。
+/// 老库原本是 NONE，改模式必须跑一次 VACUUM（会重写整库），所以只在这条启动路径上跑一次；
+/// 同时这一次 VACUUM 也把历史堆积的空洞一次性收回来。新库此时还是空的，VACUUM 瞬间完成。
+///
+/// 全程尽力而为：这只是「让文件变小」的优化，失败（例如临时磁盘不够）绝不能拖垮启动——
+/// 退回默认的 freelist 行为即可，删除照常，只是文件暂时不下缩。
+fn ensure_incremental_autovacuum(connection: &Connection) {
+    // PRAGMA auto_vacuum：0 = NONE，1 = FULL，2 = INCREMENTAL。
+    let mode: i64 = connection
+        .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+        .unwrap_or(0);
+    if mode != 2 {
+        let _ = connection.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;\nVACUUM;");
+    }
+}
+
+/// 把 freelist 里的空闲页还给文件系统；需要 `auto_vacuum = INCREMENTAL` 才生效。
+/// 删除报文后调用，数据库文件才会随之下缩。清理本身已经完成，这里的失败不致命，忽略。
+pub fn reclaim_free_pages(connection: &Connection) {
+    let _ = connection.execute_batch("PRAGMA incremental_vacuum");
 }
 
 /// 幂等补列：旧库缺列时执行 ALTER TABLE ADD COLUMN（SQLite 无 ADD COLUMN IF NOT EXISTS）。

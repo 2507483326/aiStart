@@ -42,7 +42,7 @@ pub fn run() {
             gateway::attach(app.handle().clone());
             let _ = gateway::start();
 
-            // 报文保留策略：启动先清一次过期报文，之后每天一次（按设置里的「请求保存时间」）。
+            // 报文保留策略：启动先清一次超额报文，之后每天一次（按设置里的「请求保存数量」）。
             usage::spawn_retention_task();
 
             init_tray(app)?;

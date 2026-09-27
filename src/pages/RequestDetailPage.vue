@@ -60,18 +60,16 @@ const responseView = computed(() =>
 /** 只展示一份请求：优先上游报文（提示词注入后的实际请求），旧记录没有时退回入站报文。 */
 const requestRaw = computed(() => {
   const value = payload.value;
-  if (!value) return { text: null, truncated: false, protocol: "", upstream: false };
+  if (!value) return { text: null, protocol: "", upstream: false };
   if (value.upstreamRequest) {
     return {
       text: value.upstreamRequest,
-      truncated: value.upstreamRequestTruncated,
       protocol: record.value?.upstreamProtocol ?? "",
       upstream: true,
     };
   }
   return {
     text: value.inboundRequest,
-    truncated: value.requestTruncated,
     protocol: record.value?.inboundProtocol ?? "",
     upstream: false,
   };
@@ -92,6 +90,12 @@ const responseDescription = computed(() => {
 
 const systemLabelClass =
   "border-transparent bg-amber-500/15 text-amber-600 dark:text-amber-400";
+
+/**
+ * 报文卡片的内容区：超过一屏就在卡片内滚动，避免超长报文把整页撑爆。
+ * 不用 overscroll-contain——内部滚到底后继续滚要能带动外层页面（滚动链）。
+ */
+const payloadCardBodyClass = "max-h-[55vh] overflow-auto rounded-b-lg";
 
 /** null 表示上游未回报该字段，界面显「—」而不是 0。 */
 function tokenText(value: number | null): string {
@@ -263,39 +267,38 @@ function goBack(): void {
           </CollapsibleCard>
 
           <CollapsibleCard title="上游请求" :description="requestDescription">
-            <template #action>
-              <Badge v-if="requestRaw.truncated" variant="outline">已截断</Badge>
-            </template>
-
             <template v-if="requestView">
               <PayloadCard
                 v-if="requestView.system"
                 label="system"
                 :label-class="systemLabelClass"
                 :text="requestView.system"
+                :body-class="payloadCardBodyClass"
               >
                 <pre
                   class="text-xs leading-relaxed break-words whitespace-pre-wrap"
                   >{{ requestView.system }}</pre
                 >
               </PayloadCard>
-              <MessageList v-if="requestView.messages.length" :messages="requestView.messages" />
+              <MessageList
+                v-if="requestView.messages.length"
+                :messages="requestView.messages"
+                :body-class="payloadCardBodyClass"
+              />
             </template>
             <RawPayload
               v-else
               :raw="requestRaw.text"
               label="原始请求（无法解析）"
-              :truncated="requestRaw.truncated"
             />
           </CollapsibleCard>
 
           <CollapsibleCard title="上游响应" :description="responseDescription">
-            <template #action>
-              <Badge v-if="payload.responseTruncated" variant="outline">已截断</Badge>
-            </template>
-
             <template v-if="responseView">
-              <MessageList :messages="responseView.messages" />
+              <MessageList
+                :messages="responseView.messages"
+                :body-class="payloadCardBodyClass"
+              />
               <div class="flex flex-wrap gap-x-5 gap-y-1 text-xs text-muted-foreground">
                 <span v-if="responseView.stopReason">停止原因 {{ responseView.stopReason }}</span>
                 <span v-if="responseView.usage">
@@ -308,7 +311,6 @@ function goBack(): void {
               v-else-if="payload.upstreamResponse"
               :raw="payload.upstreamResponse"
               label="原始响应（无法解析）"
-              :truncated="payload.responseTruncated"
             />
             <p v-else class="text-xs text-muted-foreground">
               本次未获取到上游响应报文（网络错误或上游未返回内容）。
@@ -324,7 +326,6 @@ function goBack(): void {
               <RawPayload
                 :raw="requestRaw.text"
                 label="请求原文"
-                :truncated="requestRaw.truncated"
               />
               <RawPayload
                 v-if="payload.inboundHeaders"
@@ -335,7 +336,6 @@ function goBack(): void {
                 v-if="payload.upstreamResponse"
                 :raw="payload.upstreamResponse"
                 label="响应原文"
-                :truncated="payload.responseTruncated"
               />
               <p v-else class="text-xs text-muted-foreground">
                 本次未获取到上游响应原文（网络错误或上游未返回内容）。

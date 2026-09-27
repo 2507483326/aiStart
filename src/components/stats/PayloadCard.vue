@@ -13,12 +13,15 @@ const props = withDefaults(
     labelClass?: string;
     text?: string;
     defaultCollapsed?: boolean;
+    /** 追加到内容区的类，例如「最大高度 + 内部滚动」。 */
+    bodyClass?: string;
   }>(),
   {
     label: "",
     labelClass: "",
     text: "",
     defaultCollapsed: false,
+    bodyClass: "",
   },
 );
 
@@ -66,7 +69,7 @@ const translateLabel = computed(() => {
       </div>
     </div>
 
-    <div v-show="!collapsed" class="space-y-2 px-3 py-2.5">
+    <div v-show="!collapsed" class="space-y-2 px-3 py-2.5" :class="bodyClass">
       <template v-if="showing && translated">
         <pre
           class="font-sans text-xs leading-relaxed break-words whitespace-pre-wrap"

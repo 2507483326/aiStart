@@ -43,9 +43,9 @@ pub struct Settings {
     /// 出站代理地址（如 `http://127.0.0.1:7890`）。
     /// 生效点是 providers::http_client()，所有出站流量共用。
     pub proxy_url: String,
-    /// 请求报文保留天数（usage_payload 清理策略）：7 / 30 / 100，0 = 永久保留。
-    /// 只删报文快照，usage_detail 明细与每日汇总不受影响。
-    pub request_retention_days: i64,
+    /// 请求报文保留条数（usage_payload 清理策略）：500 / 1000 / 2000。
+    /// 只保留最新的 N 条报文快照，更早的删除；usage_detail 明细与每日汇总不受影响。
+    pub request_retention_count: i64,
     /// app_kind -> model_id
     pub applied: BTreeMap<String, i64>,
     /// app_kind -> 应用专属网关 Key（固定可读，= app_kind）
@@ -56,8 +56,8 @@ fn default_port() -> u16 {
     8931
 }
 
-/// 「请求保存时间」的合法天数：7 / 30 / 100 天，0 = 永久保留。后端校验与前端选项共用这套值。
-pub const RETENTION_DAY_OPTIONS: [i64; 4] = [7, 30, 100, 0];
+/// 「请求保存数量」的合法条数：500 / 1000 / 2000。后端校验与前端选项共用这套值。
+pub const RETENTION_COUNT_OPTIONS: [i64; 3] = [500, 1000, 2000];
 
 impl Default for Settings {
     fn default() -> Self {
@@ -71,8 +71,8 @@ impl Default for Settings {
             // 代理默认关：地址都没有，开了也没用。
             proxy_enabled: false,
             proxy_url: String::new(),
-            // 请求报文默认保留 7 天：磁盘增长最狠的就是报文快照，默认给个短窗口。
-            request_retention_days: 7,
+            // 请求报文默认保留 500 条：磁盘增长最狠的就是报文快照，默认给个短窗口。
+            request_retention_count: 500,
             applied: BTreeMap::new(),
             app_tokens: BTreeMap::new(),
         }
@@ -215,9 +215,9 @@ fn load() -> AppResult<Settings> {
                 "launch_at_login" => settings.launch_at_login = value.trim() == "1",
                 "proxy_enabled" => settings.proxy_enabled = value.trim() == "1",
                 "proxy_url" => settings.proxy_url = value.trim().to_string(),
-                "request_retention_days" => {
-                    if let Ok(days) = value.trim().parse() {
-                        settings.request_retention_days = days;
+                "request_retention_count" => {
+                    if let Ok(count) = value.trim().parse() {
+                        settings.request_retention_count = count;
                     }
                 }
                 _ => {}
@@ -318,8 +318,8 @@ fn setting_pairs(settings: &Settings) -> Vec<(&'static str, String)> {
         ),
         ("proxy_url", settings.proxy_url.clone()),
         (
-            "request_retention_days",
-            settings.request_retention_days.to_string(),
+            "request_retention_count",
+            settings.request_retention_count.to_string(),
         ),
     ]
 }
@@ -380,6 +380,15 @@ pub fn persist() {
 
 pub fn snapshot() -> Settings {
     store().read().expect("settings lock poisoned").clone()
+}
+
+/// 只取「请求报文保留条数」。写入侧每条报文落库前都要问一遍，
+/// 不值得为此克隆整个 Settings（还带模型列表）。
+pub fn retention_count() -> i64 {
+    store()
+        .read()
+        .expect("settings lock poisoned")
+        .request_retention_count
 }
 
 /// 只取「代理开关 + 地址」。出站客户端每次请求前都要问一遍，

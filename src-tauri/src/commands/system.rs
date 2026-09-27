@@ -9,6 +9,7 @@ use crate::error::{AppError, AppResult};
 use crate::gateway;
 use crate::providers;
 use crate::settings;
+use crate::usage;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -18,7 +19,7 @@ pub struct SettingsView {
     pub launch_at_login: bool,
     pub proxy_enabled: bool,
     pub proxy_url: String,
-    pub request_retention_days: i64,
+    pub request_retention_count: i64,
     pub active_model_id: Option<i64>,
     pub applied: BTreeMap<String, i64>,
 }
@@ -38,9 +39,9 @@ pub struct SettingsInput {
     /// 空串 = 清空代理地址；不带这个字段则保持原样。
     #[serde(default)]
     pub proxy_url: Option<String>,
-    /// 请求报文保留天数：7 / 30 / 100，0 = 永久保留。
+    /// 请求报文保留条数：500 / 1000 / 2000，只保留最新的 N 条。
     #[serde(default)]
-    pub request_retention_days: Option<i64>,
+    pub request_retention_count: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -61,7 +62,7 @@ fn view() -> SettingsView {
         launch_at_login: snapshot.launch_at_login,
         proxy_enabled: snapshot.proxy_enabled,
         proxy_url: snapshot.proxy_url,
-        request_retention_days: snapshot.request_retention_days,
+        request_retention_count: snapshot.request_retention_count,
         active_model_id: snapshot.active_model_id,
         applied: snapshot.applied,
     }
@@ -104,10 +105,10 @@ pub async fn update_settings(input: SettingsInput) -> AppResult<SettingsView> {
         }
     }
 
-    // 只认下拉框里的四个值：写进来别的天数没有对应的 UI，不如当场拒绝。
-    if let Some(days) = input.request_retention_days {
-        if !settings::RETENTION_DAY_OPTIONS.contains(&days) {
-            return Err(AppError::InvalidConfig("请求保存时间取值非法".into()));
+    // 只认下拉框里的三个值：写进来别的条数没有对应的 UI，不如当场拒绝。
+    if let Some(count) = input.request_retention_count {
+        if !settings::RETENTION_COUNT_OPTIONS.contains(&count) {
+            return Err(AppError::InvalidConfig("请求保存数量取值非法".into()));
         }
     }
 
@@ -121,14 +122,19 @@ pub async fn update_settings(input: SettingsInput) -> AppResult<SettingsView> {
         if let Some(enabled) = input.launch_at_login {
             store.launch_at_login = enabled;
         }
-        if let Some(days) = input.request_retention_days {
-            store.request_retention_days = days;
+        if let Some(count) = input.request_retention_count {
+            store.request_retention_count = count;
         }
         store.proxy_enabled = proxy_enabled;
         if let Some(url) = proxy_url {
             store.proxy_url = url.unwrap_or_default();
         }
     })?;
+
+    // 调小上限要立刻见效：否则要等下一次请求或每日清扫，用户会以为设置没生效。
+    if let Some(count) = input.request_retention_count {
+        usage::cleanup_excess_payloads(count);
+    }
 
     // 代理开关/地址都不用重启网关：出站客户端按请求重建（providers::http_client）。
     if was_running && port_changed {

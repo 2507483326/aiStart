@@ -91,9 +91,6 @@ export interface UsagePayloadDetail {
   inboundHeaders: string | null;
   upstreamRequest: string | null;
   upstreamResponse: string | null;
-  requestTruncated: boolean;
-  upstreamRequestTruncated: boolean;
-  responseTruncated: boolean;
   stream: boolean;
 }
 
@@ -215,8 +212,8 @@ export interface SettingsView {
   proxyEnabled: boolean;
   /// 出站代理地址，空串 = 直连。
   proxyUrl: string;
-  /// 请求报文保留天数：7 / 30 / 100，0 = 永久保留。
-  requestRetentionDays: number;
+  /// 请求报文保留条数：500 / 1000 / 2000，只保留最新的 N 条。
+  requestRetentionCount: number;
   activeModelId: number | null;
   applied: Record<string, number>;
 }
@@ -227,7 +224,7 @@ export interface SettingsInput {
   launchAtLogin?: boolean;
   proxyEnabled?: boolean;
   proxyUrl?: string;
-  requestRetentionDays?: number;
+  requestRetentionCount?: number;
 }
 
 export interface AppInfo {
