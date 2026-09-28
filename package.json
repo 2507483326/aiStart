@@ -1,7 +1,7 @@
 {
   "name": "ai-start",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.2",
   "packageManager": "pnpm@12.3.4",
   "type": "module",
   "scripts": {
