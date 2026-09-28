@@ -47,36 +47,31 @@ impl ModelProvider for AnthropicMessagesProvider {
         headers
     }
 
-    /// 透传 = 客户端原始报文（`raw`，保住 `tools` 上的 cache_control 等协议扩展字段）
-    /// 加上规范字段的显式覆盖：
+    /// 规范 → Anthropic 报文：**纯重建**，不再以 `raw` 为底。
     ///
-    /// * Anthropic 不认识的键（`_canonical`、`store`、`n` 等）删掉；
-    /// * 与规范形状不同的字段（`response_format` / `reasoning_effort` / `parallel_tool_calls` / `metadata`）
-    ///   按 Anthropic 写法重新落一遍（`fill = IfAbsent`：报文里已有的原样字段不动）。
+    /// 同协议转发不走这里（走 `encode_request_passthrough`，以客户端原文为底），所以这条路径的
+    /// 输入**永远来自别的协议**——碰不到 Anthropic 专有字段；而规范的消息与内容块本身就是
+    /// Anthropic 形状，重建无损。
     fn encode_request(&self, cfg: &ModelConfig, req: &CanonicalRequest) -> AppResult<Value> {
         let body = req.body();
         let canonical = serde_json::to_value(body)
             .map_err(|error| AppError::Message(format!("规范请求序列化失败: {error}")))?;
 
-        let mut payload = req.raw().clone();
-        let object = payload
-            .as_object_mut()
-            .ok_or_else(|| AppError::InvalidConfig("请求体必须是 JSON 对象".into()))?;
-
+        let mut object = Map::new();
         wire::apply_common_fields(
-            object,
+            &mut object,
             &canonical,
             wire::profile(crate::domain::model::ModelFormat::AnthropicMessages),
-            Fill::IfAbsent,
+            Fill::Overwrite,
         );
 
         object.insert("model".into(), Value::String(cfg.model.clone()));
-        if !object.contains_key("max_tokens") {
-            object.insert(
-                "max_tokens".into(),
-                json!(crate::domain::model::DEFAULT_MAX_TOKENS),
-            );
-        }
+        object.insert(
+            "max_tokens".into(),
+            json!(body
+                .max_tokens
+                .unwrap_or(crate::domain::model::DEFAULT_MAX_TOKENS)),
+        );
 
         // metadata / response_format / reasoning_effort / parallel_tool_calls 的规范名已由
         // `apply_common_fields` 从报文里删掉（Anthropic 没有这些键），这里按 Anthropic 写法补回去。
@@ -101,30 +96,65 @@ impl ModelProvider for AnthropicMessagesProvider {
         }
 
         // response_format 与 reasoning_effort 在 Anthropic 里都归到 output_config 下。
+        // 同协议（客户端自带预算式 thinking）不走这里，所以不存在"预算与档位同发"的冲突。
         let format = body.response_format.as_ref().and_then(anthropic_format);
-        // 客户端原文带 thinking（预算式思考）时不再叠档位：reasoning_effort 是从预算
-        // 有损映射来的（见 decode_request），两个思考开关同时下发会被上游拒。
-        // 先算好要写什么再碰报文——没有可写的就不建 output_config 空对象。
-        let has_thinking_budget = object
-            .get("thinking")
-            .is_some_and(|thinking| thinking.get("budget_tokens").is_some());
-        let effort = if has_thinking_budget {
-            None
-        } else {
-            body.reasoning_effort.clone()
-        };
+        let effort = body.reasoning_effort.clone();
         if let Some(format) = format {
-            let config = output_config(object);
+            let config = output_config(&mut object);
             config.insert("format".into(), format);
             if let Some(effort) = effort {
                 config.insert("effort".into(), Value::String(effort));
             }
         } else if let Some(effort) = effort {
-            let config = output_config(object);
+            let config = output_config(&mut object);
             config.insert("effort".into(), Value::String(effort));
         }
 
-        Ok(payload)
+        // 思考块：Anthropic 输入侧要求 `signature`，跨协议合成出来的思考没有签名。
+        strip_unsigned_thinking(&mut object);
+
+        Ok(Value::Object(object))
+    }
+
+    /// 同协议（Anthropic → Anthropic）免转换快路：以**客户端原文**为底，只换模型名、
+    /// 覆盖被过滤器改过的 system、删规范内部键。三个协议走同一条规则。
+    fn encode_request_passthrough(
+        &self,
+        cfg: &ModelConfig,
+        req: &CanonicalRequest,
+    ) -> AppResult<Option<Value>> {
+        let Some(client) = req.client_raw().and_then(Value::as_object) else {
+            return Ok(None);
+        };
+        let mut payload = client.clone();
+
+        payload.insert("model".into(), Value::String(cfg.model.clone()));
+        if !payload
+            .get("max_tokens")
+            .is_some_and(|value| value.as_u64().is_some())
+        {
+            payload.insert(
+                "max_tokens".into(),
+                json!(crate::domain::model::DEFAULT_MAX_TOKENS),
+            );
+        }
+        // 只有过滤器注入过系统提示词才重写 system；没注入过就保留客户端原样
+        // （块数组里的 cache_control 都不动）。
+        if req.is_dirty("system") {
+            match req.body().system.as_ref() {
+                Some(system) => {
+                    let value = serde_json::to_value(system).map_err(|error| {
+                        AppError::Message(format!("system 序列化失败: {error}"))
+                    })?;
+                    payload.insert("system".into(), value);
+                }
+                None => {
+                    payload.remove("system");
+                }
+            }
+        }
+        payload.remove(wire::CANONICAL_ONLY_KEY);
+        Ok(Some(Value::Object(payload)))
     }
 
     fn decode_response(&self, _cfg: &ModelConfig, raw: &Value) -> AppResult<Value> {
@@ -265,6 +295,29 @@ fn read_usage(state: &mut StreamState, usage: Option<&Value>) {
         .and_then(Value::as_u64)
     {
         state.reasoning_tokens = tokens;
+    }
+}
+
+/// 无 signature 的 `thinking` 块构不成合法的 Anthropic 输入块（输入侧要求 signature）：
+/// 跨协议（如 Responses 的 `reasoning.summary`）合成出来的思考没有签名，原样发会被上游拒。
+/// 这里把它们剔除，而不是把非法形状送出去。
+fn strip_unsigned_thinking(payload: &mut Map<String, Value>) {
+    let Some(messages) = payload.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for message in messages {
+        let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        blocks.retain(|block| {
+            if block.get("type").and_then(Value::as_str) != Some("thinking") {
+                return true;
+            }
+            block
+                .get("signature")
+                .and_then(Value::as_str)
+                .is_some_and(|signature| !signature.is_empty())
+        });
     }
 }
 

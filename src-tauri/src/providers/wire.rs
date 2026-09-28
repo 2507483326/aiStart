@@ -12,6 +12,7 @@
 
 use serde_json::{json, Map, Value};
 
+use crate::domain::canonical::BlockKind;
 use crate::domain::model::ModelFormat;
 
 use super::SseEvent;
@@ -77,10 +78,9 @@ const ANTHROPIC_RULES: &[FieldRule] = &[
     // 上游会按非法取值 400 掉整个请求。Anthropic 侧改为显式丢弃——丢的至多是一个
     // 容量/优先级偏好（而 Anthropic 的默认档正是 `auto`），换来的是不会 400。
     //
-    // 代价说清：`Dropped` 在**本协议的编码路径上同样生效**，所以 Anthropic 客户端自己
-    // 带的 `service_tier` 也会被这条规则删掉（这条路径与跨协议重建共用同一个
-    // `encode_request`，不像两个 OpenAI 协议那样有独立的 `encode_request_passthrough`）。
-    // 见 `docs/forwarding.md` §8 批 4 的取舍说明。
+    // 范围：只对**跨协议重建**生效。同协议（Anthropic → Anthropic）走 Anthropic 自己的
+    // `encode_request_passthrough`，以客户端原文为底、不查这张表，所以客户端自己带的
+    // `service_tier` 原样转发（见 `docs/forwarding.md` §10）。
     FieldRule { field: "service_tier", slot: Slot::Dropped },
     FieldRule { field: "n", slot: Slot::Dropped },
     FieldRule { field: CANONICAL_ONLY_KEY, slot: Slot::Dropped },
@@ -280,4 +280,137 @@ pub fn response_status(stop_reason: Option<&str>) -> (&'static str, Option<&'sta
         }
         _ => ("completed", None),
     }
+}
+
+// ───────────────────────── 内容块能力表 ─────────────────────────
+
+/// 报文方向：`Decode` = wire → 规范（收），`Encode` = 规范 → wire（发）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // 审计面：目前由守卫测试消费，留痕（P3）接上后再摘掉
+pub enum Flow {
+    Decode,
+    Encode,
+}
+
+/// 某个块在「某协议的某一方向」上能否表达。
+///
+/// `unsupported: Some(原因)` 是**显式**的能力缺口：解码侧见到它就该留痕，
+/// 编码侧见到它就是明确丢弃，而不是 `_ => {}` 落空。
+#[allow(dead_code)]
+pub struct BlockRule {
+    pub protocol: ModelFormat,
+    pub flow: Flow,
+    pub kind: BlockKind,
+    pub unsupported: Option<&'static str>,
+}
+
+/// 三协议 × 两方向 × 全部块类型的完整能力表（缺一行测试就红）。
+#[allow(dead_code)]
+const BLOCK_RULES: &[BlockRule] = &[
+    // ── Anthropic Messages：规范形状就是本协议形状（走 raw 直通）──
+    rule(ModelFormat::AnthropicMessages, Flow::Decode, BlockKind::Text, None),
+    rule(ModelFormat::AnthropicMessages, Flow::Decode, BlockKind::Image, None),
+    rule(ModelFormat::AnthropicMessages, Flow::Decode, BlockKind::Document, None),
+    rule(ModelFormat::AnthropicMessages, Flow::Decode, BlockKind::ToolUse, None),
+    rule(ModelFormat::AnthropicMessages, Flow::Decode, BlockKind::ToolResult, None),
+    rule(ModelFormat::AnthropicMessages, Flow::Decode, BlockKind::Thinking, None),
+    rule(ModelFormat::AnthropicMessages, Flow::Decode, BlockKind::Unmodeled, None),
+    rule(ModelFormat::AnthropicMessages, Flow::Encode, BlockKind::Text, None),
+    rule(ModelFormat::AnthropicMessages, Flow::Encode, BlockKind::Image, None),
+    rule(ModelFormat::AnthropicMessages, Flow::Encode, BlockKind::Document, None),
+    rule(ModelFormat::AnthropicMessages, Flow::Encode, BlockKind::ToolUse, None),
+    rule(ModelFormat::AnthropicMessages, Flow::Encode, BlockKind::ToolResult, None),
+    // 思考：有 signature 才构得成合法的 Anthropic 输入块（输入侧要求 signature），
+    // 逐块判定，见 `anthropic_messages` 的编码守卫。
+    rule(ModelFormat::AnthropicMessages, Flow::Encode, BlockKind::Thinking, None),
+    rule(ModelFormat::AnthropicMessages, Flow::Encode, BlockKind::Unmodeled, None),
+    // ── OpenAI Chat Completions ──
+    rule(ModelFormat::OpenaiCompletions, Flow::Decode, BlockKind::Text, None),
+    rule(ModelFormat::OpenaiCompletions, Flow::Decode, BlockKind::Image, None),
+    rule(ModelFormat::OpenaiCompletions, Flow::Decode, BlockKind::Document, None),
+    rule(ModelFormat::OpenaiCompletions, Flow::Decode, BlockKind::ToolUse, None),
+    rule(ModelFormat::OpenaiCompletions, Flow::Decode, BlockKind::ToolResult, None),
+    rule(ModelFormat::OpenaiCompletions, Flow::Decode, BlockKind::Thinking, None),
+    rule(
+        ModelFormat::OpenaiCompletions,
+        Flow::Decode,
+        BlockKind::Unmodeled,
+        Some("Completions 入站按已知形状重建，未建模块不保留"),
+    ),
+    rule(ModelFormat::OpenaiCompletions, Flow::Encode, BlockKind::Text, None),
+    rule(ModelFormat::OpenaiCompletions, Flow::Encode, BlockKind::Image, None),
+    rule(ModelFormat::OpenaiCompletions, Flow::Encode, BlockKind::Document, None),
+    rule(ModelFormat::OpenaiCompletions, Flow::Encode, BlockKind::ToolUse, None),
+    rule(ModelFormat::OpenaiCompletions, Flow::Encode, BlockKind::ToolResult, None),
+    rule(ModelFormat::OpenaiCompletions, Flow::Encode, BlockKind::Thinking, None),
+    rule(
+        ModelFormat::OpenaiCompletions,
+        Flow::Encode,
+        BlockKind::Unmodeled,
+        Some("Completions 没有通用扩展块，未建模块丢弃"),
+    ),
+    // ── OpenAI Responses ──
+    rule(ModelFormat::OpenaiResponses, Flow::Decode, BlockKind::Text, None),
+    rule(ModelFormat::OpenaiResponses, Flow::Decode, BlockKind::Image, None),
+    rule(ModelFormat::OpenaiResponses, Flow::Decode, BlockKind::Document, None),
+    rule(ModelFormat::OpenaiResponses, Flow::Decode, BlockKind::ToolUse, None),
+    rule(ModelFormat::OpenaiResponses, Flow::Decode, BlockKind::ToolResult, None),
+    rule(ModelFormat::OpenaiResponses, Flow::Decode, BlockKind::Thinking, None),
+    rule(
+        ModelFormat::OpenaiResponses,
+        Flow::Decode,
+        BlockKind::Unmodeled,
+        Some("Responses 入站按已知 item 重建，未建模 item 不保留"),
+    ),
+    rule(ModelFormat::OpenaiResponses, Flow::Encode, BlockKind::Text, None),
+    rule(ModelFormat::OpenaiResponses, Flow::Encode, BlockKind::Image, None),
+    rule(ModelFormat::OpenaiResponses, Flow::Encode, BlockKind::Document, None),
+    rule(ModelFormat::OpenaiResponses, Flow::Encode, BlockKind::ToolUse, None),
+    rule(ModelFormat::OpenaiResponses, Flow::Encode, BlockKind::ToolResult, None),
+    rule(
+        ModelFormat::OpenaiResponses,
+        Flow::Encode,
+        BlockKind::Thinking,
+        Some("input 的 reasoning item 需要 id/encrypted_content，跨协议合成不出"),
+    ),
+    rule(
+        ModelFormat::OpenaiResponses,
+        Flow::Encode,
+        BlockKind::Unmodeled,
+        Some("Responses 没有通用扩展块，未建模块丢弃"),
+    ),
+];
+
+#[allow(dead_code)]
+const fn rule(
+    protocol: ModelFormat,
+    flow: Flow,
+    kind: BlockKind,
+    unsupported: Option<&'static str>,
+) -> BlockRule {
+    BlockRule {
+        protocol,
+        flow,
+        kind,
+        unsupported,
+    }
+}
+
+/// 该协议在这个方向上能否表达这个块；`None` = 能，`Some(原因)` = 显式不支持。
+#[allow(dead_code)]
+pub fn block_unsupported(
+    protocol: ModelFormat,
+    flow: Flow,
+    kind: BlockKind,
+) -> Option<&'static str> {
+    BLOCK_RULES
+        .iter()
+        .find(|rule| rule.protocol == protocol && rule.flow == flow && rule.kind == kind)
+        .and_then(|rule| rule.unsupported)
+}
+
+/// 能力表的全部行，供守卫测试遍历。
+#[allow(dead_code)]
+pub fn block_rules() -> &'static [BlockRule] {
+    BLOCK_RULES
 }

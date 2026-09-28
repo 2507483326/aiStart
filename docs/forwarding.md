@@ -438,14 +438,10 @@ header map），`usage_payload` 表加列（`schema.sql` + `db/mod.rs` 的 LEGAC
 而 400 会废掉整个请求。丢弃则在两种假设下都安全：最坏是丢一个容量/优先级偏好，而 Anthropic
 的默认档正是 `auto`——丢 `auto` 等于没丢。
 
-代价（写在这里免得日后当 bug 查）：`Dropped` 在 Anthropic **本协议的编码路径上同样生效**，
-所以 Anthropic 客户端自己带的 `service_tier` 也会被删掉——这条路与跨协议重建共用同一个
-`encode_request`，不像两个 OpenAI 协议那样有独立的 `encode_request_passthrough`（它们以
-客户端原文为底，从不查这张表，因此完全不受影响）。丢一个容量偏好换「绝不 400」，是这个改动
-认下的取舍。
-
-> 若日后实测确认 Anthropic 接受 `service_tier`，升级路径是把它从 `Dropped` 改成值映射
-> （`auto` → `auto`，其余丢弃），而不是改回 `Same`；那样连 Anthropic 客户端自带的值也能保住。
+范围：只对**跨协议重建**生效。同协议（Anthropic → Anthropic）走 Anthropic 自己的
+`encode_request_passthrough`（以客户端原文为底、不查这张表），所以 Anthropic 客户端自己带的
+`service_tier` 现在原样转发——当初"连客户端自带的值也丢"的代价，已在**三条直通路径统一**
+那一轮消除（见 §10）。跨协议仍按上面的理由丢弃：OpenAI 的 `priority` 抛给 Anthropic 只会 400。
 
 **A7 错误事件形状**（`wire.rs` + 两个 OpenAI provider + `gateway/server.rs`）
 
@@ -468,7 +464,7 @@ Responses 的思考按事件名区分（`response.reasoning_summary_text.delta`�
 
 测试：`stream_errors_have_one_shape_per_inbound_protocol`（A7）、
 `completions_stream_captures_the_upstream_chunk_id`（C1），
-`anthropic_clients_lose_their_own_service_tier_until_the_parameter_is_verified`（A5 的代价，见上），
+`service_tier_is_kept_for_anthropic_clients_and_dropped_across_protocols`（A5，见上），
 `canonical_fields_are_forwarded_per_protocol` 补两处断言（A5：Anthropic 丢弃 vs. 两个 OpenAI 协议保留）。
 
 **顺手修的测试隔离问题**：`sqlite_persistence_round_trips` 与
@@ -542,7 +538,7 @@ M1–M5、L2、L4–L7 也未动。
 | 断连兜底落库且不双记 | `gateway::server::tests::disconnect_guard_records_what_the_stream_had_already_accounted_for`、`disconnect_guard_stays_silent_after_the_regular_hand_off` |
 | 流内错误事件形状（两个来源一致） | `gateway::server::tests::stream_errors_have_one_shape_per_inbound_protocol` |
 | 分片 id 进记账 | `completions_stream_captures_the_upstream_chunk_id` |
-| `service_tier` 对 Anthropic 一律丢弃（含客户端自带值） | `anthropic_clients_lose_their_own_service_tier_until_the_parameter_is_verified` |
+| `service_tier`：同协议保真、跨协议对 Anthropic 丢弃 | `service_tier_is_kept_for_anthropic_clients_and_dropped_across_protocols` |
 | 块状态机不变式 | `block_normalizer_keeps_payloads_in_their_own_block`、`block_normalizer_serializes_parallel_tool_arguments` |
 | 流判罚 | `stream_verdict_flags_reasoning_only_and_truncated` |
 | 过滤器 | `filter_injects_system_prompt`、`filter_skips_disabled_and_stacks_in_order` |
@@ -556,4 +552,95 @@ M1–M5、L2、L4–L7 也未动。
 
 ```bash
 cargo test h2_oversize_request_is_rejected_and_recorded -- --ignored
+```
+
+## 10. 内容块保真（规范层扩容）
+
+顶层字段有 `ProtocolProfile` 保证「静默丢字段不可能」，**内容块这一层以前没有**：解码只认
+Anthropic 核心的几种块，编码侧靠 `_ => {}` 兜底。本轮把这一层补齐。
+
+**设计模式**
+
+1. `domain::canonical::CanonicalBlock` —— C 侧内容块的类型化全集（text / image / document /
+   tool_use / tool_result / thinking / unmodeled）。
+2. `providers::wire::BLOCK_RULES` —— 三协议 × 两方向 × 全部块类型的能力表，每行要么能表达，
+   要么 `unsupported: Some(原因)`（**显式**丢弃，不是落空）。
+3. 两个 OpenAI provider 的编解码按 `CanonicalBlock` **穷举**匹配：新增块类型时编译器会把
+   每一处没跟上的地方报出来（本轮加 `Document` 时就当场抓到一处漏改）。
+4. 守卫测试 `block_rules_cover_every_kind`：全集的每个格子在表里必须恰好一行。
+
+**块 × 协议（双向）**
+
+| 规范块 | Responses | Chat Completions | Anthropic |
+| --- | --- | --- | --- |
+| text | `input_text` / `output_text` | `text` part | `text` |
+| image | `input_image` | `image_url` | `image` |
+| document | `input_file`（`file_data` / `file_url` / `file_id` + `filename`） | `file` part（`file_data` / `file_id` + `filename`） | `document`（`source` + `title` / `context` / `cache_control`） |
+| tool_use | `function_call` item | `assistant.tool_calls[]` | `tool_use` |
+| tool_result | `function_call_output` item | `role:"tool"` | `tool_result` |
+| thinking | `reasoning.summary[].text` | `assistant.reasoning_content` | `thinking`（输入侧要求 `signature`） |
+
+**按协议的固有损失（显式，不假装能转）**
+
+- `file_id` 三个协议都有同名字段，编码时照带；但它是各家 Files API 自己的 id，
+  跨供应商能不能解析是上游的事（网关不做能力猜测）。
+- Completions 的 `file` part 只有 `file_data` / `file_id` 两个来源，**没有 url 字段**；
+  Anthropic 的 `text` / `content` 源在 Responses / Completions 也没有对应形状——这三种
+  落不了地，只能丢（形状不存在，不是能力猜测）。
+- 无 `signature` 的 `thinking` 构不成合法的 Anthropic 输入块（输入侧要求 signature），
+  跨协议合成出来的思考会被编码器剔除（`anthropic_messages::strip_unsigned_thinking`）。
+- `thinking` → Responses **请求**方向不支持：input 的 `reasoning` item 需要 `id` /
+  `encrypted_content`，跨协议合成不出（响应方向照旧发 reasoning item）。
+- computer_call / server tools 仍是一等 item 专属：Completions 没有对应形状，Anthropic 侧
+  只有工具级落点，暂不建模（能力表里也没登记这类块）。
+
+**顺带并入** A4：`http(s)` 图片与文档 url 以前被静默丢弃，现在按 `url` source 原样承载。
+
+**新增守护测试**
+
+| 守护点 | 测试 |
+| --- | --- |
+| 能力表完备性（缺行即红） | `block_rules_cover_every_kind` |
+| 文档双向（Responses ↔ Completions / Anthropic） | `documents_survive_responses_to_completions_and_anthropic`、`documents_survive_completions_to_responses` |
+| 思考双向（reasoning.summary ↔ reasoning_content） | `reasoning_summary_reaches_completions_as_reasoning_content` |
+| 无签名思考不进 Anthropic | `unsigned_thinking_is_not_sent_to_anthropic` |
+| 相邻同角色消息在规范层合并 | `responses_parallel_tool_calls_stay_one_assistant_turn`、`completions_parallel_tool_results_alternate_for_anthropic` |
+| developer / system 折进 system | `responses_developer_messages_fold_into_system` |
+
+## 11. 三条直通路径统一（对称化）
+
+**问题**：请求侧的"同协议直通"以前不是不变式，而是"看 provider 有没有实现一个可选方法"——
+`encode_upstream_request` 先试 `encode_request_passthrough`，返回 `None` 就静默回落重建。
+两个 OpenAI 协议实现了快路，**Anthropic 没有**（trait 默认 `Ok(None)`），于是 Anthropic → Anthropic
+走进了 `encode_request`。而那个函数以 `req.raw()` 为底再跑字段表，`raw` 对 Anthropic 入站又正好是
+客户端报文本身。后果：
+
+- 客户端自己的 `service_tier` / `n` 被 `Dropped` 无条件删掉（A5 的代价）；
+- 任何写 `raw` 的东西（过滤器、规范层归一）都会**改写客户端报文**；
+- 响应侧、流侧本来就是统一的（都按 `same_protocol` 走），只有请求侧一家不一致。
+
+**改法**：把请求侧的三条路径收成同一条规则。
+
+1. `AnthropicMessagesProvider::encode_request` 改为**纯重建**：以空对象为底 + `Fill::Overwrite`
+   跑 `ANTHROPIC_RULES`，不再读 `raw`。这条路径的输入永远来自别的协议（同协议走快路），
+   碰不到 Anthropic 专有字段。
+2. 新增 `AnthropicMessagesProvider::encode_request_passthrough`：`client_raw` + 模型名 +
+   （过滤器改过才）覆盖 `system` + 删 `_canonical`——与两个 OpenAI 协议同一套规则。
+3. `raw` 退化成纯内部表示（过滤器的改写对象 + serde 落点），出站编码不再读它。
+
+**收益**：Anthropic → Anthropic 现在字段与消息结构全保真（`service_tier`、`n`、`thinking`、
+`output_config`、`cache_control`、`container` 这类规范层不认识的键都原样带走）；A5 那条
+"连客户端自带的值也丢"的代价随之消除。跨协议出站方面，Anthropic 直接从类型化 body 序列化
+（规范的消息/内容块本就是 Anthropic 形状），不需要逐块派发，因此也不受块能力表约束、不会丢块。
+
+**守护测试**：`every_protocol_passthrough_is_the_client_payload_plus_the_model`（三家同一条规则）、
+`service_tier_is_kept_for_anthropic_clients_and_dropped_across_protocols`、
+`anthropic_inbound_hidden_fields_survive_cross_protocol` 的直通段。
+
+**端到端冒烟**：`gateway::server::tests::gateway_smoke_end_to_end` 起一个本地 mock 上游，把
+`route()` 全链路跑通并核对**上游实际收到的报文**（同协议直通的字段保真 + 跨协议重建的
+并行工具调用合并与 `reasoning_content` 回传）。它要写进程级设置库，默认跳过，单独跑：
+
+```bash
+cargo test gateway_smoke_end_to_end -- --ignored
 ```

@@ -1356,4 +1356,121 @@ mod tests {
             "入站报文全量保存，不再截断"
         );
     }
+
+    /// 起一个本地 mock 上游，把 `route()` 全链路跑通（解码 → 过滤器 → 选模型 → 编码 → 出网），
+    /// 核对**上游实际收到的报文**——比单元测试更接近真实链路。
+    ///
+    /// 覆盖两条关键路径：
+    /// 1. 同协议直通（Anthropic → Anthropic）：客户端原文 + 换模型名，`service_tier` /
+    ///    `thinking` / 块上的 `cache_control` 一字不动；
+    /// 2. 跨协议重建（Responses → Completions）：并行工具调用并成一条 assistant、
+    ///    `reasoning.summary` 回写成 `reasoning_content`。
+    ///
+    /// 默认跳过：它会 init/mutate **进程级**设置库，和 `sqlite_persistence_round_trips` 抢。
+    /// 单独跑：`cargo test gateway_smoke_end_to_end -- --ignored`
+    #[tokio::test]
+    #[ignore = "要写进程级设置库；会和 sqlite_persistence_round_trips 打架"]
+    async fn gateway_smoke_end_to_end() {
+        use crate::domain::model::ModelInput;
+
+        // ── mock 上游：记下收到的报文，回 200 ──
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let sink = seen.clone();
+        let upstream = Router::new().fallback(move |axum::Json(body): axum::Json<Value>| {
+            let sink = sink.clone();
+            async move {
+                sink.lock().expect("captured").push(body);
+                axum::Json(json!({ "ok": true }))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock upstream 端口");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+
+        let dir = std::env::temp_dir().join(format!("ai-start-smoke-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        // 同进程里 `db::init` 只生效一次：单独跑由本用例初始化，否则沿用已有的库。
+        if let Err(error) = crate::settings::init(&dir) {
+            println!("沿用已初始化的库：{error}");
+        }
+
+        let point_at = |format: ModelFormat, model: &str| {
+            crate::settings::mutate(|settings| {
+                let model = settings.upsert(ModelInput {
+                    id: None,
+                    name: format!("smoke-{}", format.as_str()),
+                    format,
+                    base_url: format!("http://127.0.0.1:{port}"),
+                    api_key: "sk-test".into(),
+                    model: model.into(),
+                    supports_1m: false,
+                });
+                settings.active_model_id = Some(model.id);
+            })
+            .expect("设置当前模型");
+        };
+
+        let post = |inbound: ModelFormat, client: Value| {
+            let stats = crate::gateway::stats();
+            let mut headers = HeaderMap::new();
+            headers.insert("x-api-key", "claude-desktop".parse().expect("header"));
+            let body = Bytes::from(serde_json::to_vec(&client).expect("body"));
+            async move { route(inbound, stats, headers, body).await }
+        };
+
+        // ── 1. 同协议直通：Anthropic → Anthropic ──
+        point_at(ModelFormat::AnthropicMessages, "claude-upstream");
+        let client = json!({
+            "model": "aiStart",
+            "max_tokens": 64,
+            "messages": [{
+                "role": "user",
+                "content": [{ "type": "text", "text": "hi", "cache_control": { "type": "ephemeral" } }]
+            }],
+            "service_tier": "auto",
+            "thinking": { "type": "enabled", "budget_tokens": 4096 },
+            "container": { "id": "c1" }
+        });
+        let response = post(ModelFormat::AnthropicMessages, client.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK, "同协议直通应该成功");
+        let sent = seen.lock().expect("captured").pop().expect("上游收到一次请求");
+        assert_eq!(sent["model"], "claude-upstream", "只该换模型名");
+        assert_eq!(sent["service_tier"], "auto");
+        assert_eq!(sent["thinking"]["budget_tokens"], 4096);
+        assert_eq!(sent["container"]["id"], "c1");
+        assert_eq!(
+            sent["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+
+        // ── 2. 跨协议重建：Responses → Completions ──
+        point_at(ModelFormat::OpenaiCompletions, "deepseek-test");
+        let client = json!({
+            "model": "aiStart",
+            "input": [
+                { "role": "user", "content": [{ "type": "input_text", "text": "跑两个命令" }] },
+                { "type": "reasoning", "summary": [{ "type": "summary_text", "text": "先看看" }] },
+                { "type": "function_call", "call_id": "call_A", "name": "exec_command", "arguments": "{}" },
+                { "type": "function_call", "call_id": "call_B", "name": "exec_command", "arguments": "{}" },
+                { "type": "function_call_output", "call_id": "call_A", "output": "out A" },
+                { "type": "function_call_output", "call_id": "call_B", "output": "out B" }
+            ]
+        });
+        let response = post(ModelFormat::OpenaiResponses, client).await;
+        assert_eq!(response.status(), StatusCode::OK, "跨协议重建应该成功");
+        let sent = seen.lock().expect("captured").pop().expect("上游收到一次请求");
+        assert_eq!(sent["model"], "deepseek-test");
+        let messages = sent["messages"].as_array().expect("messages 是数组");
+        assert_eq!(messages.len(), 4, "user + assistant + 两条 tool");
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["reasoning_content"], "先看看", "思考要随工具调用那轮回传");
+        assert_eq!(messages[1]["tool_calls"].as_array().map(Vec::len), Some(2));
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[3]["role"], "tool");
+    }
 }

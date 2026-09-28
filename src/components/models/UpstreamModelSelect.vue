@@ -1,17 +1,14 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import { Check, ChevronDown } from "@lucide/vue";
+import { ComboboxAnchor, ComboboxInput, ComboboxTrigger } from "reka-ui";
 
-import { Button } from "@/components/ui/button";
 import {
   Combobox,
-  ComboboxAnchor,
   ComboboxGroup,
-  ComboboxInput,
   ComboboxItem,
   ComboboxItemIndicator,
   ComboboxList,
-  ComboboxTrigger,
   ComboboxViewport,
 } from "@/components/ui/combobox";
 
@@ -32,9 +29,11 @@ const emit = defineEmits<{ "update:modelValue": [value: string] }>();
 const open = ref(false);
 const searchTerm = ref("");
 
+const displayValue = (value: unknown) => String(value ?? "");
+
 function onOpen(value: boolean) {
   open.value = value;
-  searchTerm.value = "";
+  if (!value) searchTerm.value = "";
 }
 
 function onSearch(value: unknown) {
@@ -70,13 +69,11 @@ const groups = computed(() => {
   return ordered;
 });
 
+// 输入的不是列表里已有的项时，提供一条「使用输入的 ID」的选项，实现手输自定义模型。
 const customCandidate = computed(() => {
   const term = searchTerm.value.trim();
   if (!term || props.options.includes(term)) return "";
-  const matched = props.options.some((item) =>
-    item.toLowerCase().includes(term.toLowerCase()),
-  );
-  return matched ? "" : term;
+  return term;
 });
 </script>
 
@@ -87,43 +84,45 @@ const customCandidate = computed(() => {
     @update:model-value="update"
     @update:open="onOpen"
   >
-    <ComboboxAnchor as-child class="w-full">
-      <ComboboxTrigger as-child>
-        <Button
-          :id="id"
-          variant="outline"
-          :size="size === 'sm' ? 'xs' : 'default'"
-          class="justify-between font-mono font-normal"
-          :class="[
-            size === 'sm' ? 'w-56 text-xs' : 'w-full text-xs',
-            triggerClass,
-            modelValue ? '' : 'text-muted-foreground',
-          ]"
-        >
-          <span class="truncate">{{ modelValue || placeholder }}</span>
-          <ChevronDown
-            class="shrink-0 opacity-60"
-            :class="size === 'sm' ? 'size-3.5' : 'size-4'"
-          />
-        </Button>
+    <ComboboxAnchor
+      :class="[
+        'relative flex items-center',
+        size === 'sm' ? 'w-56' : 'w-full',
+        triggerClass,
+      ]"
+    >
+      <ComboboxInput
+        :id="id"
+        :display-value="displayValue"
+        :placeholder="placeholder"
+        spellcheck="false"
+        :class="[
+          'border-input placeholder:text-muted-foreground w-full min-w-0 rounded-md border bg-transparent py-1 font-mono shadow-xs outline-none transition-[color,box-shadow] focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-3',
+          size === 'sm' ? 'h-7 pr-7 pl-2 text-xs' : 'h-8 pr-8 pl-3 text-xs',
+        ]"
+        @update:model-value="onSearch"
+      />
+      <ComboboxTrigger
+        class="text-muted-foreground hover:text-foreground focus-visible:ring-ring/50 absolute right-1 flex items-center justify-center rounded-sm outline-none focus-visible:ring-3"
+        :class="size === 'sm' ? 'size-5' : 'size-6'"
+        aria-label="展开模型列表"
+      >
+        <ChevronDown
+          class="opacity-60 transition-transform duration-200"
+          :class="[size === 'sm' ? 'size-3.5' : 'size-4', open ? 'rotate-180' : '']"
+        />
       </ComboboxTrigger>
     </ComboboxAnchor>
 
     <ComboboxList align="start" class="w-(--reka-combobox-trigger-width) min-w-64">
-      <ComboboxInput
-        :display-value="() => ''"
-        placeholder="搜索模型…"
-        class="h-8 py-0 text-xs"
-        @update:model-value="onSearch"
-      />
       <ComboboxViewport class="max-h-72 overflow-y-auto p-1">
         <ComboboxGroup v-for="group in groups" :key="group.prefix">
           <div class="flex items-center gap-2 px-2 pt-2 pb-1">
-            <span class="w-4 shrink-0 border-t border-dashed border-border" />
-            <span class="shrink-0 text-xs font-medium text-muted-foreground">
+            <span class="border-border w-4 shrink-0 border-t border-dashed" />
+            <span class="text-muted-foreground shrink-0 text-xs font-medium">
               {{ group.prefix }}
             </span>
-            <span class="flex-1 border-t border-dashed border-border" />
+            <span class="border-border flex-1 border-t border-dashed" />
           </div>
           <ComboboxItem v-for="id in group.items" :key="id" :value="id" :text-value="id">
             <span class="truncate font-mono text-xs">{{ id }}</span>
@@ -135,6 +134,7 @@ const customCandidate = computed(() => {
 
         <ComboboxItem
           v-if="customCandidate"
+          :key="customCandidate"
           :value="customCandidate"
           :text-value="customCandidate"
         >

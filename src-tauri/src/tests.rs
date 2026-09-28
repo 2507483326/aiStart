@@ -1040,20 +1040,41 @@ fn canonical_fields_are_forwarded_per_protocol() {
     }
 }
 
-/// A5 的代价写成测试，免得日后被当 bug 查：`Dropped` 在 Anthropic **本协议**的编码路径上
-/// 同样生效，所以 Anthropic 客户端自己带的 `service_tier` 也会被删（跨协议重建与同协议补写
-/// 共用同一个 `encode_request`，不像两个 OpenAI 协议有独立的直通路径）。只要该参数在
-/// Anthropic 侧的存在性与取值词表还没被实测确认，丢它换「绝不 400」就是认下的取舍
-/// （见 `docs/forwarding.md` §8 批 4）。日后实测确认后，改法是把 `Slot::Dropped` 换成
-/// 值映射并改写本测试——**不要**改回 `Same`。
+/// A5 的取舍收窄到**跨协议**：Anthropic 客户端自己带的 `service_tier` 现在原样转发
+/// （同协议走 `client_raw` 直通），只有跨协议重建时才按 `Dropped` 丢掉。
 #[test]
-fn anthropic_clients_lose_their_own_service_tier_until_the_parameter_is_verified() {
-    let inbound = provider_for(ModelFormat::AnthropicMessages)
+fn service_tier_is_kept_for_anthropic_clients_and_dropped_across_protocols() {
+    use crate::gateway::server::encode_upstream_request;
+
+    let client = json!({
+        "model": "claude-sonnet-5",
+        "max_tokens": 64,
+        "messages": [{ "role": "user", "content": "hi" }],
+        "service_tier": "auto",
+    });
+
+    // 同协议：原样转发
+    let request = provider_for(ModelFormat::AnthropicMessages)
+        .decode_request(client.clone())
+        .unwrap()
+        .retain_client_raw(client);
+    let encoded = encode_upstream_request(
+        ModelFormat::AnthropicMessages,
+        &model(ModelFormat::AnthropicMessages, "https://api.anthropic.com"),
+        &request,
+    )
+    .unwrap();
+    assert_eq!(
+        encoded["service_tier"], "auto",
+        "Anthropic 客户端自己的字段不该被网关改掉"
+    );
+
+    // 跨协议：Completions 的词表值（`priority`）原样发给 Anthropic 会被 400，继续丢
+    let inbound = provider_for(ModelFormat::OpenaiCompletions)
         .decode_request(json!({
-            "model": "claude-sonnet-5",
-            "max_tokens": 64,
+            "model": "gpt-4o",
             "messages": [{ "role": "user", "content": "hi" }],
-            "service_tier": "auto",
+            "service_tier": "priority",
         }))
         .unwrap();
     let encoded = provider_for(ModelFormat::AnthropicMessages)
@@ -1064,10 +1085,8 @@ fn anthropic_clients_lose_their_own_service_tier_until_the_parameter_is_verified
         .unwrap();
     assert!(
         encoded.get("service_tier").is_none(),
-        "A5 之下连 Anthropic 自带的 service_tier 也会被丢弃"
+        "跨协议的取值词表不通用"
     );
-    // 代价范围就这一个键：同一条报文里的其余字段照常落地。
-    assert_eq!(encoded["max_tokens"], 64);
     assert_eq!(encoded["messages"].as_array().map(Vec::len), Some(1));
 }
 
@@ -1141,32 +1160,38 @@ fn anthropic_inbound_hidden_fields_survive_cross_protocol() {
         .unwrap();
     assert_eq!(encoded["reasoning"]["effort"], "low");
 
-    // 同协议（Anthropic → Anthropic）：thinking / output_config 原样保留（不删、不叠档位）
+    // 同协议（Anthropic → Anthropic）走直通：thinking / tool_choice 原样保留，
+    // 连规范层不认识的键（container）也一字不动。
+    use crate::gateway::server::encode_upstream_request;
+
     let client = json!({
         "model": "claude-sonnet-4-5",
         "max_tokens": 1024,
         "messages": [{ "role": "user", "content": "hi" }],
         "thinking": { "type": "enabled", "budget_tokens": 4096 },
-        "tool_choice": { "type": "auto", "disable_parallel_tool_use": true }
+        "tool_choice": { "type": "auto", "disable_parallel_tool_use": true },
+        "container": { "id": "container-1" }
     });
-    let inbound = provider_for(ModelFormat::AnthropicMessages)
+    let request = provider_for(ModelFormat::AnthropicMessages)
         .decode_request(client.clone())
-        .unwrap();
-    let encoded = provider_for(ModelFormat::AnthropicMessages)
-        .encode_request(
-            &model(ModelFormat::AnthropicMessages, "https://api.anthropic.com"),
-            &inbound,
-        )
-        .unwrap();
+        .unwrap()
+        .retain_client_raw(client);
+    let encoded = encode_upstream_request(
+        ModelFormat::AnthropicMessages,
+        &model(ModelFormat::AnthropicMessages, "https://api.anthropic.com"),
+        &request,
+    )
+    .expect("同协议直通不该失败");
     assert_eq!(
         encoded["thinking"],
         json!({ "type": "enabled", "budget_tokens": 4096 })
     );
-    assert!(encoded.get("output_config").is_none());
     assert_eq!(
         encoded["tool_choice"],
         json!({ "type": "auto", "disable_parallel_tool_use": true })
     );
+    assert_eq!(encoded["container"]["id"], "container-1");
+    assert!(encoded.get("output_config").is_none());
 }
 
 /// http(s) 图片地址跨协议不再静默丢块（A4）：Completions / Responses 入站的 image_url
@@ -1287,6 +1312,62 @@ fn passthrough(format: ModelFormat, request: &CanonicalRequest) -> Value {
         .encode_request_passthrough(&model(format, "https://example.com/v1"), request)
         .expect("直通编码不该失败")
         .expect("该协议应该有直通快路")
+}
+
+/// 三个协议的同协议请求直通是**同一条规则**：客户端原文为底、只换模型名（+ 过滤器改过的
+/// system）。以前只有两个 OpenAI 协议实现了快路，Anthropic 会静默回落到规范层重建。
+#[test]
+fn every_protocol_passthrough_is_the_client_payload_plus_the_model() {
+    use crate::gateway::server::encode_upstream_request;
+
+    let cases = [
+        (
+            ModelFormat::AnthropicMessages,
+            json!({
+                "model": "claude-sonnet-5",
+                "max_tokens": 64,
+                "messages": [{ "role": "user", "content": [
+                    { "type": "text", "text": "hi", "cache_control": { "type": "ephemeral" } }
+                ] }],
+                "service_tier": "auto"
+            }),
+            "service_tier",
+        ),
+        (
+            ModelFormat::OpenaiCompletions,
+            json!({
+                "model": "gpt-4o",
+                "messages": [{ "role": "user", "content": "hi" }],
+                "logit_bias": { "50256": -100 }
+            }),
+            "logit_bias",
+        ),
+        (
+            ModelFormat::OpenaiResponses,
+            json!({
+                "model": "gpt-5",
+                "input": "hi",
+                "previous_response_id": "resp_1"
+            }),
+            "previous_response_id",
+        ),
+    ];
+
+    for (format, client, client_only_key) in cases {
+        let request = provider_for(format)
+            .decode_request(client.clone())
+            .expect("入站报文应该能解析")
+            .retain_client_raw(client);
+        let encoded =
+            encode_upstream_request(format, &model(format, "https://example.com/v1"), &request)
+                .expect("同协议直通不该失败");
+        assert_eq!(encoded["model"], "upstream-model", "{format:?}");
+        assert!(
+            encoded.get(client_only_key).is_some(),
+            "{format:?} 的直通丢了客户端自己的 `{client_only_key}`"
+        );
+        assert!(encoded.get("_canonical").is_none(), "{format:?}");
+    }
 }
 
 /// 同协议免转换直通：客户端原文为底，协议扩展键、字段名、消息结构原样带给上游。
@@ -1620,6 +1701,316 @@ fn canonical_responses_are_re_encoded_for_openai_clients() {
         .collect();
     assert_eq!(types, vec!["message", "function_call"]);
     assert_eq!(responses["status"], "completed");
+}
+
+/// Responses 把一次回合的每个工具调用拆成独立 item，解码后必须仍是一条 assistant 消息带多个
+/// tool_calls：拆成两条相邻 assistant，`tool` 消息就会接错人（实测上游 400 invalid request）。
+#[test]
+fn responses_parallel_tool_calls_stay_one_assistant_turn() {
+    use crate::gateway::server::encode_upstream_request;
+
+    let request = provider_for(ModelFormat::OpenaiResponses)
+        .decode_request(json!({
+            "model": "aiStart",
+            "instructions": "sys",
+            "input": [
+                { "role": "user", "content": [{ "type": "input_text", "text": "看屏幕" }] },
+                { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "先截个图" }] },
+                { "type": "function_call", "call_id": "call_A", "name": "exec_command", "arguments": "{\"cmd\":\"a\"}" },
+                { "type": "function_call", "call_id": "call_B", "name": "exec_command", "arguments": "{\"cmd\":\"b\"}" },
+                { "type": "function_call_output", "call_id": "call_A", "output": "out A" },
+                { "type": "function_call_output", "call_id": "call_B", "output": "out B" }
+            ]
+        }))
+        .expect("Responses 请求应该能解析");
+
+    let roles: Vec<&str> = request
+        .body()
+        .messages
+        .iter()
+        .map(|message| message.role.as_str())
+        .collect();
+    assert_eq!(roles, vec!["user", "assistant", "user"], "相邻同角色消息要在规范层并成一条");
+
+    let encoded = encode_upstream_request(
+        ModelFormat::OpenaiResponses,
+        &model(ModelFormat::OpenaiCompletions, "https://example.com/v1"),
+        &request,
+    )
+    .expect("跨协议重建不该失败");
+    let messages = encoded["messages"].as_array().expect("messages 是数组");
+    assert_eq!(messages.len(), 5);
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[1]["role"], "user");
+    assert_eq!(messages[2]["role"], "assistant");
+    assert_eq!(messages[2]["content"], "先截个图");
+    assert_eq!(
+        messages[2]["tool_calls"].as_array().unwrap().len(),
+        2,
+        "两个并行调用要落在同一条 assistant 上"
+    );
+    assert_eq!(messages[3]["tool_call_id"], "call_A");
+    assert_eq!(messages[4]["tool_call_id"], "call_B");
+    for pair in messages.windows(2) {
+        assert!(
+            !(pair[0]["role"] == "assistant" && pair[1]["role"] == "assistant"),
+            "不该出现相邻 assistant：{:?}",
+            pair
+        );
+    }
+}
+
+/// Responses 入站的 developer / system 消息折进 system：留成 messages 角色会被 Completions
+/// 降级成 user，也会被 Anthropic 当非法 role 拒掉（它只收 user / assistant）。
+#[test]
+fn responses_developer_messages_fold_into_system() {
+    let request = provider_for(ModelFormat::OpenaiResponses)
+        .decode_request(json!({
+            "model": "aiStart",
+            "instructions": "基础指令",
+            "input": [
+                { "type": "message", "role": "developer", "content": [{ "type": "input_text", "text": "权限说明" }] },
+                { "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }
+            ]
+        }))
+        .expect("Responses 请求应该能解析");
+
+    let body = request.body();
+    assert_eq!(body.system.as_ref().unwrap().plain_text(), "基础指令\n权限说明");
+    assert_eq!(body.messages.len(), 1);
+    assert_eq!(body.messages[0].role, "user");
+}
+
+/// Completions 入站的多条 `tool` 消息同样会变成相邻 user 消息；并成一条后，回给 Anthropic
+/// （要求角色严格交替）才是合法序列。
+#[test]
+fn completions_parallel_tool_results_alternate_for_anthropic() {
+    use crate::gateway::server::encode_upstream_request;
+
+    let request = provider_for(ModelFormat::OpenaiCompletions)
+        .decode_request(json!({
+            "model": "m",
+            "messages": [
+                { "role": "user", "content": "跑两个命令" },
+                { "role": "assistant", "tool_calls": [
+                    { "id": "call_A", "type": "function", "function": { "name": "exec_command", "arguments": "{}" } },
+                    { "id": "call_B", "type": "function", "function": { "name": "exec_command", "arguments": "{}" } }
+                ] },
+                { "role": "tool", "tool_call_id": "call_A", "content": "out A" },
+                { "role": "tool", "tool_call_id": "call_B", "content": "out B" }
+            ]
+        }))
+        .expect("Completions 请求应该能解析");
+
+    let roles: Vec<&str> = request
+        .body()
+        .messages
+        .iter()
+        .map(|message| message.role.as_str())
+        .collect();
+    assert_eq!(roles, vec!["user", "assistant", "user"], "多条 tool 消息并成一条 user");
+
+    let encoded = encode_upstream_request(
+        ModelFormat::OpenaiCompletions,
+        &model(ModelFormat::AnthropicMessages, "https://api.anthropic.com"),
+        &request,
+    )
+    .expect("跨协议重建不该失败");
+    let messages = encoded["messages"].as_array().expect("messages 是数组");
+    let roles: Vec<&str> = messages
+        .iter()
+        .filter_map(|message| message["role"].as_str())
+        .collect();
+    assert_eq!(roles, vec!["user", "assistant", "user"], "Anthropic 要求 user / assistant 交替");
+    let results = messages[2]["content"].as_array().expect("tool_result 是块数组");
+    assert_eq!(results.len(), 2, "两个 tool_result 落在同一条 user 上");
+    assert_eq!(results[0]["tool_use_id"], "call_A");
+    assert_eq!(results[1]["tool_use_id"], "call_B");
+}
+
+/// 内容块能力表必须覆盖「三协议 × 两方向 × 全部块类型」，一行不缺、一行不重。
+///
+/// 往 `CanonicalBlock` 加变体而忘了在 `wire::BLOCK_RULES` 里登记，这条立刻红——
+/// 和顶层字段的 `protocol_profiles_cover_every_canonical_field` 是同一个套路。
+#[test]
+fn block_rules_cover_every_kind() {
+    use crate::domain::canonical::BlockKind;
+    use crate::providers::wire::{block_rules, Flow};
+
+    for protocol in ModelFormat::ALL {
+        for flow in [Flow::Decode, Flow::Encode] {
+            for kind in BlockKind::ALL {
+                let hits = block_rules()
+                    .iter()
+                    .filter(|rule| {
+                        rule.protocol == protocol && rule.flow == flow && rule.kind == *kind
+                    })
+                    .count();
+                assert_eq!(
+                    hits,
+                    1,
+                    "{} / {:?} / {} 在能力表里应恰好一行，实际 {hits} 行",
+                    protocol.as_str(),
+                    flow,
+                    kind.as_str()
+                );
+            }
+        }
+    }
+}
+
+/// 文档双向：Responses 的 `input_file` → 规范 document → Completions `file` / Anthropic `document`。
+#[test]
+fn documents_survive_responses_to_completions_and_anthropic() {
+    use crate::gateway::server::encode_upstream_request;
+
+    let request = provider_for(ModelFormat::OpenaiResponses)
+        .decode_request(json!({
+            "model": "aiStart",
+            "input": [{
+                "role": "user",
+                "content": [
+                    { "type": "input_file", "filename": "doc.pdf", "file_data": "data:application/pdf;base64,QUJD" },
+                    { "type": "input_text", "text": "总结这份文档" }
+                ]
+            }]
+        }))
+        .expect("Responses 请求应该能解析");
+
+    // → Completions：file 内容部件
+    let encoded = encode_upstream_request(
+        ModelFormat::OpenaiResponses,
+        &model(ModelFormat::OpenaiCompletions, "https://example.com/v1"),
+        &request,
+    )
+    .expect("跨协议重建不该失败");
+    let parts = encoded["messages"][0]["content"]
+        .as_array()
+        .expect("content 是块数组");
+    assert_eq!(parts[0]["type"], "file");
+    assert_eq!(parts[0]["file"]["file_data"], "data:application/pdf;base64,QUJD");
+    assert_eq!(parts[0]["file"]["filename"], "doc.pdf");
+    assert_eq!(parts[1], json!({ "type": "text", "text": "总结这份文档" }));
+
+    // → Anthropic：document 块（规范形状就是 Anthropic 形状）
+    let encoded = encode_upstream_request(
+        ModelFormat::OpenaiResponses,
+        &model(ModelFormat::AnthropicMessages, "https://api.anthropic.com"),
+        &request,
+    )
+    .expect("跨协议重建不该失败");
+    let block = &encoded["messages"][0]["content"][0];
+    assert_eq!(block["type"], "document");
+    assert_eq!(block["source"]["type"], "base64");
+    assert_eq!(block["source"]["media_type"], "application/pdf");
+    assert_eq!(block["source"]["data"], "QUJD");
+    assert_eq!(block["title"], "doc.pdf");
+}
+
+/// 文档反向：Completions 的 `file` 部件 → 规范 document → Responses `input_file`。
+#[test]
+fn documents_survive_completions_to_responses() {
+    use crate::gateway::server::encode_upstream_request;
+
+    let request = provider_for(ModelFormat::OpenaiCompletions)
+        .decode_request(json!({
+            "model": "m",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "file", "file": { "filename": "doc.pdf", "file_data": "data:application/pdf;base64,QUJD" } }
+                ]
+            }]
+        }))
+        .expect("Completions 请求应该能解析");
+
+    let encoded = encode_upstream_request(
+        ModelFormat::OpenaiCompletions,
+        &model(ModelFormat::OpenaiResponses, "https://api.openai.com/v1"),
+        &request,
+    )
+    .expect("跨协议重建不该失败");
+    let part = &encoded["input"][0]["content"][0];
+    assert_eq!(part["type"], "input_file");
+    assert_eq!(part["file_data"], "data:application/pdf;base64,QUJD");
+    assert_eq!(part["filename"], "doc.pdf");
+}
+
+/// 思考双向：Responses 的 `reasoning.summary` → 规范 thinking → Completions `reasoning_content`。
+///
+/// DeepSeek V4 的 thinking 模式在发生过工具调用后**必须**把 reasoning_content 带回去，
+/// 否则 400；这条盯的就是「工具调用那一轮的思考有没有跟着走」。
+#[test]
+fn reasoning_summary_reaches_completions_as_reasoning_content() {
+    use crate::gateway::server::encode_upstream_request;
+
+    let request = provider_for(ModelFormat::OpenaiResponses)
+        .decode_request(json!({
+            "model": "aiStart",
+            "input": [
+                { "role": "user", "content": [{ "type": "input_text", "text": "跑个命令" }] },
+                { "type": "reasoning", "summary": [{ "type": "summary_text", "text": "先看看目录" }] },
+                { "type": "function_call", "call_id": "call_A", "name": "exec_command", "arguments": "{}" },
+                { "type": "function_call_output", "call_id": "call_A", "output": "ok" }
+            ]
+        }))
+        .expect("Responses 请求应该能解析");
+
+    // 规范里思考与工具调用并进同一条 assistant 消息。
+    let roles: Vec<&str> = request
+        .body()
+        .messages
+        .iter()
+        .map(|message| message.role.as_str())
+        .collect();
+    assert_eq!(roles, vec!["user", "assistant", "user"]);
+
+    let encoded = encode_upstream_request(
+        ModelFormat::OpenaiResponses,
+        &model(ModelFormat::OpenaiCompletions, "https://api.deepseek.com"),
+        &request,
+    )
+    .expect("跨协议重建不该失败");
+    let assistant = &encoded["messages"][1];
+    assert_eq!(assistant["role"], "assistant");
+    assert_eq!(assistant["reasoning_content"], "先看看目录");
+    assert_eq!(assistant["tool_calls"][0]["id"], "call_A");
+    assert_eq!(encoded["messages"][2]["role"], "tool");
+}
+
+/// 反向：Completions 的 `reasoning_content` → 规范 thinking → Anthropic 时无签名，
+/// 不能把非法的 `thinking` 块发出去（输入侧要求 signature）。
+#[test]
+fn unsigned_thinking_is_not_sent_to_anthropic() {
+    use crate::gateway::server::encode_upstream_request;
+
+    let request = provider_for(ModelFormat::OpenaiCompletions)
+        .decode_request(json!({
+            "model": "m",
+            "messages": [
+                { "role": "user", "content": "跑个命令" },
+                { "role": "assistant", "reasoning_content": "先看看目录", "tool_calls": [
+                    { "id": "call_A", "type": "function", "function": { "name": "exec_command", "arguments": "{}" } }
+                ] },
+                { "role": "tool", "tool_call_id": "call_A", "content": "ok" }
+            ]
+        }))
+        .expect("Completions 请求应该能解析");
+
+    let encoded = encode_upstream_request(
+        ModelFormat::OpenaiCompletions,
+        &model(ModelFormat::AnthropicMessages, "https://api.anthropic.com"),
+        &request,
+    )
+    .expect("跨协议重建不该失败");
+    let blocks = encoded["messages"][1]["content"]
+        .as_array()
+        .expect("assistant content 是块数组");
+    assert!(
+        blocks.iter().all(|block| block["type"] != "thinking"),
+        "没有 signature 的 thinking 不该发给 Anthropic：{blocks:?}"
+    );
+    assert_eq!(blocks[0]["type"], "tool_use");
 }
 
 /// 全局设置库整个测试进程只有一份（`settings::init` 的 OnceLock），而 `init` 是

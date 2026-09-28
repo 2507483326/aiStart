@@ -1,8 +1,8 @@
 use serde_json::{json, Map, Value};
 
 use crate::domain::canonical::{
-    blocks_to_text, content_to_text, CanonicalRequest, CanonicalToolChoice, ContentBlock,
-    MaxTokensField, SystemPrompt,
+    content_to_text, CanonicalBlock, CanonicalRequest, CanonicalToolChoice, MaxTokensField,
+    SystemPrompt,
 };
 use crate::domain::model::{ModelConfig, ModelFormat};
 use crate::error::{AppError, AppResult};
@@ -69,8 +69,8 @@ fn apply_usage(state: &mut StreamState, usage: &Value) {
     }
 }
 
-fn image_url_from_block(block: &ContentBlock) -> Option<String> {
-    let source = block.field("source")?;
+/// 规范 image source → 线上 `image_url`。`data:` 与 http(s) 都原样承载（A4）。
+pub(crate) fn url_from_source(source: &Value) -> Option<String> {
     match source.get("type").and_then(Value::as_str) {
         Some("base64") => {
             let media_type = source
@@ -86,6 +86,44 @@ fn image_url_from_block(block: &ContentBlock) -> Option<String> {
             .map(str::to_string),
         _ => None,
     }
+}
+
+/// 规范 document → Completions 的 `file` 内容部件。
+///
+/// Completions 的 file part 只有 `file_data`（data: URL）与 `file_id` 两个来源；
+/// `url` / `text` / `content` 源没有字段可放，返回 `None`（调用方按能力表丢弃）。
+fn file_part_from_document(source: &Value, extra: &Map<String, Value>) -> Option<Value> {
+    let mut file = Map::new();
+    match source.get("type").and_then(Value::as_str) {
+        Some("base64") => {
+            file.insert("file_data".into(), Value::String(url_from_source(source)?));
+        }
+        Some("file") => {
+            file.insert("file_id".into(), source.get("file_id").cloned()?);
+        }
+        _ => return None,
+    }
+    if let Some(filename) = extra.get("title").and_then(Value::as_str) {
+        file.insert("filename".into(), Value::String(filename.to_string()));
+    }
+    Some(json!({ "type": "file", "file": Value::Object(file) }))
+}
+
+/// Completions 的 `file` 内容部件 → 规范 document（`filename` 落 `title`）。
+fn document_from_file_part(part: &Value) -> Option<CanonicalBlock> {
+    let file = part.get("file")?;
+    let source = if let Some(file_data) = file.get("file_data").and_then(Value::as_str) {
+        source_from_url(file_data)?
+    } else if let Some(file_id) = file.get("file_id").and_then(Value::as_str) {
+        json!({ "type": "file", "file_id": file_id })
+    } else {
+        return None;
+    };
+    let mut extra = Map::new();
+    if let Some(filename) = file.get("filename").and_then(Value::as_str) {
+        extra.insert("title".into(), Value::String(filename.to_string()));
+    }
+    Some(CanonicalBlock::Document { source, extra })
 }
 
 fn encode_tools(tools: &[crate::domain::canonical::ToolDef]) -> Value {
@@ -187,23 +225,37 @@ impl ModelProvider for OpenaiCompletionsProvider {
         }
 
         for message in &body.messages {
-            let blocks = message.content.blocks();
+            let blocks = message.content.canonical_blocks();
             if message.role == "assistant" {
-                let text = blocks_to_text(&blocks);
-                let tool_calls: Vec<Value> = blocks
-                    .iter()
-                    .filter_map(|block| block.tool_use())
-                    .map(|tool| {
-                        json!({
-                            "id": tool.id,
+                // 一条规范消息里的多个块，落到 Completions 是「一条 content + 一个 tool_calls 数组」。
+                let mut text_parts: Vec<String> = Vec::new();
+                let mut reasoning_parts: Vec<String> = Vec::new();
+                let mut tool_calls: Vec<Value> = Vec::new();
+                for block in &blocks {
+                    match block {
+                        CanonicalBlock::Text(text) => text_parts.push(text.clone()),
+                        CanonicalBlock::Thinking { thinking, .. } => {
+                            if !thinking.is_empty() {
+                                reasoning_parts.push(thinking.clone());
+                            }
+                        }
+                        CanonicalBlock::ToolUse { id, name, input } => tool_calls.push(json!({
+                            "id": id,
                             "type": "function",
                             "function": {
-                                "name": tool.name,
-                                "arguments": serde_json::to_string(&tool.input).unwrap_or_else(|_| "{}".into())
+                                "name": name,
+                                "arguments": serde_json::to_string(input).unwrap_or_else(|_| "{}".into())
                             }
-                        })
-                    })
-                    .collect();
+                        })),
+                        // 能力表：assistant 消息不承载图片/文档/工具结果/未建模块。
+                        CanonicalBlock::Image { .. }
+                        | CanonicalBlock::Document { .. }
+                        | CanonicalBlock::ToolResult { .. }
+                        | CanonicalBlock::Unmodeled(_) => {}
+                    }
+                }
+                let text = text_parts.join("\n");
+                let reasoning = reasoning_parts.join("\n");
 
                 let mut entry = Map::new();
                 entry.insert("role".into(), Value::String("assistant".into()));
@@ -215,10 +267,18 @@ impl ModelProvider for OpenaiCompletionsProvider {
                         Value::String(text)
                     },
                 );
+                // 思考按上游口径写回 `assistant.reasoning_content`（DeepSeek 系要求把工具调用
+                // 那轮的思考原样带回，否则 400）。
+                if !reasoning.is_empty() {
+                    entry.insert("reasoning_content".into(), Value::String(reasoning));
+                }
                 if !tool_calls.is_empty() {
                     entry.insert("tool_calls".into(), Value::Array(tool_calls));
                 }
-                if entry.contains_key("tool_calls") || !entry["content"].is_null() {
+                if entry.contains_key("tool_calls")
+                    || entry.contains_key("reasoning_content")
+                    || !entry["content"].is_null()
+                {
                     messages.push(Value::Object(entry));
                 }
                 continue;
@@ -234,26 +294,43 @@ impl ModelProvider for OpenaiCompletionsProvider {
             };
 
             for block in &blocks {
-                if block.is("text") {
-                    pending_parts.push(json!({ "type": "text", "text": block.text_value() }));
-                } else if block.is("image") {
-                    if let Some(url) = image_url_from_block(block) {
-                        pending_parts
-                            .push(json!({ "type": "image_url", "image_url": { "url": url } }));
+                match block {
+                    CanonicalBlock::Text(text) => {
+                        pending_parts.push(json!({ "type": "text", "text": text }));
                     }
-                } else if let Some(result) = block.tool_result() {
-                    flush(&mut pending_parts, &mut messages);
-                    let text = content_to_text(&result.content);
-                    let payload = if result.is_error {
-                        format!("Error: {text}")
-                    } else {
-                        text
-                    };
-                    messages.push(json!({
-                        "role": "tool",
-                        "tool_call_id": result.tool_use_id,
-                        "content": payload
-                    }));
+                    CanonicalBlock::Image { source } => {
+                        if let Some(url) = url_from_source(source) {
+                            pending_parts
+                                .push(json!({ "type": "image_url", "image_url": { "url": url } }));
+                        }
+                    }
+                    CanonicalBlock::Document { source, extra } => {
+                        if let Some(part) = file_part_from_document(source, extra) {
+                            pending_parts.push(part);
+                        }
+                    }
+                    CanonicalBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => {
+                        flush(&mut pending_parts, &mut messages);
+                        let text = content_to_text(content);
+                        let payload = if *is_error {
+                            format!("Error: {text}")
+                        } else {
+                            text
+                        };
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": tool_use_id,
+                            "content": payload
+                        }));
+                    }
+                    // 能力表：user 消息里的工具调用/思考/未建模块在 Completions 无落点。
+                    CanonicalBlock::ToolUse { .. }
+                    | CanonicalBlock::Thinking { .. }
+                    | CanonicalBlock::Unmodeled(_) => {}
                 }
             }
 
@@ -537,6 +614,14 @@ impl ModelProvider for OpenaiCompletionsProvider {
                 })),
                 "assistant" => {
                     let mut blocks: Vec<Value> = Vec::new();
+                    // 思考：DeepSeek 系把思维链放在 assistant.reasoning_content，规范收成 thinking 块。
+                    if let Some(reasoning) = message
+                        .get("reasoning_content")
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.is_empty())
+                    {
+                        blocks.push(json!({ "type": "thinking", "thinking": reasoning }));
+                    }
                     if let Some(text) = message
                         .get("content")
                         .and_then(Value::as_str)
@@ -583,8 +668,14 @@ impl ModelProvider for OpenaiCompletionsProvider {
                                             .unwrap_or_default();
                                         // data: URL 收成 base64 source；http(s) 原样存 url source
                                         // （A4：以前静默丢块，客户端的图跨协议转发时消失）。
-                                        if let Some(source) = image_source_from_url(url) {
+                                        if let Some(source) = source_from_url(url) {
                                             blocks.push(json!({ "type": "image", "source": source }));
+                                        }
+                                    }
+                                    Some("file") => {
+                                        // 文档：Completions 的 file part → 规范 document。
+                                        if let Some(block) = document_from_file_part(part) {
+                                            blocks.push(block.to_value());
                                         }
                                     }
                                     _ => {}
@@ -954,7 +1045,7 @@ pub(crate) fn parse_arguments(value: Option<&Value>) -> Value {
 
 /// 客户端给的图片地址 → 规范 image source：`data:` URL 收成 base64，
 /// http(s) 存成 url source（A4）。两者之外的形状（空串、非 base64 的 data:）None。
-pub(crate) fn image_source_from_url(url: &str) -> Option<Value> {
+pub(crate) fn source_from_url(url: &str) -> Option<Value> {
     if url.starts_with("data:") {
         return data_url_to_source(url);
     }

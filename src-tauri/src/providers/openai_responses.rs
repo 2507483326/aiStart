@@ -1,19 +1,19 @@
 use serde_json::{json, Map, Value};
 
 use crate::domain::canonical::{
-    blocks_to_text, content_to_text, CanonicalRequest, CanonicalResponseFormat,
-    CanonicalToolChoice, ContentBlock, SystemPrompt,
+    content_to_text, CanonicalBlock, CanonicalRequest, CanonicalResponseFormat,
+    CanonicalToolChoice, SystemPrompt,
 };
 use crate::domain::model::{ModelConfig, ModelFormat};
 use crate::error::{AppError, AppResult};
 
-use super::openai_completions::{image_source_from_url, parse_arguments};
+use super::openai_completions::{source_from_url, url_from_source, parse_arguments};
 use super::wire::{self, Fill};
 use super::{ModelProvider, SseEvent, StreamState, WireState};
 
 pub struct OpenaiResponsesProvider;
 
-fn encode_content_parts(blocks: &[ContentBlock], role: &str) -> Vec<Value> {
+fn encode_content_parts(blocks: &[CanonicalBlock], role: &str) -> Vec<Value> {
     let text_type = if role == "assistant" {
         "output_text"
     } else {
@@ -21,34 +21,70 @@ fn encode_content_parts(blocks: &[ContentBlock], role: &str) -> Vec<Value> {
     };
     let mut parts = Vec::new();
     for block in blocks {
-        if block.is("text") {
-            parts.push(json!({ "type": text_type, "text": block.text_value() }));
-        } else if block.is("image") {
-            if let Some(source) = block.field("source") {
-                let url = match source.get("type").and_then(Value::as_str) {
-                    Some("base64") => {
-                        let media_type = source
-                            .get("media_type")
-                            .and_then(Value::as_str)
-                            .unwrap_or("image/png");
-                        source
-                            .get("data")
-                            .and_then(Value::as_str)
-                            .map(|data| format!("data:{media_type};base64,{data}"))
-                    }
-                    Some("url") => source
-                        .get("url")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    _ => None,
-                };
-                if let Some(url) = url {
+        match block {
+            CanonicalBlock::Text(text) => parts.push(json!({ "type": text_type, "text": text })),
+            CanonicalBlock::Image { source } => {
+                if let Some(url) = url_from_source(source) {
                     parts.push(json!({ "type": "input_image", "image_url": url }));
                 }
             }
+            CanonicalBlock::Document { source, extra } => {
+                if let Some(part) = input_file_from_document(source, extra) {
+                    parts.push(part);
+                }
+            }
+            // 能力表：这些块不是 message 的 content part（工具调用/结果是一等 item，
+            // 思考在 Responses 请求侧没有可重建的形状）。
+            CanonicalBlock::ToolUse { .. }
+            | CanonicalBlock::ToolResult { .. }
+            | CanonicalBlock::Thinking { .. }
+            | CanonicalBlock::Unmodeled(_) => {}
         }
     }
     parts
+}
+
+/// 规范 document → Responses 的 `input_file` 内容部件。
+///
+/// `base64` 源写 `file_data`（data: URL），`url` 源写 `file_url`，`file` 源写 `file_id`；
+/// 其余源（Anthropic 的 `text` / `content`）Responses 没有对应形状，返回 `None`。
+fn input_file_from_document(source: &Value, extra: &Map<String, Value>) -> Option<Value> {
+    let mut item = Map::new();
+    item.insert("type".into(), Value::String("input_file".into()));
+    match source.get("type").and_then(Value::as_str) {
+        Some("base64") => {
+            item.insert("file_data".into(), Value::String(url_from_source(source)?));
+        }
+        Some("url") => {
+            item.insert("file_url".into(), source.get("url").cloned()?);
+        }
+        Some("file") => {
+            item.insert("file_id".into(), source.get("file_id").cloned()?);
+        }
+        _ => return None,
+    }
+    if let Some(filename) = extra.get("title").and_then(Value::as_str) {
+        item.insert("filename".into(), Value::String(filename.to_string()));
+    }
+    Some(Value::Object(item))
+}
+
+/// Responses 的 `input_file` 内容部件 → 规范 document（`filename` 落 `title`）。
+fn document_from_input_file(part: &Value) -> Option<CanonicalBlock> {
+    let source = if let Some(file_data) = part.get("file_data").and_then(Value::as_str) {
+        source_from_url(file_data)?
+    } else if let Some(file_url) = part.get("file_url").and_then(Value::as_str) {
+        json!({ "type": "url", "url": file_url })
+    } else if let Some(file_id) = part.get("file_id").and_then(Value::as_str) {
+        json!({ "type": "file", "file_id": file_id })
+    } else {
+        return None;
+    };
+    let mut extra = Map::new();
+    if let Some(filename) = part.get("filename").and_then(Value::as_str) {
+        extra.insert("title".into(), Value::String(filename.to_string()));
+    }
+    Some(CanonicalBlock::Document { source, extra })
 }
 
 fn encode_tools(tools: &[crate::domain::canonical::ToolDef]) -> Value {
@@ -195,40 +231,45 @@ impl ModelProvider for OpenaiResponsesProvider {
         let mut input: Vec<Value> = Vec::new();
 
         for message in &body.messages {
-            let blocks = message.content.blocks();
+            let blocks = message.content.canonical_blocks();
             let is_assistant = message.role == "assistant";
-            let mut pending: Vec<Value> = Vec::new();
 
             for block in &blocks {
-                if block.is("text") || block.is("image") {
-                    continue;
-                }
-                if let Some(tool) = block.tool_use() {
-                    if !pending.is_empty() {
-                        let parts = std::mem::take(&mut pending);
-                        input.push(json!({ "role": "assistant", "content": parts }));
-                    }
-                    input.push(json!({
+                match block {
+                    CanonicalBlock::ToolUse {
+                        id,
+                        name,
+                        input: tool_input,
+                    } => input.push(json!({
                         "type": "function_call",
-                        "call_id": tool.id,
-                        "name": tool.name,
-                        "arguments": serde_json::to_string(&tool.input).unwrap_or_else(|_| "{}".into())
-                    }));
-                } else if let Some(result) = block.tool_result() {
-                    if !pending.is_empty() {
-                        let parts = std::mem::take(&mut pending);
-                        input.push(json!({ "role": "assistant", "content": parts }));
-                    }
-                    input.push(json!({
+                        "call_id": id,
+                        "name": name,
+                        "arguments": serde_json::to_string(tool_input).unwrap_or_else(|_| "{}".into())
+                    })),
+                    CanonicalBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } => input.push(json!({
                         "type": "function_call_output",
-                        "call_id": result.tool_use_id,
-                        "output": content_to_text(&result.content)
-                    }));
+                        "call_id": tool_use_id,
+                        "output": content_to_text(content)
+                    })),
+                    // 文本/图片/文档不是独立 item，由下面的 `encode_content_parts` 一次性写成 message；
+                    // 思考在 Responses 请求侧没有能重建的形状（能力表）。
+                    CanonicalBlock::Text(_)
+                    | CanonicalBlock::Image { .. }
+                    | CanonicalBlock::Document { .. }
+                    | CanonicalBlock::Thinking { .. }
+                    | CanonicalBlock::Unmodeled(_) => {}
                 }
             }
 
             let parts = encode_content_parts(&blocks, &message.role);
-            if !parts.is_empty() && !(is_assistant && blocks_to_text(&blocks).is_empty()) {
+            let has_text = blocks
+                .iter()
+                .any(|block| matches!(block, CanonicalBlock::Text(text) if !text.is_empty()));
+            if !parts.is_empty() && !(is_assistant && !has_text) {
                 input.push(json!({ "role": message.role, "content": parts }));
             }
         }
@@ -597,6 +638,17 @@ impl ModelProvider for OpenaiResponsesProvider {
                         "content": content_to_text(item.get("output").unwrap_or(&Value::Null))
                     }]
                 })),
+                Some("reasoning") => {
+                    // 思考正文在 `summary[].text`（完整思考在 `content[].text`）。
+                    // 以前整个 reasoning item 都被丢掉，跨协议时模型的思考历史就断了。
+                    let text = reasoning_text(item);
+                    if !text.is_empty() {
+                        messages.push(json!({
+                            "role": "assistant",
+                            "content": [{ "type": "thinking", "thinking": text }]
+                        }));
+                    }
+                }
                 _ => {
                     let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
                     let mut blocks: Vec<Value> = Vec::new();
@@ -622,8 +674,14 @@ impl ModelProvider for OpenaiResponsesProvider {
                                             .and_then(Value::as_str)
                                             .unwrap_or_default();
                                         // data: 收成 base64 source，http(s) 原样存 url source（A4）。
-                                        if let Some(source) = image_source_from_url(url) {
+                                        if let Some(source) = source_from_url(url) {
                                             blocks.push(json!({ "type": "image", "source": source }));
+                                        }
+                                    }
+                                    Some("input_file") => {
+                                        // 文档：Responses 的 input_file → 规范 document。
+                                        if let Some(block) = document_from_input_file(part) {
+                                            blocks.push(block.to_value());
                                         }
                                     }
                                     _ => {}
@@ -632,7 +690,23 @@ impl ModelProvider for OpenaiResponsesProvider {
                         }
                         _ => {}
                     }
-                    if !blocks.is_empty() {
+                    if blocks.is_empty() {
+                        continue;
+                    }
+                    // `system` / `developer` 不是规范 messages 的角色（规范只承载 user / assistant，
+                    // 与 Completions 入站的收口口径一致）。留成消息会在跨协议时被 Completions
+                    // 降级成 user，或被 Anthropic 当非法 role 拒掉（它只收 user / assistant）。
+                    if matches!(role, "system" | "developer") {
+                        let text = blocks
+                            .iter()
+                            .filter_map(|block| block.get("text"))
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if !text.is_empty() {
+                            system_parts.push(text);
+                        }
+                    } else {
                         messages.push(json!({ "role": role, "content": blocks }));
                     }
                 }

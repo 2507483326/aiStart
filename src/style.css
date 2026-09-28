@@ -43,6 +43,9 @@
      canvas 侧 withAlpha 只解析这两种格式，写 oklch 会丢透明度。 */
   --backdrop-label: #475569; /* slate-600：网格线 / 地形基底 */
   --backdrop-accent: #0ea5e9; /* sky-500：地形峰顶 + 鼠标微光 */
+  /* 文本选中高亮。不能复用 --accent/--muted 这类「贴近背景」的中性色，
+     否则浅色下几乎与白底重合、选中等于看不见。 */
+  --selection: oklch(0.685 0.169 237 / 30%); /* sky-500 @30% */
 }
 
 .dark {
@@ -80,6 +83,7 @@
   --sidebar-ring: oklch(0.556 0 0);
   --backdrop-label: #94a3b8; /* slate-400 */
   --backdrop-accent: #38bdf8; /* sky-400 */
+  --selection: oklch(0.746 0.152 233 / 42%); /* sky-400 @42% */
 }
 
 @theme inline {
@@ -189,7 +193,8 @@
 }
 
 ::selection {
-  background: var(--accent);
+  background: var(--selection);
+  color: var(--foreground);
 }
 
 /* 尊重系统的「减少动态效果」偏好 */
