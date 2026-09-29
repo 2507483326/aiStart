@@ -166,9 +166,10 @@ pub(crate) fn same_protocol(inbound: ModelFormat, config: &ModelConfig) -> bool 
 ```
 
 1. **请求侧** `encode_upstream_request`：同协议走 `encode_request_passthrough`——以 `client_raw`
-   为底，只改上游模型名、补默认输出上限（客户端没写时）、仅在 `is_dirty("system")` 时重写
-   system 落点、删除 `_canonical`。客户端的扩展键（OpenRouter 的 `provider`/`models`/`route`、
-   message 的 `name`、`logit_bias`、`stop` 原字段名……）原样带到上游。
+   为底，只改上游模型名、仅在 `is_dirty("system")` 时重写 system 落点、删除 `_canonical`。
+   客户端没给输出上限就不写——直通语义是「等价直连」，网关不替客户端设上限。
+   客户端的扩展键（OpenRouter 的 `provider`/`models`/`route`、message 的 `name`、
+   `logit_bias`、`stop` 原字段名……）原样带到上游。
 2. **响应侧（非流式）** `encode_client_response`：同协议直接回上游原文，`decode_response`
    只用于记账。跨协议才把规范响应重建成客户端协议形状。
 3. **流侧**：`SseFrame { event, data, raw }`（`gateway/sse.rs`）在解析层保留每一帧的原文，
@@ -587,6 +588,10 @@ Anthropic 核心的几种块，编码侧靠 `_ => {}` 兜底。本轮把这一�
 - Completions 的 `file` part 只有 `file_data` / `file_id` 两个来源，**没有 url 字段**；
   Anthropic 的 `text` / `content` 源在 Responses / Completions 也没有对应形状——这三种
   落不了地，只能丢（形状不存在，不是能力猜测）。
+- `response_format` 的 `json_schema` 跨协议到 **Completions** 时丢弃：Chat Completions 只认
+  `text` / `json_object`，多数网关收到 `json_schema` 会 400 把整条请求废掉（与 CC Switch 同
+  口径：表达不了就丢，而不是把请求打挂）；`json_object` / `text` 仍照发。Anthropic 的
+  `output_config.format` 与 Responses 的 `text.format` 原生支持 `json_schema`，不受影响。
 - 无 `signature` 的 `thinking` 构不成合法的 Anthropic 输入块（输入侧要求 signature），
   跨协议合成出来的思考会被编码器剔除（`anthropic_messages::strip_unsigned_thinking`）。
 - `thinking` → Responses **请求**方向不支持：input 的 `reasoning` item 需要 `id` /

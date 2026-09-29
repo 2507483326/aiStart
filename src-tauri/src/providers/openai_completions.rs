@@ -175,13 +175,6 @@ fn canonical_tool_choice(value: &Value) -> Option<Value> {
     }
 }
 
-/// 客户端有没有给出输出上限（`max_tokens` / `max_completion_tokens`；`null` 或非法值都算没给）。
-fn has_output_limit(payload: &Map<String, Value>) -> bool {
-    ["max_tokens", "max_completion_tokens"]
-        .iter()
-        .any(|key| payload.get(*key).is_some_and(|value| value.as_u64().is_some()))
-}
-
 /// 把规范里的 system 写成 completions 的 system 消息：清掉客户端原有的 system/developer 消息，
 /// 在队首放一条（位置与重建路径一致）。只在过滤器改写过后调用——此时 system 是网关接管的字段，
 /// 与重建路径一样按纯文本落地。
@@ -345,16 +338,16 @@ impl ModelProvider for OpenaiCompletionsProvider {
         let mut payload = Map::new();
         payload.insert("model".into(), Value::String(cfg.model.clone()));
         payload.insert("messages".into(), Value::Array(messages));
-        // 输出上限：客户端原本用 max_completion_tokens 就原样回它——OpenAI 的 max_tokens 已弃用，
-        // 且与 o 系列不兼容（上游会直接报错）。
-        let max_tokens = body
-            .max_tokens
-            .unwrap_or(crate::domain::model::DEFAULT_MAX_TOKENS);
-        let max_tokens_field = match body.canonical.max_tokens_field {
-            Some(MaxTokensField::MaxCompletionTokens) => "max_completion_tokens",
-            _ => "max_tokens",
-        };
-        payload.insert(max_tokens_field.into(), json!(max_tokens));
+        // 输出上限：只有客户端给了才写，没给就不写、交给上游自己的默认值（网关替客户端设上限
+        // 会把长回答 / 思考量大的回答悄悄截断）。客户端原本用 max_completion_tokens 就原样回它
+        // ——OpenAI 的 max_tokens 已弃用，且与 o 系列不兼容（上游会直接报错）。
+        if let Some(max_tokens) = body.max_tokens {
+            let max_tokens_field = match body.canonical.max_tokens_field {
+                Some(MaxTokensField::MaxCompletionTokens) => "max_completion_tokens",
+                _ => "max_tokens",
+            };
+            payload.insert(max_tokens_field.into(), json!(max_tokens));
+        }
 
         if let Some(tools) = &body.tools {
             if !tools.is_empty() {
@@ -374,6 +367,18 @@ impl ModelProvider for OpenaiCompletionsProvider {
             wire::profile(ModelFormat::OpenaiCompletions),
             Fill::Overwrite,
         );
+
+        // 结构化输出：Chat Completions 只认 `text` / `json_object`。`json_schema` 是 OpenAI 的
+        // 原生扩展，多数中转/网关（DeepSeek 等）收到会 400 把整条请求废掉——规范层表达不了就丢弃
+        // （与 CC Switch 同口径），而不是把请求打挂。
+        if payload
+            .get("response_format")
+            .and_then(|value| value.get("type"))
+            .and_then(Value::as_str)
+            == Some("json_schema")
+        {
+            payload.remove("response_format");
+        }
 
         // 上游只有收到 include_usage 才会在流末尾上报 usage（OpenAI 官方接口如此），否则本地与客户端都拿不到。
         if body.stream && body.canonical.include_usage {
@@ -805,13 +810,7 @@ impl ModelProvider for OpenaiCompletionsProvider {
         let mut payload = client.clone();
 
         payload.insert("model".into(), Value::String(cfg.model.clone()));
-        // 客户端两个上限字段都没给时补默认值（与重建路径一致，否则同协议请求会变成不限长）。
-        if !has_output_limit(&payload) {
-            payload.insert(
-                "max_tokens".into(),
-                json!(crate::domain::model::DEFAULT_MAX_TOKENS),
-            );
-        }
+        // 输出上限不兜底：客户端没写就原样不写，交给上游默认（直通语义 = 等价直连）。
         // 只有过滤器注入过系统提示词才重写 system 消息；没注入过就完全保留客户端的原有写法
         // （多条 system 消息、developer 角色、块数组里的 cache_control 都不动）。
         if req.is_dirty("system") {

@@ -1,6 +1,12 @@
 use serde::{Deserialize, Serialize};
 
+/// 客户端没给输出上限、而上游协议又必填时的兜底值（三个协议里只有 Anthropic Messages 的
+/// `max_tokens` 是必填）。取值保守：几乎被所有模型与网关接受；更高的默认会被输出上限较低的
+/// 网关直接 400，而那种失败不可重试。
 pub const DEFAULT_MAX_TOKENS: u32 = 8192;
+
+/// 勾选「支持 1M 上下文」的模型用的兜底输出上限——上下文够大，输出也放宽到 64k 量级。
+pub const LARGE_MAX_TOKENS: u32 = 64000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -69,6 +75,17 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
+    /// Anthropic 上游的 `max_tokens` 是必填：客户端给了就用客户端的，没给才兜默认值，且勾了
+    /// 「支持 1M 上下文」的模型用更大的兜底值。另两个协议的输出上限是可选的，一律不兜——
+    /// 替客户端设上限会把长回答 / 思考量大的回答悄悄截断。
+    pub fn anthropic_max_tokens(&self, requested: Option<u32>) -> u32 {
+        requested.unwrap_or(if self.supports_1m {
+            LARGE_MAX_TOKENS
+        } else {
+            DEFAULT_MAX_TOKENS
+        })
+    }
+
     pub fn completion_url(&self) -> String {
         let base = self.base_url.trim_end_matches('/');
         let path = match self.format {

@@ -66,11 +66,11 @@ impl ModelProvider for AnthropicMessagesProvider {
         );
 
         object.insert("model".into(), Value::String(cfg.model.clone()));
+        // Anthropic 的 `max_tokens` 是必填：客户端没给就兜默认值，勾了「支持 1M 上下文」的模型
+        // 用更大的兜底值（见 `ModelConfig::anthropic_max_tokens`）。
         object.insert(
             "max_tokens".into(),
-            json!(body
-                .max_tokens
-                .unwrap_or(crate::domain::model::DEFAULT_MAX_TOKENS)),
+            json!(cfg.anthropic_max_tokens(body.max_tokens)),
         );
 
         // metadata / response_format / reasoning_effort / parallel_tool_calls 的规范名已由
@@ -135,7 +135,7 @@ impl ModelProvider for AnthropicMessagesProvider {
         {
             payload.insert(
                 "max_tokens".into(),
-                json!(crate::domain::model::DEFAULT_MAX_TOKENS),
+                json!(cfg.anthropic_max_tokens(None)),
             );
         }
         // 只有过滤器注入过系统提示词才重写 system；没注入过就保留客户端原样

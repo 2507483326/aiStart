@@ -277,12 +277,11 @@ impl ModelProvider for OpenaiResponsesProvider {
         let mut payload = Map::new();
         payload.insert("model".into(), Value::String(cfg.model.clone()));
         payload.insert("input".into(), Value::Array(input));
-        payload.insert(
-            "max_output_tokens".into(),
-            json!(body
-                .max_tokens
-                .unwrap_or(crate::domain::model::DEFAULT_MAX_TOKENS)),
-        );
+        // 输出上限：客户端给了才写（Responses 的 `max_output_tokens` 可选），没给就不写、
+        // 交给上游自己的默认值——网关替客户端设上限会把长回答 / 思考量大的回答悄悄截断。
+        if let Some(max_tokens) = body.max_tokens {
+            payload.insert("max_output_tokens".into(), json!(max_tokens));
+        }
 
         if let Some(system) = &body.system {
             let text = system.plain_text();
@@ -333,15 +332,7 @@ impl ModelProvider for OpenaiResponsesProvider {
         let mut payload = client.clone();
 
         payload.insert("model".into(), Value::String(cfg.model.clone()));
-        if !payload
-            .get("max_output_tokens")
-            .is_some_and(|value| value.as_u64().is_some())
-        {
-            payload.insert(
-                "max_output_tokens".into(),
-                json!(crate::domain::model::DEFAULT_MAX_TOKENS),
-            );
-        }
+        // 输出上限不兜底：客户端没写就原样不写，交给上游默认（直通语义 = 等价直连）。
         // 只有过滤器注入过系统提示词才重写 instructions；没注入过就保留客户端原样。
         if req.is_dirty("system") {
             let text = req

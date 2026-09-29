@@ -153,7 +153,7 @@ return provider.encode_request(config, request)   // 回退到规范层重建
 
 - **同协议快路**（`encode_request_passthrough`）：只有两个 OpenAI provider 实现（返回 `Some`）；
   以 `client_raw` 为底，只改三处——上游模型名、被过滤器改过的字段（system / instructions）、
-  删除 `_canonical` 内部层；客户端两个输出上限字段都没给时补 `DEFAULT_MAX_TOKENS`。
+  删除 `_canonical` 内部层；客户端没给输出上限就不写，交给上游默认。
 - **Anthropic provider** 不实现快路（返回 `None`），走 `encode_request`：`raw` 为底 +
   `Fill::IfAbsent` 补字段（保住 `tools` 上的 `cache_control` 等扩展）+ 按 Anthropic 写法补
   `metadata`/`tool_choice`/`output_config`——结果**等价于直通**。

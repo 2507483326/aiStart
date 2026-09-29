@@ -973,7 +973,8 @@ fn canonical_fields_are_forwarded_per_protocol() {
     assert_eq!(encoded["metadata"]["user_id"], "u1");
     assert_eq!(encoded["parallel_tool_calls"], false);
     assert_eq!(encoded["reasoning_effort"], "high");
-    assert_eq!(encoded["response_format"]["type"], "json_schema");
+    // json_schema 不被转发：上游（DeepSeek 等）收到会 400，整条请求作废。
+    assert!(encoded.get("response_format").is_none());
     assert_eq!(encoded["tool_choice"]["function"]["name"], "lookup");
     assert_eq!(encoded["stop"][0], "END");
     assert_eq!(encoded["max_completion_tokens"], 256);
@@ -1131,7 +1132,8 @@ fn anthropic_inbound_hidden_fields_survive_cross_protocol() {
     assert_eq!(encoded["text"]["format"]["schema"]["type"], "object");
     assert_eq!(encoded["tool_choice"], json!("required"));
 
-    // → Completions 出站：any → required，format 原形状透传
+    // → Completions 出站：any → required；`json_schema` 不被转发——Chat Completions 只认
+    // text / json_object，上游（DeepSeek 等）收到会 400 把整条请求废掉。
     let encoded = provider_for(ModelFormat::OpenaiCompletions)
         .encode_request(
             &model(ModelFormat::OpenaiCompletions, "https://api.openai.com/v1"),
@@ -1139,7 +1141,7 @@ fn anthropic_inbound_hidden_fields_survive_cross_protocol() {
         )
         .unwrap();
     assert_eq!(encoded["tool_choice"], "required");
-    assert_eq!(encoded["response_format"]["type"], "json_schema");
+    assert!(encoded.get("response_format").is_none());
 
     // thinking 预算式（没有 output_config.effort）→ 档位映射：4k → low
     let inbound = provider_for(ModelFormat::AnthropicMessages)
@@ -1503,11 +1505,91 @@ fn responses_passthrough_keeps_client_extensions() {
     assert_eq!(encoded["include"][0], "reasoning.encrypted_content");
     assert_eq!(encoded["truncation"], "auto");
     assert_eq!(encoded["input"], "hi");
-    assert_eq!(
-        encoded["max_output_tokens"],
-        json!(crate::domain::model::DEFAULT_MAX_TOKENS)
-    );
+    // 客户端没给输出上限就不写：直通 = 等价直连，不替客户端设上限。
+    assert!(encoded.get("max_output_tokens").is_none());
     assert!(encoded.get("_canonical").is_none());
+}
+
+/// 输出上限只有 Anthropic 必填、才兜底，且勾了「支持 1M 上下文」的模型用更大的兜底值；
+/// 两个 OpenAI 协议客户端没给就不写——不替客户端设上限，避免把长回答 / 思考量大的回答截断。
+#[test]
+fn output_ceiling_is_defaulted_only_for_anthropic_and_scales_with_supports_1m() {
+    use crate::domain::model::{DEFAULT_MAX_TOKENS, LARGE_MAX_TOKENS};
+
+    let plain = request(json!({
+        "model": "m",
+        "messages": [{ "role": "user", "content": "hi" }]
+    }));
+
+    for format in [ModelFormat::OpenaiCompletions, ModelFormat::OpenaiResponses] {
+        let encoded = provider_for(format)
+            .encode_request(&model(format, "https://example.com/v1"), &plain)
+            .expect("重建编码不该失败");
+        for key in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
+            assert!(
+                encoded.get(key).is_none(),
+                "{} 不该替客户端兜输出上限（{key}）",
+                format.as_str()
+            );
+        }
+    }
+
+    let mut config = model(ModelFormat::AnthropicMessages, "https://api.anthropic.com");
+    let encoded = provider_for(ModelFormat::AnthropicMessages)
+        .encode_request(&config, &plain)
+        .expect("Anthropic 重建编码不该失败");
+    assert_eq!(encoded["max_tokens"], json!(DEFAULT_MAX_TOKENS));
+
+    config.supports_1m = true;
+    let encoded = provider_for(ModelFormat::AnthropicMessages)
+        .encode_request(&config, &plain)
+        .expect("Anthropic 重建编码不该失败");
+    assert_eq!(encoded["max_tokens"], json!(LARGE_MAX_TOKENS));
+
+    // 客户端自己给了就照用，与 1M 开关无关。
+    let explicit = request(json!({
+        "model": "m",
+        "max_tokens": 1234,
+        "messages": [{ "role": "user", "content": "hi" }]
+    }));
+    let encoded = provider_for(ModelFormat::AnthropicMessages)
+        .encode_request(&config, &explicit)
+        .expect("Anthropic 重建编码不该失败");
+    assert_eq!(encoded["max_tokens"], json!(1234));
+}
+
+/// 跨协议重建到 Chat Completions 时丢弃 `json_schema`（上游收到会 400 废掉整条请求，
+/// 与 CC Switch 同口径），`json_object` 仍照发。
+#[test]
+fn completions_drops_json_schema_response_format() {
+    let encode = |inbound: Value| {
+        let request = provider_for(ModelFormat::OpenaiCompletions)
+            .decode_request(inbound)
+            .expect("Completions 请求应该能解析");
+        provider_for(ModelFormat::OpenaiCompletions)
+            .encode_request(
+                &model(ModelFormat::OpenaiCompletions, "https://api.openai.com/v1"),
+                &request,
+            )
+            .expect("重建编码不该失败")
+    };
+
+    let json_object = encode(json!({
+        "model": "gpt-4o",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "response_format": { "type": "json_object" }
+    }));
+    assert_eq!(json_object["response_format"]["type"], "json_object");
+
+    let json_schema = encode(json!({
+        "model": "gpt-4o",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": { "name": "r", "schema": { "type": "object" }, "strict": true }
+        }
+    }));
+    assert!(json_schema.get("response_format").is_none());
 }
 
 /// 没有保留客户端原文（内部构造的请求）时快路不参与，也不会有协议提供快路给非本协议形状的报文。
