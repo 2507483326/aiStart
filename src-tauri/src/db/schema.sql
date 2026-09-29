@@ -1,5 +1,5 @@
 -- =====================================================================
--- AI Start SQLite schema v12（db_schema_version = 12）
+-- AI Start SQLite schema v13（db_schema_version = 13）
 -- v1 首次落库：app_settings / models / app_model_bindings（配置与模型，取代 settings.json）、
 -- usage_detail / usage_daily_total（token 消耗，取代 usage.jsonl）、events（审计事件）、
 -- app_version_records（应用版本检查与更新记录）。
@@ -20,6 +20,8 @@
 -- v12 变更：usage_payload 的报文不再截断——移除 request_truncated / upstream_request_truncated /
 --           response_truncated 三列，入站/上游请求与响应按原样全量保存。
 --           （老库的这三列留作无用的历史列，代码不再读写；新库不再建。）
+-- v13 新增：models.max_output_tokens（客户端没给输出上限时的兜底值：勾了「支持 1M 上下文」→ 64000，
+--           否则 8192）。保存模型时随 1M 开关同步更新，老库在 db::init 里按 1M 标记回填一次。
 --
 -- 规范（对齐 eTeam：C:\eTeam\src\host\state\schema.sql）：
 --   主键 = 每张表自己的编号列，统一 INTEGER 自增（仅 schema_meta / app_settings 以 key 为主键，
@@ -170,6 +172,7 @@ CREATE TABLE IF NOT EXISTS models (
   api_key        TEXT NOT NULL DEFAULT '',     -- API Key（明文存放，与现有 settings.json 行为一致）
   model          TEXT NOT NULL,                -- 上游模型名
   supports_1m    INTEGER NOT NULL DEFAULT 0,   -- 是否支持 1M 上下文：1=支持 / 0=否
+  max_output_tokens INTEGER NOT NULL DEFAULT 8192,  -- 客户端没给输出上限时的兜底值：1M 模型 64000，其余 8192
   created_time   INTEGER NOT NULL,             -- 创建时间
   update_time    INTEGER NOT NULL              -- 更新时间
 );

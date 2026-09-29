@@ -11,7 +11,7 @@ use crate::error::{AppError, AppResult};
 pub const SCHEMA_SQL: &str = include_str!("schema.sql");
 
 /// 当前 schema 版本号，写入 schema_meta.db_schema_version。
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 /// **读连接**：所有查询都走它（`with_conn`）。迁移跑完后置 `query_only = ON`，此后只能读。
 /// 写全部交给下面的写线程——两个连接各司其职，WAL 下读不挡写。
@@ -85,6 +85,10 @@ pub fn init(dir: &Path) -> AppResult<()> {
     let _ = ensure_column(&connection, "usage_payload", "upstream_request", "TEXT")?;
     // v9：入站 HTTP header 原样入库（用户确认不脱敏）。
     let _ = ensure_column(&connection, "usage_payload", "inbound_headers", "TEXT")?;
+
+    // v13：models 补「输出上限兜底值」。老库按 1M 标记回填一次，与新建模型同一口径；
+    // 此后每次保存模型都由 settings::upsert 按 1M 开关重算。
+    add_model_output_ceiling(&connection)?;
 
     // v10：每日汇总表补三列。只要有一列是这次新加的，就把历史回填一次——汇总查询此后只读这张表，
     // 不再依赖「每次重查 usage_detail」，所以旧库必须先补齐它漏掉的历史累计值。
@@ -281,6 +285,20 @@ fn table_has_column(connection: &Connection, table: &str, column: &str) -> AppRe
     Ok(exists)
 }
 
+/// v13 迁移：models 补「输出上限兜底值」，老库按 1M 标记回填一次（1M 行 64000，其余 8192）。
+fn add_model_output_ceiling(connection: &Connection) -> AppResult<()> {
+    if ensure_column(
+        connection,
+        "models",
+        "max_output_tokens",
+        "INTEGER NOT NULL DEFAULT 8192",
+    )? {
+        connection
+            .execute_batch("UPDATE models SET max_output_tokens = 64000 WHERE supports_1m <> 0")?;
+    }
+    Ok(())
+}
+
 /// v7 迁移第一步：旧版 app_version_records（自增主键、追加式历史）改名为 legacy，
 /// 让 schema.sql 建出「每个应用一行」的新表。
 fn rename_legacy_app_version_records(connection: &Connection) -> AppResult<()> {
@@ -409,11 +427,41 @@ mod tests {
         update_time INTEGER NOT NULL)";
 
     fn migrate(connection: &Connection) -> AppResult<()> {
+        add_model_output_ceiling(connection)?;
         rename_legacy_app_version_records(connection)?;
         rename_legacy_daily_total(connection)?;
         connection.execute_batch(SCHEMA_SQL)?;
         copy_legacy_app_version_records(connection)?;
         copy_legacy_daily_total(connection)
+    }
+
+    /// v13：老库的 models 缺 max_output_tokens，补列后按 1M 标记回填（1M 行 64000，其余 8192）。
+    #[test]
+    fn v13_adds_and_backfills_the_model_output_ceiling() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE models (\
+                   model_id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, format TEXT NOT NULL,\
+                   base_url TEXT NOT NULL, api_key TEXT NOT NULL DEFAULT '', model TEXT NOT NULL,\
+                   supports_1m INTEGER NOT NULL DEFAULT 0, created_time INTEGER NOT NULL,\
+                   update_time INTEGER NOT NULL);\
+                 INSERT INTO models (name, format, base_url, model, supports_1m, created_time, update_time) \
+                 VALUES ('big', 'anthropic-messages', 'https://api.anthropic.com', 'c', 1, 1, 1),\
+                        ('small', 'anthropic-messages', 'https://api.anthropic.com', 'c2', 0, 1, 1);",
+            )
+            .unwrap();
+
+        migrate(&connection).unwrap();
+
+        let rows: Vec<(String, i64)> = connection
+            .prepare("SELECT name, max_output_tokens FROM models ORDER BY name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(rows, vec![("big".into(), 64000), ("small".into(), 8192)]);
     }
 
     #[test]

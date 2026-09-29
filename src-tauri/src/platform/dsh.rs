@@ -320,6 +320,7 @@ mod tests {
                 api_key: "sk-test".into(),
                 model: "deepseek/deepseek-v4-flash".into(),
                 supports_1m: false,
+                max_output_tokens: crate::domain::model::DEFAULT_MAX_TOKENS,
                 created_at: String::new(),
                 updated_at: String::new(),
             },

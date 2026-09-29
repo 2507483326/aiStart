@@ -185,6 +185,20 @@ pub(crate) fn same_protocol(inbound: ModelFormat, config: &ModelConfig) -> bool 
 即 `emit_initial = !passthrough && !upstream_provider.is_passthrough()`）。原先的缺陷是缺了
 前者，不是后者维度用错。
 
+### 5.2 输出上限与 thinking budget 整流（2026-09-29）
+
+- **输出上限的来源**：`models.max_output_tokens` 是「客户端没给输出上限」时的兜底值，默认口径
+  = 勾了「支持 1M 上下文」→ 64000，否则 8192。**保存模型时随 1M 开关重算**
+  （`settings::upsert`），老库在 `db::init` 里按 1M 标记回填一次。客户端自己给了就一律用客户端的。
+- **只有 Anthropic 才兜**：Anthropic Messages 的 `max_tokens` 必填，才用这个值兜底；两个 OpenAI
+  协议的输出上限是可选的，网关**一律不写**——替客户端设上限会把长回答 / 思考量大的回答悄悄截断
+  （CC Switch 的 Codex→Chat 路径同样不写默认值）。
+- **thinking budget 整流**（`gateway/server.rs::dispatch`）：上游因为 `thinking.budget_tokens` 的
+  约束报错（非 2xx 且报文同时提到 thinking 与 budget_tokens）时，把 `thinking` 规整成
+  `enabled` + 32000、`max_tokens` 不足 32001 时抬到 64000，然后**重试一次**；只对 Anthropic
+  上游生效（另两个协议没有这个参数）。判定比 CC Switch 略宽——额外覆盖「`max_tokens` 必须大于
+  `thinking.budget_tokens`」，而那正是抬升能救的场景；整流后的报文就是实际发出去的报文（落库一致）。
+
 ## 6. 流式管道（gateway/server.rs）
 
 ```

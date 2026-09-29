@@ -533,22 +533,54 @@ fn upstream_timeout_error(config: &ModelConfig) -> AppError {
     ))
 }
 
-/// 把规范请求编码成上游协议原生报文并发起请求；成功时一并返回编码后的请求体（供落库展示）。
-async fn dispatch(
-    inbound: ModelFormat,
-    request: &CanonicalRequest,
-    headers: &HeaderMap,
-    config: &ModelConfig,
-) -> Result<(reqwest::Response, Value), UpstreamFailure> {
-    let provider = provider_for(config.format);
-    let payload =
-        encode_upstream_request(inbound, config, request).map_err(|error| UpstreamFailure {
-            error,
-            retryable: false,
-            raw_response: None,
-        })?;
+/// thinking budget 整流（对齐 CC Switch）：上游因为 `thinking.budget_tokens` 的约束报错时，
+/// 把思考预算钉到 32000、并把 `max_tokens` 抬到 64000，然后重试一次。
+/// 只对 Anthropic 上游有意义——另两个协议没有 `thinking.budget_tokens` 这个参数。
+const RECTIFY_THINKING_BUDGET: u64 = 32000;
+const RECTIFY_MAX_TOKENS: u64 = 64000;
 
-    let mut builder = http_client().post(provider.endpoint(config)).json(&payload);
+/// 上游报错是不是「thinking budget 约束」。
+///
+/// 判定比 CC Switch 略宽：它只认 `budget_tokens ... >= 1024`，这里只要同时提到 thinking 与
+/// budget_tokens 就算——另一种常见报错是「`max_tokens` 必须大于 `thinking.budget_tokens`」，
+/// 而那正是「抬升 max_tokens」能救的场景。
+fn is_thinking_budget_error(detail: &str) -> bool {
+    let lower = detail.to_lowercase();
+    lower.contains("thinking")
+        && (lower.contains("budget_tokens") || lower.contains("budget tokens"))
+}
+
+/// 就地整流请求体：`thinking` 规整成 enabled + 32000，`max_tokens` 不够放思考预算时抬到 64000。
+fn rectify_thinking_budget(payload: &mut Value) {
+    if !payload.get("thinking").is_some_and(Value::is_object) {
+        payload["thinking"] = json!({});
+    }
+    if let Some(thinking) = payload.get_mut("thinking").and_then(Value::as_object_mut) {
+        thinking.insert("type".into(), Value::String("enabled".into()));
+        thinking.insert(
+            "budget_tokens".into(),
+            Value::Number(RECTIFY_THINKING_BUDGET.into()),
+        );
+    }
+    let too_small = match payload.get("max_tokens").and_then(Value::as_u64) {
+        Some(value) => value <= RECTIFY_THINKING_BUDGET,
+        None => true,
+    };
+    if too_small {
+        payload["max_tokens"] = Value::Number(RECTIFY_MAX_TOKENS.into());
+    }
+}
+
+/// 组装并发出一次上游请求（只负责发，不判定状态码），供 `dispatch` 的整流重试复用。
+async fn send_upstream(
+    format: ModelFormat,
+    config: &ModelConfig,
+    headers: &HeaderMap,
+    payload: &Value,
+    streaming: bool,
+) -> Result<reqwest::Response, UpstreamFailure> {
+    let provider = provider_for(format);
+    let mut builder = http_client().post(provider.endpoint(config)).json(payload);
     for (name, value) in provider.headers(config) {
         builder = builder.header(name, value);
     }
@@ -564,7 +596,6 @@ async fn dispatch(
     // 超时（B1）：非流式限整个请求（reqwest 的请求级超时覆盖建连到响应体读完）；
     // 流式不能设它——长生成合法，请求级超时会把流中途掐死，改为只限「等响应头」
     //（响应体的首帧等待在 `first_frame_timeout` 里）。
-    let streaming = request.stream();
     if !streaming {
         builder = builder.timeout(UPSTREAM_TIMEOUT);
     }
@@ -577,17 +608,49 @@ async fn dispatch(
     } else {
         builder.send().await.map_err(AppError::from)
     };
-    let response = send.map_err(|error| UpstreamFailure {
+    send.map_err(|error| UpstreamFailure {
         error,
         // 超时与网络错误同类：换一个模型确实可能通，值得事后探测。
         retryable: true,
         raw_response: None,
-    })?;
+    })
+}
 
-    let status = response.status();
-    if !status.is_success() {
+/// 把规范请求编码成上游协议原生报文并发起请求；成功时一并返回编码后的请求体（供落库展示）。
+async fn dispatch(
+    inbound: ModelFormat,
+    request: &CanonicalRequest,
+    headers: &HeaderMap,
+    config: &ModelConfig,
+) -> Result<(reqwest::Response, Value), UpstreamFailure> {
+    let mut payload =
+        encode_upstream_request(inbound, config, request).map_err(|error| UpstreamFailure {
+            error,
+            retryable: false,
+            raw_response: None,
+        })?;
+
+    let streaming = request.stream();
+    // thinking budget 约束报错会整流后重试一次；整流后的报文就是实际发出去的报文，
+    // 所以成功时返回的是它（落库展示与真实请求一致）。
+    let mut rectified = false;
+    loop {
+        let response = send_upstream(config.format, config, headers, &payload, streaming).await?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok((response, payload));
+        }
+
         // 上游错误响应体完整保留（截断交给落库时的统一上限），错误文案只取前 400 字。
         let detail = response.text().await.unwrap_or_default();
+        if !rectified
+            && config.format == ModelFormat::AnthropicMessages
+            && is_thinking_budget_error(&detail)
+        {
+            rectified = true;
+            rectify_thinking_budget(&mut payload);
+            continue;
+        }
         let retryable =
             status.is_server_error() || matches!(status.as_u16(), 401 | 403 | 404 | 408 | 429);
         let error = AppError::Message(format!(
@@ -602,8 +665,6 @@ async fn dispatch(
             raw_response: Some(detail),
         });
     }
-
-    Ok((response, payload))
 }
 
 /// 流式请求的记账快照（B3）。
@@ -1148,9 +1209,38 @@ mod tests {
             api_key: "sk-test".into(),
             model: "upstream-model".into(),
             supports_1m: false,
+            max_output_tokens: crate::domain::model::DEFAULT_MAX_TOKENS,
             created_at: String::new(),
             updated_at: String::new(),
         }
+    }
+
+    /// thinking budget 约束报错才整流：预算钉到 32000、max_tokens 抬到 64000；
+    /// 认不出的错误不动，本来就够大的 max_tokens 也不动。
+    #[test]
+    fn thinking_budget_errors_are_rectified_to_the_default_headroom() {
+        // 认得出的两种文案：`>= 1024` 与「max_tokens 必须大于 budget」。
+        assert!(is_thinking_budget_error(
+            "thinking.budget_tokens: Input should be greater than or equal to 1024"
+        ));
+        assert!(is_thinking_budget_error(
+            "max_tokens: Input should be greater than thinking.budget_tokens"
+        ));
+        // 认不出的：不该误触发。
+        assert!(!is_thinking_budget_error("rate limit exceeded"));
+        assert!(!is_thinking_budget_error("budget_tokens must be a number"));
+
+        let mut payload = json!({ "model": "c", "max_tokens": 1024 });
+        rectify_thinking_budget(&mut payload);
+        assert_eq!(payload["thinking"]["type"], json!("enabled"));
+        assert_eq!(payload["thinking"]["budget_tokens"], json!(32000));
+        assert_eq!(payload["max_tokens"], json!(64000));
+
+        // 本来就是大上限：只补 thinking，不动 max_tokens。
+        let mut payload = json!({ "model": "c", "max_tokens": 100_000 });
+        rectify_thinking_budget(&mut payload);
+        assert_eq!(payload["max_tokens"], json!(100_000));
+        assert_eq!(payload["thinking"]["budget_tokens"], json!(32000));
     }
 
     fn accounting() -> StreamAccounting {
@@ -1408,6 +1498,7 @@ mod tests {
                     api_key: "sk-test".into(),
                     model: model.into(),
                     supports_1m: false,
+                    max_output_tokens: None,
                 });
                 settings.active_model_id = Some(model.id);
             })

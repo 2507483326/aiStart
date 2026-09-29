@@ -143,6 +143,12 @@ impl Settings {
             .map(|index| self.models[index].created_at.clone())
             .unwrap_or_else(|| now.clone());
 
+        // 输出上限的兜底值跟着「支持 1M 上下文」开关走：用户改这个开关，保存时这里就同步更新
+        //（前端不单独编辑这个数）。只有内部调用显式给了值才用显式值。
+        let max_output_tokens = input
+            .max_output_tokens
+            .unwrap_or_else(|| crate::domain::model::default_max_output_tokens(input.supports_1m));
+
         let config = ModelConfig {
             id,
             name: input.name,
@@ -151,6 +157,7 @@ impl Settings {
             api_key: input.api_key,
             model: input.model,
             supports_1m: input.supports_1m,
+            max_output_tokens,
             created_at,
             updated_at: now,
         };
@@ -233,7 +240,8 @@ fn load() -> AppResult<Settings> {
 
 fn load_models(connection: &Connection) -> AppResult<Vec<ModelConfig>> {
     let mut statement = connection.prepare(
-        "SELECT model_id, name, format, base_url, api_key, model, supports_1m, created_time, update_time \
+        "SELECT model_id, name, format, base_url, api_key, model, supports_1m, max_output_tokens, \
+                created_time, update_time \
          FROM models ORDER BY model_id",
     )?;
     let rows = statement.query_map([], |row| {
@@ -246,8 +254,9 @@ fn load_models(connection: &Connection) -> AppResult<Vec<ModelConfig>> {
             api_key: row.get(4)?,
             model: row.get(5)?,
             supports_1m: row.get::<_, i64>(6)? != 0,
-            created_at: db::iso_from_ms(row.get(7)?),
-            updated_at: db::iso_from_ms(row.get(8)?),
+            max_output_tokens: row.get::<_, i64>(7)? as u32,
+            created_at: db::iso_from_ms(row.get(8)?),
+            updated_at: db::iso_from_ms(row.get(9)?),
         })
     })?;
 
@@ -343,8 +352,8 @@ pub fn persist() {
         transaction.execute("DELETE FROM models", [])?;
         for model in &snapshot.models {
             transaction.execute(
-                "INSERT INTO models (model_id, name, format, base_url, api_key, model, supports_1m, created_time, update_time) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO models (model_id, name, format, base_url, api_key, model, supports_1m, max_output_tokens, created_time, update_time) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     model.id,
                     model.name,
@@ -353,6 +362,7 @@ pub fn persist() {
                     model.api_key,
                     model.model,
                     i64::from(model.supports_1m),
+                    i64::from(model.max_output_tokens),
                     db::ms_from_iso(&model.created_at).unwrap_or(now),
                     db::ms_from_iso(&model.updated_at).unwrap_or(now),
                 ],

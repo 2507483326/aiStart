@@ -131,6 +131,7 @@ fn probe_config(base_url: &str, api_key: &str, format: ModelFormat) -> ModelConf
         api_key: api_key.to_string(),
         model: String::new(),
         supports_1m: false,
+        max_output_tokens: crate::domain::model::DEFAULT_MAX_TOKENS,
         created_at: String::new(),
         updated_at: String::new(),
     }

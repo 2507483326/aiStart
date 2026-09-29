@@ -19,6 +19,7 @@ fn model(format: ModelFormat, base_url: &str) -> ModelConfig {
         api_key: "sk-test".into(),
         model: "upstream-model".into(),
         supports_1m: false,
+        max_output_tokens: crate::domain::model::DEFAULT_MAX_TOKENS,
         created_at: String::new(),
         updated_at: String::new(),
     }
@@ -62,6 +63,7 @@ fn resolve_target_settings() -> Settings {
             api_key: String::new(),
             model: name.into(),
             supports_1m: false,
+            max_output_tokens: None,
         });
     }
     settings.active_model_id = Some(2);
@@ -1510,10 +1512,10 @@ fn responses_passthrough_keeps_client_extensions() {
     assert!(encoded.get("_canonical").is_none());
 }
 
-/// 输出上限只有 Anthropic 必填、才兜底，且勾了「支持 1M 上下文」的模型用更大的兜底值；
+/// 输出上限只有 Anthropic 必填、才兜底，且兜底值取自模型字段（1M 模型保存下来是 64000）；
 /// 两个 OpenAI 协议客户端没给就不写——不替客户端设上限，避免把长回答 / 思考量大的回答截断。
 #[test]
-fn output_ceiling_is_defaulted_only_for_anthropic_and_scales_with_supports_1m() {
+fn output_ceiling_is_defaulted_only_for_anthropic_and_reads_the_model_field() {
     use crate::domain::model::{DEFAULT_MAX_TOKENS, LARGE_MAX_TOKENS};
 
     let plain = request(json!({
@@ -1540,13 +1542,14 @@ fn output_ceiling_is_defaulted_only_for_anthropic_and_scales_with_supports_1m() 
         .expect("Anthropic 重建编码不该失败");
     assert_eq!(encoded["max_tokens"], json!(DEFAULT_MAX_TOKENS));
 
-    config.supports_1m = true;
+    // 兜底值直接读模型字段（1M 模型保存下来就是 64000）。
+    config.max_output_tokens = LARGE_MAX_TOKENS;
     let encoded = provider_for(ModelFormat::AnthropicMessages)
         .encode_request(&config, &plain)
         .expect("Anthropic 重建编码不该失败");
     assert_eq!(encoded["max_tokens"], json!(LARGE_MAX_TOKENS));
 
-    // 客户端自己给了就照用，与 1M 开关无关。
+    // 客户端自己给了就照用，与模型的兜底值无关。
     let explicit = request(json!({
         "model": "m",
         "max_tokens": 1234,
@@ -1556,6 +1559,35 @@ fn output_ceiling_is_defaulted_only_for_anthropic_and_scales_with_supports_1m() 
         .encode_request(&config, &explicit)
         .expect("Anthropic 重建编码不该失败");
     assert_eq!(encoded["max_tokens"], json!(1234));
+}
+
+/// 改「支持 1M 上下文」开关时，模型的输出上限兜底值跟着同步更新（保存时重算）。
+#[test]
+fn toggling_supports_1m_resyncs_the_output_ceiling() {
+    use crate::domain::model::{DEFAULT_MAX_TOKENS, LARGE_MAX_TOKENS, ModelInput};
+
+    let input = |id: Option<i64>, supports_1m: bool| ModelInput {
+        id,
+        name: "M".into(),
+        format: ModelFormat::AnthropicMessages,
+        base_url: "https://api.anthropic.com".into(),
+        api_key: "k".into(),
+        model: "claude".into(),
+        supports_1m,
+        max_output_tokens: None,
+    };
+
+    let mut settings = Settings::default();
+    let saved = settings.upsert(input(None, false));
+    assert_eq!(saved.max_output_tokens, DEFAULT_MAX_TOKENS);
+
+    // 同一行改勾 1M：兜底值跟着变成 64000。
+    let saved = settings.upsert(input(Some(saved.id), true));
+    assert_eq!(saved.max_output_tokens, LARGE_MAX_TOKENS);
+
+    // 取消勾选：变回 8192。
+    let saved = settings.upsert(input(Some(saved.id), false));
+    assert_eq!(saved.max_output_tokens, DEFAULT_MAX_TOKENS);
 }
 
 /// 跨协议重建到 Chat Completions 时丢弃 `json_schema`（上游收到会 400 废掉整条请求，
@@ -2139,6 +2171,7 @@ fn sqlite_persistence_round_trips() {
             api_key: "k".into(),
             model: "temp-model".into(),
             supports_1m: true,
+            max_output_tokens: None,
         })
     })
     .expect("model should save");
