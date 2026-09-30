@@ -832,6 +832,106 @@ impl Drop for DisconnectGuard {
     }
 }
 
+/// 非流式请求的落库上下文（B3 的非流式对照）。
+///
+/// 非流式路径要等上游把**整条响应体**读完才落库（探测类请求还带着更短的客户端超时）。客户端
+/// 等不及先断开时，hyper 会把 handler 的 future 连同这次落库一起丢弃——明细里既没有成功也没有
+/// 失败，客户端的超时在库里完全不可见。守卫靠这份上下文补一条「客户端断开」。
+struct RequestAccounting {
+    primary: String,
+    config: ModelConfig,
+    source_app: String,
+    inbound: ModelFormat,
+    started: std::time::Instant,
+    inbound_request: String,
+    inbound_headers: String,
+    /// dispatch 编码完才知道，成功后补进来（见 `set_upstream_request`）。
+    upstream_request: String,
+}
+
+impl RequestAccounting {
+    fn usage_record(&self, error: String) -> crate::usage::UsageRecord {
+        // 断连时上游的响应体还没读出来，token / 缓存量都未知：按 0 记（与流式兜底同一口径——
+        // 只记已经确定的部分）。
+        build_usage_record(
+            &self.primary,
+            &self.config,
+            &self.source_app,
+            self.inbound,
+            0,
+            0,
+            None,
+            None,
+            None,
+            self.started.elapsed().as_millis() as u64,
+            false,
+            false,
+            Some(error),
+        )
+    }
+
+    fn payload(&self) -> crate::usage::UsagePayload {
+        crate::usage::UsagePayload {
+            inbound_request: Some(self.inbound_request.clone()),
+            inbound_headers: Some(self.inbound_headers.clone()),
+            upstream_request: Some(self.upstream_request.clone()),
+            // 客户端没等到响应体就断了，这次调用没有可存的上游响应原文。
+            upstream_response: None,
+            stream: false,
+        }
+    }
+
+    /// 统计 + 明细落库。守卫的默认写入口就是它；单测注入同签名的捕获实现，免得碰真库。
+    fn record(&self, stats: &GatewayStats) {
+        let message = "客户端断开".to_string();
+        // 兜底也要计入错误统计，否则面板与明细两个口径会分叉（与流式兜底同一口径）。
+        stats.record_error(&message);
+        crate::usage::submit(&self.usage_record(message), Some(&self.payload()));
+    }
+}
+
+/// 断连兜底的写入口：生产用 `RequestAccounting::record`，单测注入捕获实现（免得碰真库）。
+type RequestWriter = fn(&RequestAccounting, &GatewayStats);
+
+/// 非流式断连守卫：语义与流式的 [`DisconnectGuard`] 一致——正常收尾、或失败已由 `route()` 落库时，
+/// 出口处先 `disarm`（放下上下文，守卫随即让位），只有 future 真被丢弃（客户端断开）才补记，不双记。
+struct RequestGuard {
+    accounting: Option<RequestAccounting>,
+    stats: Arc<GatewayStats>,
+    writer: RequestWriter,
+}
+
+impl RequestGuard {
+    fn new(accounting: RequestAccounting, stats: Arc<GatewayStats>) -> Self {
+        Self {
+            accounting: Some(accounting),
+            stats,
+            writer: |accounting, stats| accounting.record(stats),
+        }
+    }
+
+    /// 上游报文要等 dispatch 编码完才知道，届时补进上下文。
+    fn set_upstream_request(&mut self, text: &str) {
+        if let Some(accounting) = self.accounting.as_mut() {
+            accounting.upstream_request = text.to_string();
+        }
+    }
+
+    /// 认领：后续落库由调用方（成功）或 `route()`（失败）负责，守卫不再补记。
+    fn disarm(&mut self) {
+        self.accounting = None;
+    }
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        let Some(accounting) = self.accounting.take() else {
+            return;
+        };
+        (self.writer)(&accounting, &self.stats);
+    }
+}
+
 /// 入站请求体的体积自检（H2）。报错就走 `route()` 那条统一的失败路径：按入站协议的形状回 413、
 /// 记一条失败明细、计入错误统计。到了这里 body 已经全在内存里，`body_len` 就是实际长度，
 /// 不看客户端报的 Content-Length——那个可以撒谎。
@@ -899,6 +999,28 @@ async fn handle(
         config.model.clone(),
     );
 
+    // 非流式请求的断连兜底（B3 的非流式对照）：这条路径要等上游把整条响应读完才落库，而客户端
+    // 往往等不及（探测类请求带短超时）——断开时 hyper 直接丢弃整个 future，落库代码永远跑不到，
+    // 明细里既没有成功也没有失败。守卫覆盖「等响应头 + 读响应体」这两段等待；它们之后全是同步
+    // 处理，不会再被取消。每个「已由别的路径落库」的出口都先 disarm，唯有真被丢弃才补记。
+    // 流式请求不建它：那条路径由流内生成器的 `DisconnectGuard` 负责。
+    let mut non_stream_guard = (!request.stream()).then(|| {
+        RequestGuard::new(
+            RequestAccounting {
+                primary: primary.clone(),
+                config: config.clone(),
+                source_app: source_app.clone(),
+                inbound,
+                started,
+                inbound_request: inbound_request.to_string(),
+                inbound_headers: inbound_headers.to_string(),
+                // dispatch 编码完才知道，成功后补（见下面的 set_upstream_request）。
+                upstream_request: String::new(),
+            },
+            stats.clone(),
+        )
+    });
+
     let (upstream, upstream_payload) = match dispatch(inbound, &request, &headers, &config).await {
         Ok(success) => success,
         Err(failure) => {
@@ -907,6 +1029,10 @@ async fn handle(
                 retryable,
                 raw_response,
             } = failure;
+            // 失败由 route() 统一落库，守卫让位，不双记。
+            if let Some(guard) = non_stream_guard.as_mut() {
+                guard.disarm();
+            }
             // 第一个上游失败立即返回客户端；是否事后探测切换由 route() 落库后判定。
             return Err(RouteFailure {
                 error,
@@ -927,11 +1053,27 @@ async fn handle(
     let upstream_request_text = serde_json::to_string_pretty(&upstream_payload)
         .unwrap_or_else(|_| upstream_payload.to_string());
 
+    // 上游报文此时才知道，补进守卫：真断开时明细里能看到实际发出去的是什么。
+    if let Some(guard) = non_stream_guard.as_mut() {
+        guard.set_upstream_request(&upstream_request_text);
+    }
+
     let upstream_provider = provider_for(config.format);
 
     if !request.stream() {
-        let raw_response = upstream.json::<Value>().await.map_err(AppError::from)?;
-        let canonical = upstream_provider.decode_response(&config, &raw_response)?;
+        // 内部块把「等上游读完 + 解码」收成一个值：出口处无论成败都先 disarm（失败由 route() 落库、
+        // 成功由下面的 record_usage 落库，都不该再被守卫补记），唯一跳过 disarm 的路径就是 future
+        // 真被丢弃——那正是客户端断开。
+        let outcome = async {
+            let raw_response = upstream.json::<Value>().await.map_err(AppError::from)?;
+            let canonical = upstream_provider.decode_response(&config, &raw_response)?;
+            Ok::<_, AppError>((raw_response, canonical))
+        }
+        .await;
+        if let Some(guard) = non_stream_guard.as_mut() {
+            guard.disarm();
+        }
+        let (raw_response, canonical) = outcome?;
         let input_tokens = canonical
             .pointer("/usage/input_tokens")
             .and_then(Value::as_u64)
@@ -1200,6 +1342,34 @@ mod tests {
         CAPTURED.with(|captured| captured.borrow_mut().drain(..).collect())
     }
 
+    // 非流式守卫的单测替身：同样不碰真库，只记「补记了几次」。
+    thread_local! {
+        static CAPTURED_REQUESTS: std::cell::RefCell<u32> = const { std::cell::RefCell::new(0) };
+    }
+
+    fn capture_request(_accounting: &RequestAccounting, stats: &GatewayStats) {
+        // 与生产实现同款统计口径：兜底落库同样要计入面板与错误计数。
+        stats.record_error("客户端断开");
+        CAPTURED_REQUESTS.with(|captured| *captured.borrow_mut() += 1);
+    }
+
+    fn taken_requests() -> u32 {
+        CAPTURED_REQUESTS.with(|captured| std::mem::take(&mut *captured.borrow_mut()))
+    }
+
+    fn request_accounting() -> RequestAccounting {
+        RequestAccounting {
+            primary: "M".into(),
+            config: config(ModelFormat::AnthropicMessages),
+            source_app: "app".into(),
+            inbound: ModelFormat::AnthropicMessages,
+            started: std::time::Instant::now(),
+            inbound_request: "{\"model\":\"a\"}".into(),
+            inbound_headers: "{}".into(),
+            upstream_request: String::new(),
+        }
+    }
+
     fn config(format: ModelFormat) -> ModelConfig {
         ModelConfig {
             id: 1,
@@ -1302,6 +1472,68 @@ mod tests {
 
         assert!(taken().is_empty(), "常规收尾落库后守卫必须让位");
         assert_eq!(stats.snapshot().1, 0, "让位的守卫也不该记错误");
+    }
+
+    /// 非流式断连兜底（B3）：客户端等不及先断开（探测类请求带短超时，这是常态）时，hyper 会把
+    /// handler 的 future 连落库一起丢弃——守卫据上下文补一条「客户端断开」，这次超时才在明细里可见。
+    #[test]
+    fn request_guard_records_the_client_disconnect() {
+        let stats = Arc::new(GatewayStats::default());
+
+        drop(RequestGuard {
+            accounting: Some(request_accounting()),
+            stats: stats.clone(),
+            writer: capture_request,
+        });
+
+        assert_eq!(taken_requests(), 1, "断连兜底该恰好补一条");
+        assert_eq!(
+            stats.snapshot().1,
+            1,
+            "兜底也要计入错误统计，否则面板与明细两个口径分叉"
+        );
+    }
+
+    /// 成功收尾由 `record_usage` 落库、失败由 `route()` 落库——两者都先 `disarm`，守卫必须让位，
+    /// 否则每次成功请求都会双记。
+    #[test]
+    fn request_guard_stays_silent_after_the_hand_off() {
+        let stats = Arc::new(GatewayStats::default());
+        let mut guard = RequestGuard::new(request_accounting(), stats.clone());
+        guard.disarm();
+
+        drop(guard);
+
+        assert_eq!(taken_requests(), 0, "已认领的出口不能补记");
+        assert_eq!(stats.snapshot().1, 0, "让位的守卫也不该记错误");
+    }
+
+    /// 断连记录的形态：失败 + 「客户端断开」+ 入站/上游报文都留着。上游响应为空——客户端没等到它。
+    #[test]
+    fn request_accounting_keeps_what_the_disconnect_left_behind() {
+        let mut accounting = request_accounting();
+        accounting.upstream_request = "{\"model\":\"upstream\"}".into();
+
+        let record = accounting.usage_record("客户端断开".to_string());
+        assert!(!record.ok);
+        assert_eq!(record.error.as_deref(), Some("客户端断开"));
+        assert_eq!(record.served_by, "Test", "失败仍归属这次实际用的模型");
+        assert_eq!(record.upstream_model, "upstream-model");
+
+        let payload = accounting.payload();
+        assert_eq!(
+            payload.inbound_request.as_deref(),
+            Some("{\"model\":\"a\"}")
+        );
+        assert_eq!(
+            payload.upstream_request.as_deref(),
+            Some("{\"model\":\"upstream\"}")
+        );
+        assert!(
+            payload.upstream_response.is_none(),
+            "没等到响应就没有响应原文"
+        );
+        assert!(!payload.stream);
     }
 
     /// A7：流内错误事件的形状只有一份来源。上游在流里报错时解码侧产出的是 Anthropic 形状的
@@ -1444,6 +1676,123 @@ mod tests {
             payload.inbound_request.expect("入站报文").len(),
             body_len,
             "入站报文全量保存，不再截断"
+        );
+    }
+
+    /// 非流式断连兜底的端到端验证（批 6）：起两个 mock 上游——一个正常回 200、一个受理后永不回应，
+    /// 把 `route()` 的 future 在对端「上游」上 abort 掉（等价于 hyper 因客户端断开而丢弃 handler），
+    /// 核对统计口径。单测只能证明守卫本身会补记；这条证明它真的接在非流式路径上，且成功请求不会被
+    /// 误补记（disarm 漏一处就会在这里露出来）。
+    ///
+    /// 默认跳过：它同样会 init **进程级**设置库。
+    /// 单独跑：`cargo test non_stream_disconnects_are_recorded -- --ignored`
+    #[tokio::test]
+    #[ignore = "要写进程级设置库；会和 sqlite_persistence_round_trips 打架"]
+    async fn non_stream_disconnects_are_recorded_and_successes_are_not() {
+        use crate::domain::model::ModelInput;
+
+        // ── mock 上游 A：正常回 200 ──
+        let ok_upstream = Router::new().fallback(|| async { axum::Json(json!({ "ok": true })) });
+        let ok_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock 上游端口");
+        let ok_port = ok_listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            let _ = axum::serve(ok_listener, ok_upstream).await;
+        });
+
+        // ── mock 上游 B：受理请求后永不回应（模拟「建连成功但不吐数据」） ──
+        async fn hang() -> axum::response::Response {
+            std::future::pending().await
+        }
+        let hang_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock 上游端口");
+        let hang_port = hang_listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            let _ = axum::serve(hang_listener, Router::new().fallback(hang)).await;
+        });
+
+        let dir = std::env::temp_dir().join(format!("ai-start-disconnect-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        if let Err(error) = crate::settings::init(&dir) {
+            println!("沿用已初始化的库：{error}");
+        }
+
+        let point_at = |base_url: &str| {
+            crate::settings::mutate(|settings| {
+                let model = settings.upsert(ModelInput {
+                    id: None,
+                    name: "disconnect-probe".into(),
+                    format: ModelFormat::AnthropicMessages,
+                    base_url: base_url.to_string(),
+                    api_key: "sk-test".into(),
+                    model: "upstream-model".into(),
+                    supports_1m: false,
+                    max_output_tokens: None,
+                });
+                settings.active_model_id = Some(model.id);
+            })
+            .expect("设置当前模型");
+        };
+
+        // 非流式（不带 stream）：走 `upstream.json()`，即客户端能等不及的那一段。
+        let body = || {
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": "aiStart",
+                    "max_tokens": 64,
+                    "messages": [{ "role": "user", "content": "hi" }]
+                }))
+                .expect("body"),
+            )
+        };
+        let headers = || {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-api-key", "claude-desktop".parse().expect("header"));
+            headers
+        };
+
+        let stats = crate::gateway::stats();
+
+        // ── 1. 成功请求：不许被守卫补记 ──
+        point_at(&format!("http://127.0.0.1:{ok_port}"));
+        let before = stats.snapshot().1;
+        let response = route(
+            ModelFormat::AnthropicMessages,
+            stats.clone(),
+            headers(),
+            body(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "非流式成功路径应该 200");
+        assert_eq!(
+            stats.snapshot().1,
+            before,
+            "成功收尾先 disarm，守卫不该补记"
+        );
+
+        // ── 2. 客户端在等响应体时断开：必须留下一条「客户端断开」 ──
+        point_at(&format!("http://127.0.0.1:{hang_port}"));
+        let before = stats.snapshot().1;
+        let task = tokio::spawn({
+            let stats = stats.clone();
+            async move { route(ModelFormat::AnthropicMessages, stats, headers(), body()).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // abort 等价于 hyper 因客户端断开而丢弃 handler 的 future：落库代码不再有机会跑。
+        task.abort();
+        let cancelled = task.await;
+        assert!(cancelled.is_err(), "任务应当是被取消的");
+        assert_eq!(
+            stats.snapshot().1,
+            before + 1,
+            "断开要恰好补一条，且计入错误统计"
+        );
+        assert_eq!(
+            stats.snapshot().5.as_deref(),
+            Some("客户端断开"),
+            "最近一次错误就是它"
         );
     }
 

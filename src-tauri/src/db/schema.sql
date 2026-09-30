@@ -1,5 +1,5 @@
 -- =====================================================================
--- AI Start SQLite schema v13（db_schema_version = 13）
+-- AI Start SQLite schema v14（db_schema_version = 14）
 -- v1 首次落库：app_settings / models / app_model_bindings（配置与模型，取代 settings.json）、
 -- usage_detail / usage_daily_total（token 消耗，取代 usage.jsonl）、events（审计事件）、
 -- app_version_records（应用版本检查与更新记录）。
@@ -22,6 +22,8 @@
 --           （老库的这三列留作无用的历史列，代码不再读写；新库不再建。）
 -- v13 新增：models.max_output_tokens（客户端没给输出上限时的兜底值：勾了「支持 1M 上下文」→ 64000，
 --           否则 8192）。保存模型时随 1M 开关同步更新，老库在 db::init 里按 1M 标记回填一次。
+-- v14 新增：usage_payload.size_bytes（四个报文列的字节数之和）。报文保留策略的字节预算按它排序——
+--           现算得读完整张表（实测 0.9s），而清理挂在每一次报文写入之后。老库在 db::init 里回填一次。
 --
 -- 规范（对齐 eTeam：C:\eTeam\src\host\state\schema.sql）：
 --   主键 = 每张表自己的编号列，统一 INTEGER 自增（仅 schema_meta / app_settings 以 key 为主键，
@@ -210,6 +212,9 @@ CREATE TABLE IF NOT EXISTS usage_payload (
   upstream_request   TEXT,               -- 提示词注入后实际发往上游的请求体（上游协议原生形状）；未捕获为 NULL
   upstream_response  TEXT,               -- 上游原生响应：非流式=上游返回原文；流式=拼装后转回上游协议原生形状
   is_stream          INTEGER NOT NULL DEFAULT 0,  -- 1=流式（响应为拼装结果）/ 0=非流式（上游原文）
+  size_bytes         INTEGER NOT NULL DEFAULT 0,  -- 四个报文列的字节数之和（写入时算好）
+                                                  -- 字节预算靠它排序：现算要读完整张表（实测 0.9s），
+                                                  -- 而它挂在每一次报文写入之后，等于每个请求都白读一遍
   created_time       INTEGER NOT NULL,   -- 入库时刻
   update_time        INTEGER NOT NULL    -- 报文行只插不改，= created_time
 );

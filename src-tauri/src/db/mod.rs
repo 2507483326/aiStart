@@ -11,7 +11,7 @@ use crate::error::{AppError, AppResult};
 pub const SCHEMA_SQL: &str = include_str!("schema.sql");
 
 /// 当前 schema 版本号，写入 schema_meta.db_schema_version。
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 /// **读连接**：所有查询都走它（`with_conn`）。迁移跑完后置 `query_only = ON`，此后只能读。
 /// 写全部交给下面的写线程——两个连接各司其职，WAL 下读不挡写。
@@ -89,6 +89,10 @@ pub fn init(dir: &Path) -> AppResult<()> {
     // v13：models 补「输出上限兜底值」。老库按 1M 标记回填一次，与新建模型同一口径；
     // 此后每次保存模型都由 settings::upsert 按 1M 开关重算。
     add_model_output_ceiling(&connection)?;
+
+    // v14：usage_payload 补「报文体积」。字节预算挂在每一次写入之后，按四列现算要读完整张表，
+    // 所以老库必须回填一次——此后每条报文在写入时就算好。
+    add_payload_size_column(&connection)?;
 
     // v10：每日汇总表补三列。只要有一列是这次新加的，就把历史回填一次——汇总查询此后只读这张表，
     // 不再依赖「每次重查 usage_detail」，所以旧库必须先补齐它漏掉的历史累计值。
@@ -245,10 +249,41 @@ fn ensure_incremental_autovacuum(connection: &Connection) {
     }
 }
 
-/// 把 freelist 里的空闲页还给文件系统；需要 `auto_vacuum = INCREMENTAL` 才生效。
-/// 删除报文后调用，数据库文件才会随之下缩。清理本身已经完成，这里的失败不致命，忽略。
-pub fn reclaim_free_pages(connection: &Connection) {
-    let _ = connection.execute_batch("PRAGMA incremental_vacuum");
+/// 空闲页攒到这个量才值得整库重写一次（见 [`compact`]）。
+const COMPACT_MIN_FREE_BYTES: i64 = 256 * 1024 * 1024;
+
+/// 一天一次（`usage::spawn_retention_task`）的存储整理：必要时整库重写，然后截断 WAL。
+///
+/// **重写那一半**：删掉报文留下的空洞只有 `VACUUM` 能还给文件系统。原先走
+/// `PRAGMA incremental_vacuum`，实测它**等于没作用**——本机 SQLite 上无论带不带参数、库是新是旧
+/// （专门建了个 auto_vacuum=INCREMENTAL 的新库验证过），每次都只回收 **1 页**：删掉 1GB 报文后
+/// freelist 涨到 57 万页（2.2GB），文件一个字节没缩；200 次 `incremental_vacuum(4096)` 合计也只
+/// 回收 201 页。`VACUUM` 才是真能回收的那条路：同一个库 **2.88GB → 1.08GB，6 秒**。只在空闲页
+/// 值得回收时才做，否则每天都要白重写一遍整库。
+///
+/// **WAL 那一半**：`autocheckpoint` 只把帧搬回主库、不缩文件，一次重写就会留下几百 MB 的 WAL
+/// （实测 545MB），所以每次整理都截断一次。
+///
+/// 两步都尽力而为：失败（磁盘临时不够、正赶上读者等）不致命，删与写都不受影响，下一轮再来。
+pub fn compact(connection: &Connection) {
+    compact_when_free_pages_exceed(connection, COMPACT_MIN_FREE_BYTES);
+}
+
+/// 抽出来是为了能用小阈值单测，不必真在内存里腾出 256MB 空洞。
+fn compact_when_free_pages_exceed(connection: &Connection, min_free_bytes: i64) {
+    let page_size: i64 = connection
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .unwrap_or(4096);
+    let free_pages: i64 = connection
+        .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+        .unwrap_or(0);
+    let rewrite = free_pages.saturating_mul(page_size) >= min_free_bytes;
+    let sql = if rewrite {
+        "VACUUM;\nPRAGMA wal_checkpoint(TRUNCATE);"
+    } else {
+        "PRAGMA wal_checkpoint(TRUNCATE);"
+    };
+    let _ = connection.execute_batch(sql);
 }
 
 /// 幂等补列：旧库缺列时执行 ALTER TABLE ADD COLUMN（SQLite 无 ADD COLUMN IF NOT EXISTS）。
@@ -295,6 +330,31 @@ fn add_model_output_ceiling(connection: &Connection) -> AppResult<()> {
     )? {
         connection
             .execute_batch("UPDATE models SET max_output_tokens = 64000 WHERE supports_1m <> 0")?;
+    }
+    Ok(())
+}
+
+/// 一行报文的字节数（四列之和，NULL 按 0）。TEXT 的 `LENGTH` 数字符，得 `CAST AS BLOB` 才是字节。
+/// 唯一来源：老库回填（见 [`add_payload_size_column`]）与写入侧算 `size_bytes` 用同一套口径。
+pub(crate) const PAYLOAD_SIZE_SQL: &str = "COALESCE(LENGTH(CAST(inbound_request AS BLOB)), 0) \
+     + COALESCE(LENGTH(CAST(inbound_headers AS BLOB)), 0) \
+     + COALESCE(LENGTH(CAST(upstream_request AS BLOB)), 0) \
+     + COALESCE(LENGTH(CAST(upstream_response AS BLOB)), 0)";
+
+/// v14 迁移：usage_payload 补 `size_bytes`（四个报文列的字节数之和），老库回填一次。
+///
+/// 字节预算要在**每一次报文写入之后**排序，而按四列现算得读完整张表——实测 0.9s（库里有
+/// 500MB 报文），等于每个请求都白读一遍。回填本身也是这一遍扫描，但只在升级时跑一次。
+fn add_payload_size_column(connection: &Connection) -> AppResult<()> {
+    if ensure_column(
+        connection,
+        "usage_payload",
+        "size_bytes",
+        "INTEGER NOT NULL DEFAULT 0",
+    )? {
+        connection.execute_batch(&format!(
+            "UPDATE usage_payload SET size_bytes = {PAYLOAD_SIZE_SQL}"
+        ))?;
     }
     Ok(())
 }
@@ -428,6 +488,7 @@ mod tests {
 
     fn migrate(connection: &Connection) -> AppResult<()> {
         add_model_output_ceiling(connection)?;
+        add_payload_size_column(connection)?;
         rename_legacy_app_version_records(connection)?;
         rename_legacy_daily_total(connection)?;
         connection.execute_batch(SCHEMA_SQL)?;
@@ -641,5 +702,79 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM usage_total", [], |row| row.get(0))
             .unwrap();
         assert_eq!(rows, 3);
+    }
+
+    /// v14：老库的 usage_payload 没有 size_bytes，补列后按四列现算回填一次——不回填的话旧报文在
+    /// 字节预算里按 0 计，永远轮不到被清理。
+    #[test]
+    fn v14_backfills_the_payload_size_column() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE usage_payload (\
+                   usage_payload_id INTEGER PRIMARY KEY AUTOINCREMENT, usage_detail_id INTEGER NOT NULL,\
+                   inbound_request TEXT, inbound_headers TEXT, upstream_request TEXT, upstream_response TEXT,\
+                   is_stream INTEGER NOT NULL DEFAULT 0, created_time INTEGER NOT NULL, update_time INTEGER NOT NULL);\
+                 INSERT INTO usage_payload (usage_detail_id, inbound_request, upstream_response, created_time, update_time) \
+                 VALUES (1, 'abcd', 'ef', 1, 1), (2, NULL, NULL, 1, 1);",
+            )
+            .unwrap();
+
+        migrate(&connection).unwrap();
+
+        let sizes: Vec<i64> = connection
+            .prepare("SELECT size_bytes FROM usage_payload ORDER BY usage_payload_id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(sizes, vec![6, 0], "入站 4 字节 + 响应 2 字节；NULL 列按 0");
+    }
+
+    /// 报文删掉留下的空洞只有整库重写（`VACUUM`）才还给文件系统——`incremental_vacuum` 实测
+    /// 每次只回收 1 页，等于没作用。空洞不够阈值时不重写（白重写一遍整库不划算），够了才重写。
+    #[test]
+    fn compaction_rewrites_the_file_only_once_the_freelist_is_worth_it() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE blobs (id INTEGER PRIMARY KEY, data TEXT)")
+            .unwrap();
+        let blob = "x".repeat(64 * 1024);
+        for _ in 0..32 {
+            connection
+                .execute(
+                    "INSERT INTO blobs (data) VALUES (?1)",
+                    rusqlite::params![&blob],
+                )
+                .unwrap();
+        }
+        // 删掉一半：约 1MB 的空洞。
+        connection
+            .execute("DELETE FROM blobs WHERE id <= 16", [])
+            .unwrap();
+
+        let pages = |connection: &Connection| {
+            connection
+                .query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+        let free_pages = |connection: &Connection| {
+            connection
+                .query_row("PRAGMA freelist_count", [], |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+
+        let filled = pages(&connection);
+        assert!(free_pages(&connection) > 0, "删除应当留下空闲页");
+
+        // 阈值远高于空洞：不重写。
+        compact_when_free_pages_exceed(&connection, 1024 * 1024 * 1024);
+        assert_eq!(pages(&connection), filled);
+
+        // 阈值低于空洞：重写，页数降下来且不再有空闲页。
+        compact_when_free_pages_exceed(&connection, 0);
+        assert!(pages(&connection) < filled, "重写后文件应当变小");
+        assert_eq!(free_pages(&connection), 0, "重写后不该再有空闲页");
     }
 }

@@ -301,6 +301,8 @@ CJK 字符（3 字节）恰好跨在两个 chunk 边界上时，会变成两个 
 `stats.record_tokens`、判罚全部不执行。长生成被取消是常态，用量统计因此系统性少记。
 目标流程要求「请求完全结束后记录」，这条必须修：记账快照收进共享状态 + `Drop` 守卫，
 drop 时也能落一条「客户端取消」的记录。
+（流式这一半在批 3 修掉；**非流式那一半当时没查**——它在 `upstream.json()` 上被丢弃时连明细都不留，
+比流式更隐蔽，批 6 补上。）
 
 **B4｜`decode_stream_done` 双发，靠幂等兜底**（低，设计债）
 `[DONE]` 分支与流末尾各调一次，正确性靠 `state.finished` 幂等保证。语义上它只该在流末
@@ -526,6 +528,96 @@ hyper-util 里做判定的 matcher 不是 `pub`，规则只能抄一份，用测
 **没做**：H1（`read_timeout`）与 H3（跟随重定向）——两条都还是一行级改动，方案见该文 §2；
 M1–M5、L2、L4–L7 也未动。
 
+### 批 6：非流式断连兜底 / 报文预算 / 回收限页（2026-09-30）✅ 已完成
+
+起因是一次「网关不可达」误报：客户端（Claude Desktop 的自定义网关校验，非流式探针
+`/v1/messages` + `claude-haiku-4-5`）报超时，而网关当时是健康的——同一分钟里 13 条请求全部成功，
+`/v1/models` 68ms 返回、`/health` 正常，同一条探针手工复现 200 / 2.0s。关键是**库里根本没有这次
+请求的记录**：超时在明细里完全不可见，只有「客户端说超时了、网关说什么都没发生」。三条一起落地。
+
+**1. 非流式断连兜底（B3 的非流式对照）**
+
+流式路径有 `DisconnectGuard`（批 3），非流式没有。非流式要等上游把**整条响应体**读完才落库
+（`dispatch` 之后的 `upstream.json()`），客户端等不及先断开时 hyper 会把整个 handler 的 future
+连同落库一起丢弃——明细里既没有成功也没有失败。上面的误报正是这个形态。
+
+新增 `RequestAccounting` / `RequestGuard`（`gateway/server.rs`），与流式守卫同一套语义：
+
+- 只为非流式请求创建（`!request.stream()`），覆盖「等响应头（dispatch）+ 读响应体」两段等待；
+  之后的同步处理不会再被取消。
+- 每个「已由别的路径落库」的出口都先 `disarm`：dispatch 失败由 `route()` 落库，读响应体失败与
+  成功由同一处收尾。唯一跳过 `disarm` 的路径就是 future 真被丢弃，那正是客户端断开。
+- 补记的形态：`ok=false` + `"客户端断开"` + 入站/上游报文照存、上游响应为空（没等到它）。
+  不计 token（上游没吐完，未知按 0，与流式兜底同口径），但**计入错误统计**，否则面板与明细分叉。
+
+读响应体那一段用一个内部 `async` 块把「等 + 解码」收成一个值再 `?`——这样成功与失败两条出口
+共用同一个 `disarm` 点，不必在每个 `?` 上都记得让位（漏一个就会双记）。单测注入写入口
+（与流式守卫同款 `fn` 指针注入），不碰真库。
+
+**2. 报文快照加字节预算**
+
+条数上限单独用不够：v12 起报文按原样全量保存，入站报文上限 32MB，一条 Codex 长会话就 14.6MB。
+实测库里 500 条报文 = **1487.6 MB**（条数上限已经顶满），`ai-start.db3` 2.68GB + WAL 280MB。
+
+`prune_payloads` 增加第二道闸 `PAYLOAD_BYTE_BUDGET`（512MB）：从最新往回累加，超出预算的更旧行
+删掉。仍然全量保真（不截断、不回退 v12 的决定），只是历史窗口按体积自动缩短；小报文（几十 KB）
+远够不到预算，平时仍是条数说了算。用窗口函数一次算出水位线，不逐条构造列表；最新一条永不删
+（子查询为 NULL 时不命中任何行，否则会陷入「刚写就删」）。按现库实测：保留 233 条 / 500.6MB，
+删 267 条、释放 987MB。
+
+**体积必须存下来，不能现算**（v14，同一轮里发现的）：第一版把「四列之和」直接写在清理的 SQL 里，
+而清理挂在**每一次报文写入之后**——`LENGTH(CAST(x AS BLOB))` 得把整张表的报文都读一遍，实测
+**0.65~0.93s**（库里有 500MB 报文），等于每个请求都在写库线程上白读 500MB，启动后第一个请求
+一度要 10s。改成 `usage_payload.size_bytes`（schema v14）：写入时按同一口径算好（`String::len()`
+就是 UTF-8 字节数），老库在 `db::init` 里回填一次。同一条查询 **0.93s → 0.0046s**。
+
+**3. 空洞回收：`incremental_vacuum` → 整库重写**
+
+原以为 `PRAGMA incremental_vacuum` 能把 freelist 还回去，实测**它等于没作用**：本机 SQLite 上
+无论带不带参数、库是新是旧（专门建了个 auto_vacuum=INCREMENTAL 的新库验证过），每次都只回收
+**1 页**——删掉 1GB 报文后 freelist 涨到 57 万页（2.2GB），文件一个字节没缩；200 次
+`incremental_vacuum(4096)` 合计也只回收 201 页。而它原先挂在**每一次报文写入之后**，库大时
+等于每个请求都白跑一遍（进程累计 CPU 53s、WAL 涨到 280MB），收益为零。
+
+真正能回收的是 `VACUUM`：同一个库 **2.88GB → 1.08GB，6 秒**（内容就是 511MB 报文 + 明细）。
+所以改成：请求路径上不做任何回收；一天一次的清扫里用 `db::compact`——空闲页超过
+`COMPACT_MIN_FREE_BYTES`（256MB）才整库重写一遍（否则每天白重写整库），**外加每次都截断一次
+WAL**（`autocheckpoint` 只把帧搬回主库、不缩文件，一次重写会留下 545MB 的 WAL）。整库重写与
+WAL 截断都尽力而为，失败不致命（磁盘临时不够、正赶上读者等），下一轮再来。
+`db::reclaim_free_pages` / `reclaim_all_free_pages` 连同「incremental 模式能回收空间」这个前提
+一起删掉。
+
+**效果**：重启一次即完成整理——但要**等第一轮清理**（见下）。实测落地（就是本机这份库）：
+
+| | 之前 | 之后 |
+| --- | --- | --- |
+| `ai-start.db3` | 2,877,689,856 | 542,138,368 |
+| WAL | 280,666,792 | 0（截断） |
+| 合计 | 2.94GB | **0.50GB** |
+| `freelist` | 319,839 页 | 0 |
+| 报文 | 500 条 / 1487.6MB | 422 条 / 509.9MiB（受字节预算约束） |
+
+单独量过 `VACUUM` 的耗时（离线副本 `backup` API 取的一致性快照，同一台机）：
+`2,877,657,088 → 538,681,344` 字节（702,547 → 131,514 页），**6.04 秒**。
+
+**第一轮清理要延后，别卡在启动路径上**（同一轮里发现的）：原来 `spawn_retention_task` 是
+「启动先跑一次」，而这一轮可能整库重写——几秒重 I/O 正好和窗口加载、启动后的头几个请求撞上，
+实测启动后第一个请求要 **10s**。改成启动后等 `FIRST_SWEEP_DELAY`（30s）再跑第一轮，之后仍每
+24 小时一轮。口径不变（写入侧每次仍然照常按条数 + 字节预算即时清理，整库重写只是把空洞还回去）。
+
+测试：`request_guard_records_the_client_disconnect`、`request_guard_stays_silent_after_the_hand_off`、
+`request_accounting_keeps_what_the_disconnect_left_behind`、
+`pruning_drops_the_oldest_payloads_when_the_byte_budget_is_exceeded`、
+`compaction_rewrites_the_file_only_once_the_freelist_is_worth_it`，外加一条端到端
+`non_stream_disconnects_are_recorded_and_successes_are_not`（两个 mock 上游：一个回 200、一个
+永不回应，abort 掉 `route()` 的 future 等价于客户端断开）。169 通过 / 3 ignored。
+
+落地时确认到的两件事（不是猜的，是对着在跑的进程量的）：
+
+- 非流式断连兜底对**真实客户端**同样生效：`curl -m 1` 打一个上游要 2.5 秒的非流式请求，
+  明细里立刻出现 `ok=false` / `"客户端断开"` / `duration_ms=1008`，错误计数 +1。
+- 上面那张体积表就是重启后实测的（不是离线推算）。
+
 ### 不做的（明确排除）
 
 - **不引入协议描述 DSL**：三个协议是有限集，流式块状态机无法声明式化，强行 DSL 同时失去
@@ -536,7 +628,7 @@ M1–M5、L2、L4–L7 也未动。
 - **不重建直通开关**：同协议直通按 `same_protocol` 硬边界生效，无配置项；回滚手段就是让
   谓词返回 `false`（一行）。
 
-## 9. 守护测试现状（144 passed, 1 ignored）
+## 9. 守护测试现状（169 passed, 3 ignored）
 
 关键守护点与对应测试：
 
@@ -561,12 +653,18 @@ M1–M5、L2、L4–L7 也未动。
 | 超大入站请求被拒且落库（**默认忽略**，单独跑） | `gateway::server::tests::h2_oversize_request_is_rejected_and_recorded` |
 | SSE 帧名回落（两个来源） | `responses_frames_fall_back_to_the_body_type_when_the_envelope_is_unknown`、`anthropic_frames_fall_back_to_the_body_type_when_the_envelope_is_unknown` |
 | 绕行名单语义（对齐 reqwest）与只有环回 | `loopback_bypass_matches_reqwest_rules`、`no_proxy_list_only_covers_loopback` |
+| 非流式断连兜底且不双记 | `gateway::server::tests::request_guard_records_the_client_disconnect`、`request_guard_stays_silent_after_the_hand_off`、`request_accounting_keeps_what_the_disconnect_left_behind` |
+| 报文快照的字节预算（条数之外的第二道闸） | `pruning_drops_the_oldest_payloads_when_the_byte_budget_is_exceeded` |
+| 空洞回收只在值得时整库重写 | `db::tests::compaction_rewrites_the_file_only_once_the_freelist_is_worth_it` |
+| v14 回填报文体积（不回填则旧报文永远清不掉） | `db::tests::v14_backfills_the_payload_size_column` |
+| 非流式断连端到端（**默认忽略**，单独跑） | `gateway::server::tests::non_stream_disconnects_are_recorded_and_successes_are_not` |
 
-上表里唯一 `#[ignore]` 的那条要单独跑（它写进程级 usage 库，全量跑会顶掉
+上表里带 `#[ignore]` 的两条要单独跑（它们写进程级库，全量跑会顶掉
 `sqlite_persistence_round_trips` 的条数断言）：
 
 ```bash
 cargo test h2_oversize_request_is_rejected_and_recorded -- --ignored
+cargo test non_stream_disconnects_are_recorded -- --ignored
 ```
 
 ## 10. 内容块保真（规范层扩容）

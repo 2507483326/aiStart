@@ -219,8 +219,8 @@ pub fn submit(entry: &UsageRecord, payload: Option<&UsagePayload>) {
         if let Some(payload) = &payload {
             transaction.execute(
                 "INSERT INTO usage_payload (usage_detail_id, inbound_request, inbound_headers, upstream_request, upstream_response, \
-                 is_stream, created_time, update_time) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+                 is_stream, size_bytes, created_time, update_time) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
                 params![
                     detail_id,
                     payload.inbound_request.as_deref(),
@@ -228,20 +228,18 @@ pub fn submit(entry: &UsageRecord, payload: Option<&UsagePayload>) {
                     payload.upstream_request.as_deref(),
                     payload.upstream_response.as_deref(),
                     i64::from(payload.stream),
+                    // 体积在写入时算好：清理要按它排序，现算得读完整张表。
+                    payload_size_bytes(payload),
                     event_time,
                 ],
             )?;
-            // 写入即清理：同事务内把超出上限的旧报文删掉，不依赖每日清扫。
+            // 写入即清理：同事务内把超出上限（条数 + 字节预算）的旧报文删掉，不依赖每日清扫。
             if retention > 0 {
-                prune_payloads(&transaction, retention)?;
+                prune_payloads(&transaction, retention, PAYLOAD_BYTE_BUDGET)?;
             }
         }
 
         transaction.commit()?;
-        // 删掉的页要显式回收，否则只进 freelist，DB 文件不会缩小。
-        if retention > 0 && payload.is_some() {
-            db::reclaim_free_pages(connection);
-        }
         Ok(())
     });
 }
@@ -321,44 +319,88 @@ pub fn payload_detail(usage_detail_id: i64) -> Option<UsagePayloadDetail> {
     .unwrap_or(None)
 }
 
-/// 按「请求保存数量」清理超额报文快照：只保留最新的 `retention_count` 条，
-/// 更早的删除。usage_detail 明细与 usage_total 汇总保留；`retention_count <= 0` 不动任何行。
+/// 报文快照的总字节预算——「请求保存数量」之外的第二道上限。
+///
+/// 只按条数限不够：v12 起报文按原样全量保存，而入站报文的上限是 32MB（`gateway::MAX_INBOUND_BODY`），
+/// 一条 Codex 长会话就是十几 MB，500 条能把库顶到几个 GB（实测 500 条 = 1.45GB，库文件 2.7GB）。
+/// 超出预算时**最旧的先删**：最近那批仍然全量保真，历史窗口按体积自动缩短。典型的小报文
+/// （几十 KB）加起来远不到这个数，所以平时条数上限说了算、预算不介入。
+const PAYLOAD_BYTE_BUDGET: i64 = 512 * 1024 * 1024;
+
+/// 一行报文的字节数。写入时按与 `db::PAYLOAD_SIZE_SQL` 同一口径算好存进 `size_bytes`，清理时只读
+/// 那一列——按四列现算得读完整张表（实测 0.9s，库里有 500MB 报文），而清理挂在每一次写入之后。
+fn payload_size_bytes(payload: &UsagePayload) -> i64 {
+    let len = |value: &Option<String>| value.as_ref().map_or(0, |text| text.len() as i64);
+    len(&payload.inbound_request)
+        + len(&payload.inbound_headers)
+        + len(&payload.upstream_request)
+        + len(&payload.upstream_response)
+}
+
+/// 按「请求保存数量」清理超额报文快照：只保留最新的 `retention_count` 条（且总量不超过
+/// [`PAYLOAD_BYTE_BUDGET`]），更早的删除。usage_detail 明细与 usage_total 汇总保留；
+/// `retention_count <= 0` 不动任何行。
 /// 走写线程（读连接是 `query_only`，删除只能交给写线程）；异步投递，行数不再返回。
-/// 写入侧每条报文落库时也会即时清理（见 [`submit`]），这里主要用于「用户调小上限后立即生效」。
+/// 写入侧每条报文落库时也会即时清理（见 [`submit`]），这里主要用于「用户调小上限后立即生效」
+/// 与「把删出来的空洞真正还给文件系统」（见 [`db::compact`]）。
 pub fn cleanup_excess_payloads(retention_count: i64) {
     if retention_count <= 0 {
         return;
     }
     db::submit(move |connection| {
-        prune_payloads(connection, retention_count)?;
-        db::reclaim_free_pages(connection);
+        prune_payloads(connection, retention_count, PAYLOAD_BYTE_BUDGET)?;
+        db::compact(connection);
         Ok(())
     });
 }
 
-/// 只保留最新的 `keep` 条报文行，删除其余。抽出来是为了能用内存库单测，不必碰进程级 usage 库。
-/// 用「第 keep+1 新的行号」作水位线一次删干净，避免逐条构造 NOT IN 列表；
-/// 现有条数不足 keep+1 时子查询为 NULL，`<= NULL` 不命中任何行，等于不删。
-fn prune_payloads(connection: &rusqlite::Connection, keep: i64) -> AppResult<usize> {
-    Ok(connection.execute(
+/// 只保留最新的 `keep` 条、且总字节不超过 `budget` 的报文行，删除其余。
+/// 抽出两条上限是为了能用内存库单测，不必碰进程级 usage 库。
+/// 条数用「第 keep+1 新的行号」作水位线一次删干净，避免逐条构造 NOT IN 列表；
+/// 字节用窗口函数在 `size_bytes` 上从最新往回累加（只读这一列，几十行整数，微秒级），
+/// 一次算出「还在预算内的最旧行号」。
+/// 现有条数不足（或最新一条本身就超预算）时子查询为 NULL，`< NULL` 不命中任何行，等于不删
+/// ——最新那条永远留着，否则会陷入「刚写就删」。
+fn prune_payloads(connection: &rusqlite::Connection, keep: i64, budget: i64) -> AppResult<usize> {
+    let by_count = connection.execute(
         "DELETE FROM usage_payload WHERE usage_payload_id <= ( \
              SELECT usage_payload_id FROM usage_payload ORDER BY usage_payload_id DESC LIMIT 1 OFFSET ?1 \
          )",
         params![keep],
-    )?)
+    )?;
+    let by_bytes = connection.execute(
+        "DELETE FROM usage_payload WHERE usage_payload_id < ( \
+             SELECT MIN(usage_payload_id) FROM ( \
+                 SELECT usage_payload_id, \
+                        SUM(size_bytes) OVER ( \
+                            ORDER BY usage_payload_id DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW \
+                        ) AS running_bytes \
+                 FROM usage_payload \
+             ) WHERE running_bytes <= ?1 \
+         )",
+        params![budget],
+    )?;
+    Ok(by_count + by_bytes)
 }
 
-/// 保存窗口清理的节奏：启动先跑一次，之后每 24 小时一轮。
+/// 保存窗口清理的节奏：启动后先等一会儿，之后每 24 小时一轮。
 const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// 启动后到第一轮清理之间的等待。这一轮可能整库重写（见 [`db::compact`]），几秒的重 I/O
+/// 不该和窗口加载、启动后的头几个请求抢——实测卡在启动路径上时，启动后第一个请求要 10s。
+const FIRST_SWEEP_DELAY: Duration = Duration::from_secs(30);
 
 /// 每天按当前设置清理一次过期报文。用独立线程而不是 tokio 任务：落库本身是同步的，
 /// 清理一天才一次，不值得占用异步运行时；线程在进程退出时随之结束。
 pub fn spawn_retention_task() {
     let _ = std::thread::Builder::new()
         .name("usage-retention".into())
-        .spawn(|| loop {
-            cleanup_excess_payloads(settings::snapshot().request_retention_count);
-            std::thread::sleep(RETENTION_SWEEP_INTERVAL);
+        .spawn(|| {
+            std::thread::sleep(FIRST_SWEEP_DELAY);
+            loop {
+                cleanup_excess_payloads(settings::snapshot().request_retention_count);
+                std::thread::sleep(RETENTION_SWEEP_INTERVAL);
+            }
         });
 }
 
@@ -513,6 +555,17 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
 
+    /// 现存报文的行号（升序），断言清理结果用。
+    fn payload_ids(connection: &Connection) -> Vec<i64> {
+        connection
+            .prepare("SELECT usage_detail_id FROM usage_payload ORDER BY usage_payload_id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
+    }
+
     #[test]
     fn pruning_keeps_only_the_newest_rows() {
         let connection = Connection::open_in_memory().unwrap();
@@ -527,19 +580,44 @@ mod tests {
                 .unwrap();
         }
 
-        // 上限 2 条：最旧的一条删除，保留最新的两条。
-        assert_eq!(prune_payloads(&connection, 2).unwrap(), 1);
-        let remaining: Vec<i64> = connection
-            .prepare("SELECT usage_detail_id FROM usage_payload ORDER BY usage_payload_id")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .filter_map(Result::ok)
-            .collect();
-        assert_eq!(remaining, vec![20, 30]);
+        // 上限 2 条：最旧的一条删除，保留最新的两条（这些行没有报文，字节预算不介入）。
+        assert_eq!(
+            prune_payloads(&connection, 2, PAYLOAD_BYTE_BUDGET).unwrap(),
+            1
+        );
+        assert_eq!(payload_ids(&connection), vec![20, 30]);
 
         // 上限不小于现有条数：一行都不删。
-        assert_eq!(prune_payloads(&connection, 3).unwrap(), 0);
+        assert_eq!(
+            prune_payloads(&connection, 3, PAYLOAD_BYTE_BUDGET).unwrap(),
+            0
+        );
+    }
+
+    /// 字节预算：条数没超但总量超了 —— 从最旧的开始删，最近的那批仍然全量保真。
+    /// 预算是「条数上限」之外的第二道闸，专门对付「一条报文十几 MB」把库顶到几个 GB 的情况。
+    #[test]
+    fn pruning_drops_the_oldest_payloads_when_the_byte_budget_is_exceeded() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(db::SCHEMA_SQL).unwrap();
+        // 每行 100 字节，共 5 行 = 500 字节。
+        for detail_id in 1_i64..=5 {
+            connection
+                .execute(
+                    "INSERT INTO usage_payload (usage_detail_id, inbound_request, size_bytes, created_time, update_time) \
+                     VALUES (?1, ?2, 100, 100, 100)",
+                    params![detail_id, "x".repeat(100)],
+                )
+                .unwrap();
+        }
+
+        // 预算 250 字节 = 最新的两行；第 3 行起累计已超 → 删掉最旧的三行。
+        assert_eq!(prune_payloads(&connection, 500, 250).unwrap(), 3);
+        assert_eq!(payload_ids(&connection), vec![4, 5]);
+
+        // 预算连最新一条都放不下：一行都不删（否则会陷入「刚写就删」）。
+        assert_eq!(prune_payloads(&connection, 500, 10).unwrap(), 0);
+        assert_eq!(payload_ids(&connection), vec![4, 5]);
     }
 
     /// v11：usage_total 由写入侧增量累加（每日行 + 全量行共用一张表），读取侧只按 day 取行。
